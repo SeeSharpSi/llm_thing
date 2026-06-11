@@ -13,6 +13,7 @@ var DEFAULT_SETTINGS = {
   Model: 'gpt-4.1-mini',
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen.',
   ShowThinking: false,
+  WebSearchEnabled: false,
   McpServersJson: '[]'
 };
 
@@ -42,6 +43,7 @@ function extend(base, extra) {
   }
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
+  result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
   return result;
 }
 
@@ -170,10 +172,30 @@ function buildMcpTools(settings) {
   return tools;
 }
 
+function addWebSearchTool(tools, settings) {
+  if (!settings.WebSearchEnabled) {
+    return;
+  }
+
+  tools.push({
+    type: 'web_search_preview',
+    search_context_size: 'low'
+  });
+}
+
+function buildSystemPrompt(settings) {
+  if (!settings.WebSearchEnabled) {
+    return settings.SystemPrompt;
+  }
+
+  return settings.SystemPrompt + '\nIf web search is useful, use it and cite sources briefly.';
+}
+
 function buildBody(settings, userText) {
   var endpoint = String(settings.Endpoint || '').toLowerCase();
   var body;
   var tools;
+  var systemPrompt;
 
   if (endpoint.indexOf('/chat/completions') !== -1) {
     return {
@@ -185,17 +207,20 @@ function buildBody(settings, userText) {
     };
   }
 
+  systemPrompt = buildSystemPrompt(settings);
   body = {
     model: settings.Model,
     input: [
-      { role: 'system', content: settings.SystemPrompt },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: userText }
     ]
   };
 
   tools = buildMcpTools(settings);
+  addWebSearchTool(tools, settings);
   if (tools.length) {
     body.tools = tools;
+    body.tool_choice = 'auto';
   }
 
   return body;

@@ -41,6 +41,7 @@
       "Model",
       "SystemPrompt",
       "ShowThinking",
+      "WebSearchEnabled",
       "McpServersJson"
     ],
     "resources": {

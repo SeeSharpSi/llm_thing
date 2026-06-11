@@ -67,6 +67,13 @@ module.exports = [
         "label": "Show Thinking",
         "description": "Only shown if the endpoint returns visible reasoning or <think> blocks.",
         "defaultValue": false
+      },
+      {
+        "type": "toggle",
+        "messageKey": "WebSearchEnabled",
+        "label": "Web Search",
+        "description": "Allow supported Responses API models to search the web.",
+        "defaultValue": false
       }
     ]
   },
