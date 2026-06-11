@@ -1,6 +1,8 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
+var mcpServersComponent = require('./mcp_servers_component');
 var clay = new Clay(clayConfig, null, { autoHandleEvents: false });
+clay.registerComponent(mcpServersComponent);
 
 var SETTINGS_KEY = 'llm_thing_settings';
 var CHUNK_SIZE = 400;
@@ -11,24 +13,7 @@ var DEFAULT_SETTINGS = {
   Model: 'gpt-4.1-mini',
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen.',
   ShowThinking: false,
-  McpServer1Enabled: false,
-  McpServer1Label: '',
-  McpServer1Url: '',
-  McpServer1Description: '',
-  McpServer1AllowedTools: '',
-  McpServer1Authorization: '',
-  McpServer2Enabled: false,
-  McpServer2Label: '',
-  McpServer2Url: '',
-  McpServer2Description: '',
-  McpServer2AllowedTools: '',
-  McpServer2Authorization: '',
-  McpServer3Enabled: false,
-  McpServer3Label: '',
-  McpServer3Url: '',
-  McpServer3Description: '',
-  McpServer3AllowedTools: '',
-  McpServer3Authorization: ''
+  McpServersJson: '[]'
 };
 
 function extend(base, extra) {
@@ -57,9 +42,6 @@ function extend(base, extra) {
   }
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
-  result.McpServer1Enabled = result.McpServer1Enabled === true || result.McpServer1Enabled === 1 || result.McpServer1Enabled === '1';
-  result.McpServer2Enabled = result.McpServer2Enabled === true || result.McpServer2Enabled === 1 || result.McpServer2Enabled === '1';
-  result.McpServer3Enabled = result.McpServer3Enabled === true || result.McpServer3Enabled === 1 || result.McpServer3Enabled === '1';
   return result;
 }
 
@@ -133,13 +115,13 @@ function splitCsv(value) {
   return result;
 }
 
-function addMcpTool(tools, settings, index) {
-  var enabled = settings['McpServer' + index + 'Enabled'];
-  var label = String(settings['McpServer' + index + 'Label'] || '').replace(/^\s+|\s+$/g, '');
-  var url = String(settings['McpServer' + index + 'Url'] || '').replace(/^\s+|\s+$/g, '');
-  var description = String(settings['McpServer' + index + 'Description'] || '').replace(/^\s+|\s+$/g, '');
-  var authorization = String(settings['McpServer' + index + 'Authorization'] || '').replace(/^\s+|\s+$/g, '');
-  var allowedTools = splitCsv(settings['McpServer' + index + 'AllowedTools']);
+function addMcpTool(tools, server) {
+  var enabled = server && (server.enabled === true || server.enabled === 1 || server.enabled === '1');
+  var label = String((server && server.label) || '').replace(/^\s+|\s+$/g, '');
+  var url = String((server && server.url) || '').replace(/^\s+|\s+$/g, '');
+  var description = String((server && server.description) || '').replace(/^\s+|\s+$/g, '');
+  var authorization = String((server && server.authorization) || '').replace(/^\s+|\s+$/g, '');
+  var allowedTools = splitCsv(server && server.allowedTools);
   var tool;
 
   if (!enabled || !label || !url) {
@@ -168,10 +150,22 @@ function addMcpTool(tools, settings, index) {
 
 function buildMcpTools(settings) {
   var tools = [];
+  var servers;
+  var i;
 
-  addMcpTool(tools, settings, 1);
-  addMcpTool(tools, settings, 2);
-  addMcpTool(tools, settings, 3);
+  try {
+    servers = JSON.parse(settings.McpServersJson || '[]');
+  } catch (e) {
+    servers = [];
+  }
+
+  if (!servers || !servers.length) {
+    return tools;
+  }
+
+  for (i = 0; i < servers.length; i += 1) {
+    addMcpTool(tools, servers[i]);
+  }
 
   return tools;
 }
