@@ -1,15 +1,22 @@
 {
-  "name": "llm_thing2",
+  "name": "llm_thing",
   "author": "MakeAwesomeHappen",
   "version": "1.0.0",
-  "keywords": ["pebble-app"],
+  "keywords": [
+    "pebble-app"
+  ],
   "private": true,
-  "dependencies": {},
+  "dependencies": {
+    "@rebble/clay": "^1.0.10"
+  },
   "pebble": {
-    "displayName": "llm_thing2",
+    "displayName": "llm_thing",
     "uuid": "cfee9469-e9db-4f5b-a219-b4d438d35f17",
     "sdkVersion": "3",
     "enableMultiJS": true,
+    "capabilities": [
+      "configurable"
+    ],
     "targetPlatforms": [
       "aplite",
       "basalt",
@@ -23,7 +30,17 @@
       "watchface": false
     },
     "messageKeys": [
-      "dummy"
+      "RequestId",
+      "RequestText",
+      "ResponseChunk",
+      "ResponseDone",
+      "ResponseError",
+      "ResponseReset",
+      "Endpoint",
+      "ApiKey",
+      "Model",
+      "SystemPrompt",
+      "ShowThinking"
     ],
     "resources": {
       "media": []
