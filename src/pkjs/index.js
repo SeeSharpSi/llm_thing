@@ -10,7 +10,25 @@ var DEFAULT_SETTINGS = {
   ApiKey: '',
   Model: 'gpt-4.1-mini',
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen.',
-  ShowThinking: false
+  ShowThinking: false,
+  McpServer1Enabled: false,
+  McpServer1Label: '',
+  McpServer1Url: '',
+  McpServer1Description: '',
+  McpServer1AllowedTools: '',
+  McpServer1Authorization: '',
+  McpServer2Enabled: false,
+  McpServer2Label: '',
+  McpServer2Url: '',
+  McpServer2Description: '',
+  McpServer2AllowedTools: '',
+  McpServer2Authorization: '',
+  McpServer3Enabled: false,
+  McpServer3Label: '',
+  McpServer3Url: '',
+  McpServer3Description: '',
+  McpServer3AllowedTools: '',
+  McpServer3Authorization: ''
 };
 
 function extend(base, extra) {
@@ -39,6 +57,9 @@ function extend(base, extra) {
   }
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
+  result.McpServer1Enabled = result.McpServer1Enabled === true || result.McpServer1Enabled === 1 || result.McpServer1Enabled === '1';
+  result.McpServer2Enabled = result.McpServer2Enabled === true || result.McpServer2Enabled === 1 || result.McpServer2Enabled === '1';
+  result.McpServer3Enabled = result.McpServer3Enabled === true || result.McpServer3Enabled === 1 || result.McpServer3Enabled === '1';
   return result;
 }
 
@@ -96,8 +117,69 @@ function sendResponse(requestId, text) {
   sendReset(requestId, sendNext);
 }
 
+function splitCsv(value) {
+  var items = String(value || '').split(',');
+  var result = [];
+  var item;
+  var i;
+
+  for (i = 0; i < items.length; i += 1) {
+    item = items[i].replace(/^\s+|\s+$/g, '');
+    if (item) {
+      result.push(item);
+    }
+  }
+
+  return result;
+}
+
+function addMcpTool(tools, settings, index) {
+  var enabled = settings['McpServer' + index + 'Enabled'];
+  var label = String(settings['McpServer' + index + 'Label'] || '').replace(/^\s+|\s+$/g, '');
+  var url = String(settings['McpServer' + index + 'Url'] || '').replace(/^\s+|\s+$/g, '');
+  var description = String(settings['McpServer' + index + 'Description'] || '').replace(/^\s+|\s+$/g, '');
+  var authorization = String(settings['McpServer' + index + 'Authorization'] || '').replace(/^\s+|\s+$/g, '');
+  var allowedTools = splitCsv(settings['McpServer' + index + 'AllowedTools']);
+  var tool;
+
+  if (!enabled || !label || !url) {
+    return;
+  }
+
+  tool = {
+    type: 'mcp',
+    server_label: label,
+    server_url: url,
+    require_approval: 'never'
+  };
+
+  if (description) {
+    tool.server_description = description;
+  }
+  if (authorization) {
+    tool.authorization = authorization;
+  }
+  if (allowedTools.length) {
+    tool.allowed_tools = allowedTools;
+  }
+
+  tools.push(tool);
+}
+
+function buildMcpTools(settings) {
+  var tools = [];
+
+  addMcpTool(tools, settings, 1);
+  addMcpTool(tools, settings, 2);
+  addMcpTool(tools, settings, 3);
+
+  return tools;
+}
+
 function buildBody(settings, userText) {
   var endpoint = String(settings.Endpoint || '').toLowerCase();
+  var body;
+  var tools;
 
   if (endpoint.indexOf('/chat/completions') !== -1) {
     return {
@@ -109,13 +191,20 @@ function buildBody(settings, userText) {
     };
   }
 
-  return {
+  body = {
     model: settings.Model,
     input: [
       { role: 'system', content: settings.SystemPrompt },
       { role: 'user', content: userText }
     ]
   };
+
+  tools = buildMcpTools(settings);
+  if (tools.length) {
+    body.tools = tools;
+  }
+
+  return body;
 }
 
 function collectTextFromContent(content) {
@@ -260,7 +349,7 @@ Pebble.addEventListener('webviewclosed', function(e) {
     return;
   }
 
-  saveSettings(clay.getSettings(e.response));
+  saveSettings(clay.getSettings(e.response, false));
 });
 
 Pebble.addEventListener('appmessage', function(e) {

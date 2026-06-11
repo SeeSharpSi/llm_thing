@@ -40,7 +40,25 @@
       "ApiKey",
       "Model",
       "SystemPrompt",
-      "ShowThinking"
+      "ShowThinking",
+      "McpServer1Enabled",
+      "McpServer1Label",
+      "McpServer1Url",
+      "McpServer1Description",
+      "McpServer1AllowedTools",
+      "McpServer1Authorization",
+      "McpServer2Enabled",
+      "McpServer2Label",
+      "McpServer2Url",
+      "McpServer2Description",
+      "McpServer2AllowedTools",
+      "McpServer2Authorization",
+      "McpServer3Enabled",
+      "McpServer3Label",
+      "McpServer3Url",
+      "McpServer3Description",
+      "McpServer3AllowedTools",
+      "McpServer3Authorization"
     ],
     "resources": {
       "media": []
