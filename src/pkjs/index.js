@@ -64,6 +64,7 @@ var DEFAULT_SETTINGS = {
   ShowThinking: false,
   WebSearchEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
+  FontSize: 18,
   McpServersJson: '[]'
 };
 
@@ -113,6 +114,10 @@ function extend(base, extra) {
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
   result.MaxToolCalls = clampNumber(result.MaxToolCalls, 0, 10, DEFAULT_MAX_TOOL_CALLS);
+  result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
+  if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
+    result.FontSize = 18;
+  }
   return result;
 }
 
@@ -126,6 +131,10 @@ function loadSettings() {
 
 function saveSettings(settings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(extend(DEFAULT_SETTINGS, settings)));
+}
+
+function syncWatchSettings(settings) {
+  sendMessage({ FontSize: settings.FontSize });
 }
 
 function sendMessage(dict, onSuccess, onFailure) {
@@ -1125,6 +1134,7 @@ function requestCompletion(requestId, userText) {
   var conversation;
 
   logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls);
+  syncWatchSettings(settings);
   progressStart(requestId, 'Starting request', 'dictation: ' + String(userText || '').length + ' chars');
 
   if (!settings.Endpoint) {
@@ -1174,6 +1184,7 @@ function requestCompletion(requestId, userText) {
 
 Pebble.addEventListener('ready', function() {
   logDebug('ready');
+  syncWatchSettings(loadSettings());
 });
 
 Pebble.addEventListener('showConfiguration', function() {
@@ -1189,7 +1200,9 @@ Pebble.addEventListener('webviewclosed', function(e) {
   }
 
   logDebug('configuration saved');
-  saveSettings(clay.getSettings(e.response, false));
+  var settings = clay.getSettings(e.response, false);
+  saveSettings(settings);
+  syncWatchSettings(extend(DEFAULT_SETTINGS, settings));
 });
 
 Pebble.addEventListener('appmessage', function(e) {

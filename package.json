@@ -44,6 +44,7 @@
       "ShowThinking",
       "WebSearchEnabled",
       "MaxToolCalls",
+      "FontSize",
       "McpServersJson"
     ],
     "resources": {

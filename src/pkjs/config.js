@@ -95,6 +95,39 @@ module.exports = [
     "type": "section",
     "items": [
       {
+        "type": "heading",
+        "defaultValue": "Watch Display"
+      },
+      {
+        "type": "select",
+        "messageKey": "FontSize",
+        "label": "Font Size",
+        "defaultValue": "18",
+        "options": [
+          {
+            "label": "Small",
+            "value": "14"
+          },
+          {
+            "label": "Normal",
+            "value": "18"
+          },
+          {
+            "label": "Large",
+            "value": "24"
+          },
+          {
+            "label": "Huge",
+            "value": "28"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "type": "section",
+    "items": [
+      {
         "type": "mcp_servers",
         "messageKey": "McpServersJson",
         "defaultValue": "[]"

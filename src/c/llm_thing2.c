@@ -1,8 +1,10 @@
 #include <pebble.h>
+#include <stdlib.h>
 
 #define DICTATION_BUFFER_SIZE 384
 #define RESPONSE_BUFFER_SIZE 6144
-#define SCROLL_LINE_DELTA 20
+#define FONT_SIZE_DEFAULT 18
+#define PERSIST_KEY_FONT_SIZE 1
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
@@ -14,14 +16,68 @@ static DictationSession *s_dictation_session;
 static char s_response[RESPONSE_BUFFER_SIZE];
 static int16_t s_text_width;
 static int16_t s_min_text_height;
-static int16_t s_content_height;
+static int s_font_size = FONT_SIZE_DEFAULT;
 static uint32_t s_request_id;
 static bool s_response_truncated;
-static bool s_progress_mode;
-static bool s_follow_bottom;
+
+static void prv_update_scroll_text(void);
 
 static void prv_set_status(const char *text) {
   (void)text;
+}
+
+static int prv_normalize_font_size(int size) {
+  switch (size) {
+    case 14:
+    case 18:
+    case 24:
+    case 28:
+      return size;
+    default:
+      return FONT_SIZE_DEFAULT;
+  }
+}
+
+static const char *prv_font_key_for_size(int size) {
+  switch (prv_normalize_font_size(size)) {
+    case 14:
+      return FONT_KEY_GOTHIC_14;
+    case 24:
+      return FONT_KEY_GOTHIC_24;
+    case 28:
+      return FONT_KEY_GOTHIC_28;
+    case 18:
+    default:
+      return FONT_KEY_GOTHIC_18;
+  }
+}
+
+static int prv_font_size_from_tuple(Tuple *tuple) {
+  if (!tuple) {
+    return s_font_size;
+  }
+
+  if (tuple->type == TUPLE_CSTRING) {
+    return atoi(tuple->value->cstring);
+  }
+  if (tuple->type == TUPLE_INT) {
+    return tuple->value->int32;
+  }
+
+  return tuple->value->uint32;
+}
+
+static void prv_apply_font_size(int size, bool should_persist) {
+  s_font_size = prv_normalize_font_size(size);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_FONT_SIZE, s_font_size);
+  }
+
+  if (s_text_layer) {
+    text_layer_set_font(s_text_layer, fonts_get_system_font(prv_font_key_for_size(s_font_size)));
+    prv_update_scroll_text();
+  }
 }
 
 static void prv_update_scroll_text(void) {
@@ -39,58 +95,9 @@ static void prv_update_scroll_text(void) {
 
   text_layer_set_size(s_text_layer, GSize(s_text_width, content_size.h));
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_size.h));
-  s_content_height = content_size.h;
-}
-
-static int16_t prv_bottom_offset_y(void) {
-  if (s_content_height <= s_min_text_height) {
-    return 0;
-  }
-
-  return s_min_text_height - s_content_height;
-}
-
-static void prv_clamp_scroll_offset(void) {
-  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
-  int16_t bottom_y = prv_bottom_offset_y();
-
-  if (offset.y > 0) {
-    offset.y = 0;
-  } else if (offset.y < bottom_y) {
-    offset.y = bottom_y;
-  }
-
-  scroll_layer_set_content_offset(s_scroll_layer, offset, false);
-}
-
-static bool prv_is_at_bottom(void) {
-  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
-  int16_t bottom_y = prv_bottom_offset_y();
-
-  return offset.y <= bottom_y + (SCROLL_LINE_DELTA / 2);
-}
-
-static void prv_scroll_to_bottom(void) {
-  scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, prv_bottom_offset_y()), false);
-}
-
-static void prv_scroll_by(int16_t delta_y) {
-  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
-  int16_t bottom_y = prv_bottom_offset_y();
-
-  offset.y += delta_y;
-  if (offset.y > 0) {
-    offset.y = 0;
-  } else if (offset.y < bottom_y) {
-    offset.y = bottom_y;
-  }
-
-  scroll_layer_set_content_offset(s_scroll_layer, offset, false);
 }
 
 static void prv_set_response(const char *text) {
-  s_progress_mode = false;
-  s_follow_bottom = false;
   snprintf(s_response, sizeof(s_response), "%s", text);
   s_response_truncated = false;
   prv_update_scroll_text();
@@ -98,21 +105,9 @@ static void prv_set_response(const char *text) {
 }
 
 static void prv_set_progress(const char *text) {
-  if (!s_progress_mode) {
-    s_progress_mode = true;
-    s_follow_bottom = true;
-  } else if (prv_is_at_bottom()) {
-    s_follow_bottom = true;
-  }
-
   snprintf(s_response, sizeof(s_response), "%s", text);
   s_response_truncated = false;
   prv_update_scroll_text();
-  if (s_follow_bottom) {
-    prv_scroll_to_bottom();
-  } else {
-    prv_clamp_scroll_offset();
-  }
 }
 
 static void prv_append_response(const char *text) {
@@ -239,21 +234,7 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
 #endif
 }
 
-static void prv_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_follow_bottom = false;
-  prv_scroll_by(SCROLL_LINE_DELTA);
-}
-
-static void prv_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  prv_scroll_by(-SCROLL_LINE_DELTA);
-  if (s_progress_mode && prv_is_at_bottom()) {
-    s_follow_bottom = true;
-  }
-}
-
 static void prv_scroll_click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, prv_up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN, prv_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, prv_select_click_handler);
 }
 
@@ -265,12 +246,16 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     return;
   }
 
+  Tuple *font_size_t = dict_find(iter, MESSAGE_KEY_FontSize);
+  if (font_size_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "font size update");
+    prv_apply_font_size(prv_font_size_from_tuple(font_size_t), true);
+  }
+
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
     prv_set_status("Receiving");
-    s_progress_mode = false;
-    s_follow_bottom = false;
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
@@ -329,7 +314,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_callbacks(s_scroll_layer, (ScrollLayerCallbacks) {
     .click_config_provider = prv_scroll_click_config_provider
   });
-  scroll_layer_set_paging(s_scroll_layer, false);
+  scroll_layer_set_paging(s_scroll_layer, true);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_width = bounds.size.w - 8;
@@ -338,7 +323,7 @@ static void prv_window_load(Window *window) {
   s_text_layer = text_layer_create(GRect(4, 0, s_text_width, s_min_text_height));
   text_layer_set_background_color(s_text_layer, GColorClear);
   text_layer_set_text_color(s_text_layer, GColorBlack);
-  text_layer_set_font(s_text_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_text_layer, fonts_get_system_font(prv_font_key_for_size(s_font_size)));
   text_layer_set_overflow_mode(s_text_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_text_layer, GTextAlignmentLeft);
   scroll_layer_add_child(s_scroll_layer, text_layer_get_layer(s_text_layer));
@@ -355,6 +340,10 @@ static void prv_window_unload(Window *window) {
 
 static void prv_init(void) {
   APP_LOG(APP_LOG_LEVEL_DEBUG, "app init");
+  if (persist_exists(PERSIST_KEY_FONT_SIZE)) {
+    s_font_size = prv_normalize_font_size(persist_read_int(PERSIST_KEY_FONT_SIZE));
+  }
+
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = prv_window_load,
