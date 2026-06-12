@@ -48,7 +48,8 @@
       "MaxToolCalls",
       "FontSize",
       "McpServersJson",
-      "BuzzStrength"
+      "BuzzStrength",
+      "ProgressDetail"
     ],
     "resources": {
       "media": []

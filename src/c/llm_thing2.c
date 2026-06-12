@@ -9,24 +9,48 @@
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_MEASURE_HEIGHT 24000
+#define PROGRESS_TITLE_BUFFER_SIZE 96
+#define PROGRESS_DETAIL_BUFFER_SIZE 192
+#define PROGRESS_LOADING_HEIGHT 28
+#define PROGRESS_LOADING_MARGIN 16
+#define PROGRESS_LOADING_TIMER_MS 80
+#define PROGRESS_LOADING_STEP 6
+#define PROGRESS_TEXT_SIDE_PADDING 6
+#define PROGRESS_TEXT_GAP 4
+#define PROGRESS_TITLE_MIN_HEIGHT 32
+#define PROGRESS_TITLE_MAX_HEIGHT 60
+#define PROGRESS_DETAIL_MIN_HEIGHT 22
+#define PROGRESS_DETAIL_MAX_HEIGHT 44
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
 static TextLayer *s_text_layer;
+static Layer *s_progress_layer;
+static TextLayer *s_progress_title_layer;
+static TextLayer *s_progress_detail_layer;
+static Layer *s_progress_loading_layer;
+static AppTimer *s_progress_loading_timer;
 #if defined(PBL_MICROPHONE)
 static DictationSession *s_dictation_session;
 #endif
 
 static char s_response[RESPONSE_BUFFER_SIZE];
+static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
+static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static int16_t s_text_width;
 static int16_t s_min_text_height;
+static int16_t s_progress_width;
+static int16_t s_progress_height;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static uint32_t s_request_id;
+static uint16_t s_progress_loading_frame;
 static bool s_response_truncated;
 static bool s_progress_mode;
 
 static void prv_update_scroll_text(void);
+
+static void prv_progress_loading_timer_callback(void *context);
 
 static void prv_set_status(const char *text) {
   (void)text;
@@ -148,6 +172,170 @@ static void prv_update_scroll_text(void) {
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_height));
 }
 
+static void prv_schedule_progress_loading_timer(void) {
+  if (!s_progress_mode || s_progress_loading_timer) {
+    return;
+  }
+
+  s_progress_loading_timer = app_timer_register(PROGRESS_LOADING_TIMER_MS, prv_progress_loading_timer_callback, NULL);
+}
+
+static void prv_stop_progress_loading(void) {
+  if (s_progress_loading_timer) {
+    app_timer_cancel(s_progress_loading_timer);
+    s_progress_loading_timer = NULL;
+  }
+
+  s_progress_loading_frame = 0;
+}
+
+static void prv_start_progress_loading(void) {
+  if (s_progress_loading_layer) {
+    layer_mark_dirty(s_progress_loading_layer);
+  }
+  prv_schedule_progress_loading_timer();
+}
+
+static void prv_progress_loading_timer_callback(void *context) {
+  (void)context;
+  s_progress_loading_timer = NULL;
+
+  if (!s_progress_mode) {
+    return;
+  }
+
+  s_progress_loading_frame += 1;
+  if (s_progress_loading_layer) {
+    layer_mark_dirty(s_progress_loading_layer);
+  }
+  prv_schedule_progress_loading_timer();
+}
+
+static void prv_progress_loading_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  int16_t track_width = bounds.size.w - (PROGRESS_LOADING_MARGIN * 2);
+  int16_t x0;
+  int16_t y;
+  int16_t segment_width;
+  int16_t travel;
+  int16_t x;
+  int16_t left;
+  int16_t right;
+
+  if (track_width <= 0) {
+    return;
+  }
+
+  x0 = (bounds.size.w - track_width) / 2;
+  y = bounds.size.h / 2;
+  segment_width = track_width / 4;
+  if (segment_width < 12) {
+    segment_width = 12;
+  }
+  travel = track_width + segment_width;
+  x = x0 - segment_width + ((s_progress_loading_frame * PROGRESS_LOADING_STEP) % travel);
+  left = x < x0 ? x0 : x;
+  right = x + segment_width > x0 + track_width ? x0 + track_width : x + segment_width;
+
+#if defined(PBL_COLOR)
+  graphics_context_set_fill_color(ctx, GColorLightGray);
+#else
+  graphics_context_set_fill_color(ctx, GColorBlack);
+#endif
+  graphics_fill_rect(ctx, GRect(x0, y - 1, track_width, 2), 0, GCornerNone);
+
+  if (right > left) {
+    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_fill_rect(ctx, GRect(left, y - 2, right - left, 4), 1, GCornersAll);
+  }
+}
+
+static void prv_set_progress_visible(bool visible) {
+  if (s_scroll_layer) {
+    layer_set_hidden(scroll_layer_get_layer(s_scroll_layer), visible);
+  }
+  if (s_progress_layer) {
+    layer_set_hidden(s_progress_layer, !visible);
+  }
+
+  if (visible) {
+    prv_start_progress_loading();
+  } else {
+    prv_stop_progress_loading();
+  }
+}
+
+static void prv_show_response_view(void) {
+  s_progress_mode = false;
+  prv_set_progress_visible(false);
+}
+
+static int16_t prv_clamp_int16(int16_t value, int16_t min, int16_t max) {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+
+  return value;
+}
+
+static void prv_update_progress_text(void) {
+  int16_t title_height;
+  int16_t detail_height = 0;
+  int16_t group_height;
+  int16_t group_y;
+  int16_t max_y;
+
+  if (s_progress_title_layer) {
+    text_layer_set_size(s_progress_title_layer, GSize(s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
+    text_layer_set_text(s_progress_title_layer, s_progress_title);
+  }
+  if (s_progress_detail_layer) {
+    text_layer_set_size(s_progress_detail_layer, GSize(s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
+    text_layer_set_text(s_progress_detail_layer, s_progress_detail);
+  }
+
+  if (!s_progress_title_layer || !s_progress_detail_layer || s_progress_width <= 0 || s_progress_height <= 0) {
+    return;
+  }
+
+  title_height = prv_clamp_int16(text_layer_get_content_size(s_progress_title_layer).h, PROGRESS_TITLE_MIN_HEIGHT, PROGRESS_TITLE_MAX_HEIGHT);
+  if (s_progress_detail[0] != '\0') {
+    detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
+  }
+
+  group_height = title_height + (detail_height ? PROGRESS_TEXT_GAP + detail_height : 0);
+  group_y = (s_progress_height - group_height) / 2;
+  max_y = s_progress_height - PROGRESS_LOADING_HEIGHT - group_height;
+  if (max_y < 0) {
+    max_y = 0;
+  }
+  if (group_y > max_y) {
+    group_y = max_y;
+  }
+  if (group_y < 0) {
+    group_y = 0;
+  }
+
+  layer_set_frame(text_layer_get_layer(s_progress_title_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y, s_progress_width, title_height));
+  layer_set_hidden(text_layer_get_layer(s_progress_detail_layer), detail_height == 0);
+  if (detail_height) {
+    layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
+  }
+}
+
+static void prv_set_progress_title(const char *text) {
+  snprintf(s_progress_title, sizeof(s_progress_title), "%s", text && text[0] ? text : "thinking");
+  prv_update_progress_text();
+}
+
+static void prv_set_progress_detail(const char *text) {
+  snprintf(s_progress_detail, sizeof(s_progress_detail), "%s", text ? text : "");
+  prv_update_progress_text();
+}
+
 static void prv_append_text_limited(const char *text) {
   size_t used = strlen(s_response);
   size_t incoming = strlen(text);
@@ -173,7 +361,11 @@ static void prv_progress_reset(void) {
   s_progress_mode = true;
   s_response[0] = '\0';
   s_response_truncated = false;
+  snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
+  s_progress_detail[0] = '\0';
   prv_update_scroll_text();
+  prv_update_progress_text();
+  prv_set_progress_visible(true);
   scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
 }
 
@@ -182,13 +374,11 @@ static void prv_progress_append(const char *text) {
     prv_progress_reset();
   }
 
-  prv_append_text_limited(text);
-  prv_append_text_limited("\n");
-  prv_update_scroll_text();
+  prv_set_progress_title(text);
 }
 
 static void prv_set_response(const char *text) {
-  s_progress_mode = false;
+  prv_show_response_view();
   snprintf(s_response, sizeof(s_response), "%s", text);
   s_response_truncated = false;
   prv_update_scroll_text();
@@ -196,10 +386,15 @@ static void prv_set_response(const char *text) {
 }
 
 static void prv_set_progress(const char *text) {
-  prv_progress_append(text);
+  if (!s_progress_mode) {
+    prv_progress_reset();
+  }
+
+  prv_set_progress_title(text);
 }
 
 static void prv_append_response(const char *text) {
+  prv_show_response_view();
   prv_append_text_limited(text);
   prv_update_scroll_text();
 }
@@ -232,7 +427,9 @@ static void prv_send_request(const char *text) {
 
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
   prv_set_status("Waiting for phone");
-  prv_set_response("Waiting for response...");
+  prv_progress_reset();
+  prv_set_progress("thinking");
+  prv_set_progress_detail("waiting for phone");
 }
 
 static void prv_dictation_callback(DictationSession *session, DictationSessionStatus status,
@@ -333,7 +530,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
     prv_set_status("Receiving");
-    s_progress_mode = false;
+    prv_show_response_view();
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
@@ -356,6 +553,15 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (progress_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "progress text len=%u", (unsigned int)strlen(progress_t->value->cstring));
     prv_set_progress(progress_t->value->cstring);
+  }
+
+  Tuple *progress_detail_t = dict_find(iter, MESSAGE_KEY_ProgressDetail);
+  if (progress_detail_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress detail len=%u", (unsigned int)strlen(progress_detail_t->value->cstring));
+    if (!s_progress_mode) {
+      prv_progress_reset();
+    }
+    prv_set_progress_detail(progress_detail_t->value->cstring);
   }
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
@@ -410,6 +616,8 @@ static void prv_window_load(Window *window) {
 
   s_text_width = bounds.size.w - 8;
   s_min_text_height = bounds.size.h;
+  s_progress_width = bounds.size.w - (PROGRESS_TEXT_SIDE_PADDING * 2);
+  s_progress_height = bounds.size.h;
 
   s_text_layer = text_layer_create(GRect(4, 0, s_text_width, s_min_text_height));
   text_layer_set_background_color(s_text_layer, GColorClear);
@@ -420,11 +628,40 @@ static void prv_window_load(Window *window) {
   scroll_layer_add_child(s_scroll_layer, text_layer_get_layer(s_text_layer));
   text_layer_enable_screen_text_flow_and_paging(s_text_layer, 4);
 
+  s_progress_layer = layer_create(bounds);
+  layer_set_hidden(s_progress_layer, true);
+  layer_add_child(window_layer, s_progress_layer);
+
+  s_progress_title_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
+  text_layer_set_background_color(s_progress_title_layer, GColorClear);
+  text_layer_set_text_color(s_progress_title_layer, GColorBlack);
+  text_layer_set_font(s_progress_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
+  text_layer_set_overflow_mode(s_progress_title_layer, GTextOverflowModeWordWrap);
+  text_layer_set_text_alignment(s_progress_title_layer, GTextAlignmentCenter);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_title_layer));
+
+  s_progress_detail_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
+  text_layer_set_background_color(s_progress_detail_layer, GColorClear);
+  text_layer_set_text_color(s_progress_detail_layer, GColorBlack);
+  text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeWordWrap);
+  text_layer_set_text_alignment(s_progress_detail_layer, GTextAlignmentCenter);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_detail_layer));
+
+  s_progress_loading_layer = layer_create(GRect(0, bounds.size.h - PROGRESS_LOADING_HEIGHT, bounds.size.w, PROGRESS_LOADING_HEIGHT));
+  layer_set_update_proc(s_progress_loading_layer, prv_progress_loading_update_proc);
+  layer_add_child(s_progress_layer, s_progress_loading_layer);
+
   prv_set_status("Ready");
   prv_set_response("Press SELECT to dictate.\n\nUse UP/DOWN to scroll responses.");
 }
 
 static void prv_window_unload(Window *window) {
+  prv_stop_progress_loading();
+  layer_destroy(s_progress_loading_layer);
+  text_layer_destroy(s_progress_detail_layer);
+  text_layer_destroy(s_progress_title_layer);
+  layer_destroy(s_progress_layer);
   text_layer_destroy(s_text_layer);
   scroll_layer_destroy(s_scroll_layer);
 }
@@ -439,6 +676,7 @@ static void prv_init(void) {
   }
 
   s_window = window_create();
+  window_set_background_color(s_window, GColorWhite);
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = prv_window_load,
     .unload = prv_window_unload,

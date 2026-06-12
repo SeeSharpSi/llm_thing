@@ -176,48 +176,32 @@ function sendWatchText(requestId, text, includeDone, onDone) {
   sendReset(requestId, sendNext);
 }
 
-function sendProgressReset(requestId, onDone) {
-  sendMessage({
-    ProgressReset: 1,
-    RequestId: requestId
-  }, onDone);
-}
+function sendProgressState(requestId, current, detail, reset, onDone) {
+  var dict = {
+    RequestId: requestId,
+    ProgressText: truncate(current || 'thinking', 80),
+    ProgressDetail: truncate(detail || '', 160)
+  };
 
-function sendProgressAppend(requestId, text, onDone) {
-  sendMessage({
-    ProgressAppend: truncate(text, 380),
-    RequestId: requestId
-  }, onDone);
-}
-
-function progressLine(prefix, text, detail) {
-  var lines = [];
-
-  if (text) {
-    lines.push(prefix + ' ' + text);
-  }
-  if (detail) {
-    lines.push('  ' + detail);
+  if (reset) {
+    dict.ProgressReset = 1;
   }
 
-  return lines.join('\n');
-}
-
-function progressDoneText(text, detail) {
-  return progressLine('ok', text, detail);
+  sendMessage(dict, onDone);
 }
 
 function progressStart(requestId, current, detail) {
   s_progress.requestId = requestId;
   s_progress.active = true;
-  s_progress.current = current || '';
+  s_progress.current = current || 'thinking';
   s_progress.detail = detail || '';
-  sendProgressReset(requestId, function() {
-    sendProgressAppend(requestId, progressLine('...', s_progress.current, s_progress.detail));
-  });
+  sendProgressState(requestId, s_progress.current, s_progress.detail, true);
 }
 
 function progressSet(requestId, current, detail) {
+  current = current || 'thinking';
+  detail = detail || '';
+
   if (!s_progress.active || s_progress.requestId !== requestId) {
     progressStart(requestId, current, detail);
     return;
@@ -227,21 +211,15 @@ function progressSet(requestId, current, detail) {
     return;
   }
 
-  s_progress.current = current || '';
-  s_progress.detail = detail || '';
-  if (s_progress.current) {
-    sendProgressAppend(requestId, progressLine('...', s_progress.current, s_progress.detail));
-  }
+  s_progress.current = current;
+  s_progress.detail = detail;
+  sendProgressState(requestId, s_progress.current, s_progress.detail, false);
 }
 
 function progressDone(requestId, text, detail) {
   if (!s_progress.active || s_progress.requestId !== requestId) {
     return;
   }
-
-  sendProgressAppend(requestId, progressDoneText(text, detail));
-  s_progress.current = '';
-  s_progress.detail = '';
 }
 
 function progressStop(requestId) {
@@ -314,6 +292,13 @@ function summarizeToolArgs(args) {
   var key;
 
   args = args || {};
+  if (args.query !== undefined && args.query !== null && args.query !== '') {
+    return truncate(args.query, 120);
+  }
+  if (args.url !== undefined && args.url !== null && args.url !== '') {
+    return truncate(args.url, 120);
+  }
+
   for (i = 0; i < keys.length; i += 1) {
     key = keys[i];
     if (args[key] !== undefined && args[key] !== null && args[key] !== '') {
@@ -328,8 +313,24 @@ function summarizeToolArgs(args) {
   return parts.join(', ');
 }
 
+function formatToolWords(value) {
+  var words = trim(value).replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').split(' ');
+  var result = [];
+  var i;
+  var word;
+
+  for (i = 0; i < words.length; i += 1) {
+    word = words[i];
+    if (word) {
+      result.push(word.charAt(0).toUpperCase() + word.substring(1));
+    }
+  }
+
+  return result.join(' ');
+}
+
 function formatToolLabel(toolInfo) {
-  return toolInfo.server.label + ' ' + toolInfo.toolName;
+  return formatToolWords(toolInfo.server.label + ' ' + toolInfo.toolName);
 }
 
 function parseJsonOrSse(text) {
@@ -1023,7 +1024,7 @@ function appendToolResults(conversation, assistantText, results) {
 
 function completeWithTools(requestId, settings, conversation, toolMap, round, usedToolCalls, callback) {
   logDebug('tool loop round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
-  progressSet(requestId, round === 0 ? 'Thinking' : 'Thinking with tool results', 'round ' + (round + 1));
+  progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
   requestModel(settings, conversation, function(error, json) {
     var assistantText;
     var toolCalls;
@@ -1069,7 +1070,7 @@ function requestCompletion(requestId, userText) {
 
   logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls);
   syncWatchSettings(settings);
-  progressStart(requestId, 'Starting request', 'dictation: ' + String(userText || '').length + ' chars');
+  progressStart(requestId, 'thinking', '');
 
   if (!settings.Endpoint) {
     sendError(requestId, 'Endpoint missing. Open settings on phone.');
