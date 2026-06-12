@@ -67,8 +67,10 @@ static void prv_append_response(const char *text) {
 static void prv_send_request(const char *text) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "send request start next_id=%lu text_len=%u", (unsigned long)(s_request_id + 1), (unsigned int)strlen(text));
 
   if (result != APP_MSG_OK || !iter) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "outbox begin failed result=%d", result);
     prv_set_response("Could not contact phone. Try again.");
     return;
   }
@@ -80,15 +82,18 @@ static void prv_send_request(const char *text) {
 
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)s_request_id, result);
     prv_set_response("Could not send request to phone.");
     return;
   }
 
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
   prv_set_response("Waiting for response...");
 }
 
 static void prv_dictation_callback(DictationSession *session, DictationSessionStatus status,
                                    char *transcription, void *context) {
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "dictation callback status=%d text_len=%u", status, (unsigned int)(transcription ? strlen(transcription) : 0));
   switch (status) {
     case DictationSessionStatusSuccess:
       if (transcription && transcription[0] != '\0') {
@@ -131,6 +136,7 @@ static bool prv_ensure_dictation_session(void) {
 
 static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
 #if defined(PBL_MICROPHONE)
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "select pressed: start dictation");
   if (!prv_ensure_dictation_session()) {
     return;
   }
@@ -138,9 +144,11 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
   prv_set_response("Listening...");
   DictationSessionStatus status = dictation_session_start(s_dictation_session);
   if (status != DictationSessionStatusSuccess) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "dictation start failed status=%d", status);
     prv_set_response("Could not start dictation.");
   }
 #else
+  APP_LOG(APP_LOG_LEVEL_WARNING, "select pressed: microphone unsupported");
   prv_set_response("Voice dictation unsupported on this watch.");
 #endif
 }
@@ -151,12 +159,15 @@ static void prv_scroll_click_config_provider(void *context) {
 
 static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) {
   Tuple *request_id_t = dict_find(iter, MESSAGE_KEY_RequestId);
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "inbox received request_id=%lu current=%lu", (unsigned long)(request_id_t ? request_id_t->value->uint32 : 0), (unsigned long)s_request_id);
   if (request_id_t && request_id_t->value->uint32 != s_request_id) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored stale response request_id=%lu", (unsigned long)request_id_t->value->uint32);
     return;
   }
 
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
@@ -164,16 +175,19 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
   if (chunk_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk len=%u", (unsigned int)strlen(chunk_t->value->cstring));
     prv_append_response(chunk_t->value->cstring);
   }
 
   Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
   if (error_t) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
     prv_set_response(error_t->value->cstring);
   }
 
   Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
   if (done_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
     if (s_response[0] == '\0') {
       prv_set_response("No response text.");
     } else {
@@ -183,10 +197,12 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 }
 
 static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
+  APP_LOG(APP_LOG_LEVEL_ERROR, "inbox dropped reason=%d", reason);
   prv_set_response("Response message dropped. Try again.");
 }
 
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
+  APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
   prv_set_response("Phone connection failed. Try again.");
 }
 
@@ -223,6 +239,7 @@ static void prv_window_unload(Window *window) {
 }
 
 static void prv_init(void) {
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "app init");
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = prv_window_load,
@@ -233,6 +250,7 @@ static void prv_init(void) {
   app_message_register_inbox_dropped(prv_inbox_dropped_handler);
   app_message_register_outbox_failed(prv_outbox_failed_handler);
   app_message_open(app_message_inbox_size_maximum(), app_message_outbox_size_maximum());
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "appmessage opened inbox=%lu outbox=%lu", (unsigned long)app_message_inbox_size_maximum(), (unsigned long)app_message_outbox_size_maximum());
 
 #if defined(PBL_MICROPHONE)
   prv_ensure_dictation_session();

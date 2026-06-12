@@ -5,7 +5,7 @@ module.exports = [
   },
   {
     "type": "text",
-    "defaultValue": "Configure the OpenAI-compatible endpoint used by the phone. The API key and prompt stay on the phone."
+    "defaultValue": "Configure the OpenAI-compatible endpoint used by the phone. MCP tools are called by the phone, so endpoints do not need native MCP support."
   },
   {
     "type": "section",
@@ -73,7 +73,7 @@ module.exports = [
         "type": "toggle",
         "messageKey": "WebSearchEnabled",
         "label": "Web Search",
-        "description": "Allow supported Responses API models to search the web.",
+        "description": "Ask models with web access to search when useful.",
         "defaultValue": false
       }
     ]
