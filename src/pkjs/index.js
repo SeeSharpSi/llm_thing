@@ -7,6 +7,9 @@ clay.registerComponent(mcpServersComponent);
 var SETTINGS_KEY = 'llm_thing_settings';
 var CHUNK_SIZE = 400;
 var MAX_RESPONSE_CHARS = 6000;
+// Non-NUL style markers are stripped from display and drive watch-side fonts.
+var WATCH_BOLD_ON = '\u0001';
+var WATCH_BOLD_OFF = '\u0002';
 var DEFAULT_MAX_TOOL_CALLS = 4;
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
@@ -217,6 +220,51 @@ function truncateResponseForWatch(text, limit) {
   return value.substring(0, limit - suffix.length) + suffix;
 }
 
+function formatMarkdownBoldForWatch(text, maxLength) {
+  var value = String(text || '');
+  var output = '';
+  var i = 0;
+  var close;
+  var ch;
+
+  function appendChar(value) {
+    if (output.length >= maxLength) {
+      return false;
+    }
+    if (value !== WATCH_BOLD_ON && value !== WATCH_BOLD_OFF) {
+      output += value;
+    }
+    return true;
+  }
+
+  while (i < value.length && output.length < maxLength) {
+    if (value.substring(i, i + 2) === '**') {
+      close = value.indexOf('**', i + 2);
+      if (close !== -1) {
+        if (output.length + 2 > maxLength) {
+          break;
+        }
+
+        output += WATCH_BOLD_ON;
+        i += 2;
+        while (i < close && output.length < maxLength - 1) {
+          appendChar(value.charAt(i));
+          i += 1;
+        }
+        output += WATCH_BOLD_OFF;
+        i = close + 2;
+        continue;
+      }
+    }
+
+    ch = value.charAt(i);
+    appendChar(ch);
+    i += 1;
+  }
+
+  return output;
+}
+
 function sendProgressState(requestId, current, detail, reset, onDone) {
   var dict = {
     RequestId: requestId,
@@ -283,7 +331,7 @@ function sendError(requestId, message) {
 
 function sendResponse(requestId, settings, text) {
   var limit = maxResponseCharsForFontSize(settings);
-  var value = truncateResponseForWatch(text, limit);
+  var value = formatMarkdownBoldForWatch(truncateResponseForWatch(text, limit), MAX_RESPONSE_CHARS);
 
   progressStop(requestId);
   logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + limit);

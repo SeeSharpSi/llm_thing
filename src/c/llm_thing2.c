@@ -9,6 +9,11 @@
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_MEASURE_HEIGHT 32000
+#define TEXT_MEASURE_WIDTH 32000
+#define TEXT_RUN_BUFFER_SIZE 256
+// Phone-side Markdown parsing sends these non-NUL markers inside ResponseChunk.
+#define TEXT_BOLD_ON '\x01'
+#define TEXT_BOLD_OFF '\x02'
 #define PROGRESS_TITLE_BUFFER_SIZE 96
 #define PROGRESS_DETAIL_BUFFER_SIZE 192
 #define PROGRESS_LOADING_HEIGHT 28
@@ -24,7 +29,7 @@
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
-static TextLayer *s_text_layer;
+static Layer *s_text_layer;
 static Layer *s_progress_layer;
 static TextLayer *s_progress_title_layer;
 static TextLayer *s_progress_detail_layer;
@@ -35,6 +40,7 @@ static DictationSession *s_dictation_session;
 #endif
 
 static char s_response[RESPONSE_BUFFER_SIZE];
+static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static int16_t s_text_width;
@@ -49,6 +55,7 @@ static bool s_response_truncated;
 static bool s_progress_mode;
 
 static void prv_update_scroll_text(void);
+static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
 
 static void prv_progress_loading_timer_callback(void *context);
 
@@ -79,6 +86,20 @@ static const char *prv_font_key_for_size(int size) {
     case 18:
     default:
       return FONT_KEY_GOTHIC_18;
+  }
+}
+
+static const char *prv_bold_font_key_for_size(int size) {
+  switch (prv_normalize_font_size(size)) {
+    case 14:
+      return FONT_KEY_GOTHIC_14_BOLD;
+    case 24:
+      return FONT_KEY_GOTHIC_24_BOLD;
+    case 28:
+      return FONT_KEY_GOTHIC_28_BOLD;
+    case 18:
+    default:
+      return FONT_KEY_GOTHIC_18_BOLD;
   }
 }
 
@@ -145,9 +166,200 @@ static void prv_apply_font_size(int size, bool should_persist) {
   }
 
   if (s_text_layer) {
-    text_layer_set_font(s_text_layer, fonts_get_system_font(prv_font_key_for_size(s_font_size)));
     prv_update_scroll_text();
   }
+}
+
+static GFont prv_response_font(bool bold) {
+  return fonts_get_system_font(bold ? prv_bold_font_key_for_size(s_font_size) : prv_font_key_for_size(s_font_size));
+}
+
+static void prv_copy_text_run(const char *text, size_t length) {
+  if (length >= sizeof(s_text_run)) {
+    length = sizeof(s_text_run) - 1;
+  }
+
+  memcpy(s_text_run, text, length);
+  s_text_run[length] = '\0';
+}
+
+static int16_t prv_measure_text_width(const char *text, GFont font) {
+  GSize size = graphics_text_layout_get_content_size(text, font,
+      GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+
+  if (size.w <= 0 && text[0] != '\0') {
+    return 1;
+  }
+
+  return size.w;
+}
+
+static int16_t prv_line_height(void) {
+  GFont normal_font = prv_response_font(false);
+  GFont bold_font = prv_response_font(true);
+  GSize normal_size = graphics_text_layout_get_content_size("Ag", normal_font,
+      GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+  GSize bold_size = graphics_text_layout_get_content_size("Ag", bold_font,
+      GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+  int16_t height = normal_size.h > bold_size.h ? normal_size.h : bold_size.h;
+
+  if (height <= 0) {
+    height = s_font_size + 4;
+  }
+
+  return height;
+}
+
+static int16_t prv_space_width(GFont font) {
+  int16_t x_width = prv_measure_text_width("x", font);
+  int16_t spaced_width = prv_measure_text_width("x x", font);
+  int16_t width = spaced_width - (x_width * 2);
+
+  if (width <= 0) {
+    width = s_font_size / 3;
+  }
+  if (width <= 0) {
+    width = 1;
+  }
+
+  return width;
+}
+
+static size_t prv_safe_chunk_length(const char *text, size_t length) {
+  size_t chunk_length = length < sizeof(s_text_run) - 1 ? length : sizeof(s_text_run) - 1;
+
+  if (chunk_length < length) {
+    while (chunk_length > 1 && (((uint8_t)text[chunk_length] & 0xc0) == 0x80)) {
+      chunk_length -= 1;
+    }
+  }
+  if (chunk_length == 0) {
+    chunk_length = 1;
+  }
+
+  return chunk_length;
+}
+
+static size_t prv_fit_chunk_length(const char *text, size_t length, GFont font) {
+  size_t chunk_length = prv_safe_chunk_length(text, length);
+
+  while (chunk_length > 1) {
+    prv_copy_text_run(text, chunk_length);
+    if (prv_measure_text_width(s_text_run, font) <= s_text_width) {
+      break;
+    }
+    chunk_length = prv_safe_chunk_length(text, chunk_length / 2);
+  }
+
+  return chunk_length;
+}
+
+static void prv_layout_word(const char *text, size_t length, bool bold, GContext *ctx,
+                            bool should_draw, int16_t *x, int16_t *y, int16_t line_height) {
+  GFont font = prv_response_font(bold);
+
+  while (length > 0) {
+    size_t chunk_length = prv_fit_chunk_length(text, length, font);
+    int16_t width;
+    int16_t draw_width;
+
+    prv_copy_text_run(text, chunk_length);
+    width = prv_measure_text_width(s_text_run, font);
+    if (width <= 0) {
+      width = 1;
+    }
+
+    if (*x > 0 && *x + width > s_text_width) {
+      *x = 0;
+      *y += line_height;
+    }
+
+    draw_width = width;
+    if (draw_width > s_text_width - *x) {
+      draw_width = s_text_width - *x;
+    }
+
+    if (should_draw && ctx && draw_width > 0) {
+      graphics_draw_text(ctx, s_text_run, font, GRect(*x, *y, draw_width + 2, line_height),
+          GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+    }
+
+    *x += width;
+    if (*x > s_text_width) {
+      *x = s_text_width;
+    }
+
+    text += chunk_length;
+    length -= chunk_length;
+  }
+}
+
+static void prv_layout_spaces(const char *text, size_t length, bool bold, int16_t *x,
+                              int16_t *y, int16_t line_height) {
+  GFont font = prv_response_font(bold);
+  int16_t space_width = prv_space_width(font);
+  int32_t width = 0;
+  size_t i;
+
+  if (*x == 0) {
+    return;
+  }
+
+  for (i = 0; i < length; i += 1) {
+    width += text[i] == '\t' ? space_width * 2 : space_width;
+  }
+
+  if ((int32_t)*x + width > s_text_width) {
+    *x = 0;
+    *y += line_height;
+    return;
+  }
+
+  *x += (int16_t)width;
+}
+
+static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
+  const char *cursor = s_response;
+  int16_t x = 0;
+  int16_t y = 0;
+  int16_t line_height = prv_line_height();
+  bool bold = false;
+
+  if (should_draw && ctx) {
+    graphics_context_set_text_color(ctx, GColorBlack);
+  }
+
+  while (*cursor != '\0' && y < TEXT_MEASURE_HEIGHT - line_height) {
+    if (*cursor == TEXT_BOLD_ON) {
+      bold = true;
+      cursor += 1;
+    } else if (*cursor == TEXT_BOLD_OFF) {
+      bold = false;
+      cursor += 1;
+    } else if (*cursor == '\n') {
+      x = 0;
+      y += line_height;
+      cursor += 1;
+    } else if (*cursor == ' ' || *cursor == '\t') {
+      const char *start = cursor;
+      while (*cursor == ' ' || *cursor == '\t') {
+        cursor += 1;
+      }
+      prv_layout_spaces(start, cursor - start, bold, &x, &y, line_height);
+    } else {
+      const char *start = cursor;
+      while (*cursor != '\0' && *cursor != TEXT_BOLD_ON && *cursor != TEXT_BOLD_OFF &&
+             *cursor != '\n' && *cursor != ' ' && *cursor != '\t') {
+        cursor += 1;
+      }
+      prv_layout_word(start, cursor - start, bold, ctx, should_draw, &x, &y, line_height);
+    }
+  }
+
+  return y + line_height;
 }
 
 static void prv_update_scroll_text(void) {
@@ -155,11 +367,7 @@ static void prv_update_scroll_text(void) {
     return;
   }
 
-  text_layer_set_text(s_text_layer, s_response);
-  text_layer_set_size(s_text_layer, GSize(s_text_width, TEXT_MEASURE_HEIGHT));
-
-  GSize content_size = text_layer_get_content_size(s_text_layer);
-  int32_t measured_height = content_size.h;
+  int32_t measured_height = prv_layout_response_text(NULL, false);
   int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
   int32_t scroll_height;
   int32_t page_remainder;
@@ -183,8 +391,15 @@ static void prv_update_scroll_text(void) {
     scroll_height = TEXT_MEASURE_HEIGHT;
   }
 
-  text_layer_set_size(s_text_layer, GSize(s_text_width, scroll_height));
+  layer_set_frame(s_text_layer, GRect(4, 0, s_text_width, scroll_height));
+  layer_mark_dirty(s_text_layer);
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, scroll_height));
+}
+
+static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+  prv_layout_response_text(ctx, true);
 }
 
 static void prv_schedule_progress_loading_timer(void) {
@@ -634,14 +849,9 @@ static void prv_window_load(Window *window) {
   s_progress_width = bounds.size.w - (PROGRESS_TEXT_SIDE_PADDING * 2);
   s_progress_height = bounds.size.h;
 
-  s_text_layer = text_layer_create(GRect(4, 0, s_text_width, s_min_text_height));
-  text_layer_set_background_color(s_text_layer, GColorClear);
-  text_layer_set_text_color(s_text_layer, GColorBlack);
-  text_layer_set_font(s_text_layer, fonts_get_system_font(prv_font_key_for_size(s_font_size)));
-  text_layer_set_overflow_mode(s_text_layer, GTextOverflowModeWordWrap);
-  text_layer_set_text_alignment(s_text_layer, GTextAlignmentLeft);
-  scroll_layer_add_child(s_scroll_layer, text_layer_get_layer(s_text_layer));
-  text_layer_enable_screen_text_flow_and_paging(s_text_layer, 4);
+  s_text_layer = layer_create(GRect(4, 0, s_text_width, s_min_text_height));
+  layer_set_update_proc(s_text_layer, prv_text_layer_update_proc);
+  scroll_layer_add_child(s_scroll_layer, s_text_layer);
 
   s_progress_layer = layer_create(bounds);
   layer_set_hidden(s_progress_layer, true);
@@ -677,7 +887,7 @@ static void prv_window_unload(Window *window) {
   text_layer_destroy(s_progress_detail_layer);
   text_layer_destroy(s_progress_title_layer);
   layer_destroy(s_progress_layer);
-  text_layer_destroy(s_text_layer);
+  layer_destroy(s_text_layer);
   scroll_layer_destroy(s_scroll_layer);
 }
 
