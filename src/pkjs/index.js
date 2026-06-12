@@ -81,6 +81,20 @@ function clampNumber(value, min, max, fallback) {
   return number;
 }
 
+function minNumber(value, min, fallback) {
+  var number = parseInt(value, 10);
+
+  if (isNaN(number)) {
+    return fallback;
+  }
+
+  if (number < min) {
+    return min;
+  }
+
+  return number;
+}
+
 function extend(base, extra) {
   var result = {};
   var key;
@@ -108,7 +122,7 @@ function extend(base, extra) {
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
-  result.MaxToolCalls = clampNumber(result.MaxToolCalls, 0, 10, DEFAULT_MAX_TOOL_CALLS);
+  result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
     result.FontSize = 18;
