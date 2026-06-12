@@ -36,12 +36,14 @@
       "ResponseDone",
       "ResponseError",
       "ResponseReset",
+      "ProgressText",
       "Endpoint",
       "ApiKey",
       "Model",
       "SystemPrompt",
       "ShowThinking",
       "WebSearchEnabled",
+      "MaxToolCalls",
       "McpServersJson"
     ],
     "resources": {

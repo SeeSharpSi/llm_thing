@@ -7,14 +7,53 @@ clay.registerComponent(mcpServersComponent);
 var SETTINGS_KEY = 'llm_thing_settings';
 var CHUNK_SIZE = 400;
 var MAX_RESPONSE_CHARS = 6000;
-var MAX_TOOL_ROUNDS = 4;
+var DEFAULT_MAX_TOOL_CALLS = 4;
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
 var s_mcp_request_id = 1;
+var s_send_queue = [];
+var s_send_busy = false;
+var s_progress = {
+  requestId: 0,
+  active: false,
+  sending: false,
+  dirty: false,
+  spinnerIndex: 0,
+  timer: null,
+  current: '',
+  detail: '',
+  history: []
+};
+var SPINNER_FRAMES = ['|', '/', '-', '\\'];
 
 function logDebug(message) {
   console.log('[llm_thing] ' + message);
+}
+
+function processSendQueue() {
+  var item;
+
+  if (s_send_busy || !s_send_queue.length) {
+    return;
+  }
+
+  item = s_send_queue.shift();
+  s_send_busy = true;
+  Pebble.sendAppMessage(item.dict, function() {
+    s_send_busy = false;
+    if (item.onSuccess) {
+      item.onSuccess();
+    }
+    processSendQueue();
+  }, function(e) {
+    s_send_busy = false;
+    logDebug('sendAppMessage failed: ' + JSON.stringify(e));
+    if (item.onFailure) {
+      item.onFailure(e);
+    }
+    processSendQueue();
+  });
 }
 
 var DEFAULT_SETTINGS = {
@@ -24,8 +63,27 @@ var DEFAULT_SETTINGS = {
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen.',
   ShowThinking: false,
   WebSearchEnabled: false,
+  MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   McpServersJson: '[]'
 };
+
+function clampNumber(value, min, max, fallback) {
+  var number = parseInt(value, 10);
+
+  if (isNaN(number)) {
+    return fallback;
+  }
+
+  if (number < min) {
+    return min;
+  }
+
+  if (number > max) {
+    return max;
+  }
+
+  return number;
+}
 
 function extend(base, extra) {
   var result = {};
@@ -54,6 +112,7 @@ function extend(base, extra) {
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
+  result.MaxToolCalls = clampNumber(result.MaxToolCalls, 0, 10, DEFAULT_MAX_TOOL_CALLS);
   return result;
 }
 
@@ -69,36 +128,34 @@ function saveSettings(settings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(extend(DEFAULT_SETTINGS, settings)));
 }
 
-function sendMessage(dict, onSuccess) {
-  Pebble.sendAppMessage(dict, function() {
-    if (onSuccess) {
-      onSuccess();
-    }
-  }, function(e) {
-    logDebug('sendAppMessage failed: ' + JSON.stringify(e));
+function sendMessage(dict, onSuccess, onFailure) {
+  s_send_queue.push({
+    dict: dict,
+    onSuccess: onSuccess,
+    onFailure: onFailure
   });
+  processSendQueue();
 }
 
 function sendReset(requestId, onSuccess) {
   sendMessage({ ResponseReset: 1, RequestId: requestId }, onSuccess);
 }
 
-function sendError(requestId, message) {
-  logDebug('watch error request=' + requestId + ' message=' + String(message).substring(0, 160));
-  sendReset(requestId, function() {
-    sendMessage({ ResponseError: String(message).substring(0, CHUNK_SIZE), RequestId: requestId });
-  });
-}
-
-function sendResponse(requestId, text) {
+function sendWatchText(requestId, text, includeDone, onDone) {
   var i = 0;
   var value = String(text || '').substring(0, MAX_RESPONSE_CHARS);
 
-  logDebug('send response request=' + requestId + ' chars=' + value.length);
+  function finish() {
+    if (includeDone) {
+      sendMessage({ ResponseDone: 1, RequestId: requestId }, onDone);
+    } else if (onDone) {
+      onDone();
+    }
+  }
 
   function sendNext() {
     if (i >= value.length) {
-      sendMessage({ ResponseDone: 1, RequestId: requestId });
+      finish();
       return;
     }
 
@@ -112,6 +169,162 @@ function sendResponse(requestId, text) {
   }
 
   sendReset(requestId, sendNext);
+}
+
+function sendProgressText(requestId, text, onDone) {
+  sendMessage({
+    ProgressText: truncate(text, 1500),
+    RequestId: requestId
+  }, onDone);
+}
+
+function progressTrimHistory() {
+  while (s_progress.history.length > 18) {
+    s_progress.history.shift();
+  }
+}
+
+function progressArchiveCurrent() {
+  if (!s_progress.current) {
+    return;
+  }
+
+  s_progress.history.push('ok ' + s_progress.current);
+  if (s_progress.detail) {
+    s_progress.history.push('  ' + s_progress.detail);
+  }
+  progressTrimHistory();
+}
+
+function progressRender() {
+  var frame = SPINNER_FRAMES[s_progress.spinnerIndex % SPINNER_FRAMES.length];
+  var lines = [];
+  var i;
+
+  for (i = 0; i < s_progress.history.length; i += 1) {
+    lines.push(s_progress.history[i]);
+  }
+
+  if (s_progress.current) {
+    lines.push(frame + ' ' + s_progress.current);
+  }
+  if (s_progress.detail) {
+    lines.push('  ' + s_progress.detail);
+  }
+
+  return lines.join('\n');
+}
+
+function progressSendLatest() {
+  if (!s_progress.active || s_progress.sending) {
+    s_progress.dirty = true;
+    return;
+  }
+
+  s_progress.sending = true;
+  s_progress.dirty = false;
+  sendProgressText(s_progress.requestId, progressRender(), function() {
+    s_progress.sending = false;
+    if (s_progress.dirty && s_progress.active) {
+      progressSendLatest();
+    }
+  });
+}
+
+function progressSchedule() {
+  if (!s_progress.active) {
+    return;
+  }
+
+  progressSendLatest();
+}
+
+function progressTick() {
+  if (!s_progress.active || !s_progress.current) {
+    s_progress.timer = null;
+    return;
+  }
+
+  s_progress.spinnerIndex += 1;
+  progressSchedule();
+  s_progress.timer = setTimeout(progressTick, 350);
+}
+
+function progressStart(requestId, current, detail) {
+  s_progress.requestId = requestId;
+  s_progress.active = true;
+  s_progress.current = current || '';
+  s_progress.detail = detail || '';
+  s_progress.history = [];
+  s_progress.spinnerIndex = 0;
+  progressSchedule();
+  if (!s_progress.timer) {
+    s_progress.timer = setTimeout(progressTick, 350);
+  }
+}
+
+function progressSet(requestId, current, detail) {
+  if (!s_progress.active || s_progress.requestId !== requestId) {
+    progressStart(requestId, current, detail);
+    return;
+  }
+
+  if (s_progress.current && s_progress.current !== current) {
+    progressArchiveCurrent();
+  }
+  s_progress.current = current || '';
+  s_progress.detail = detail || '';
+  progressSchedule();
+  if (s_progress.current && !s_progress.timer) {
+    s_progress.timer = setTimeout(progressTick, 350);
+  }
+}
+
+function progressDone(requestId, text, detail) {
+  if (!s_progress.active || s_progress.requestId !== requestId) {
+    return;
+  }
+
+  s_progress.history.push('ok ' + text);
+  if (detail) {
+    s_progress.history.push('  ' + detail);
+  }
+  progressTrimHistory();
+  s_progress.current = '';
+  s_progress.detail = '';
+  progressSchedule();
+}
+
+function progressStop(requestId) {
+  if (s_progress.requestId !== requestId) {
+    return;
+  }
+
+  s_progress.active = false;
+  s_progress.dirty = false;
+  s_progress.current = '';
+  s_progress.detail = '';
+  s_progress.history = [];
+  if (s_progress.timer) {
+    clearTimeout(s_progress.timer);
+    s_progress.timer = null;
+  }
+}
+
+function sendError(requestId, message) {
+  progressStop(requestId);
+  logDebug('watch error request=' + requestId + ' message=' + String(message).substring(0, 160));
+  sendReset(requestId, function() {
+    sendMessage({ ResponseError: String(message).substring(0, CHUNK_SIZE), RequestId: requestId });
+  });
+}
+
+function sendResponse(requestId, text) {
+  var value = String(text || '').substring(0, MAX_RESPONSE_CHARS);
+
+  progressStop(requestId);
+  logDebug('send response request=' + requestId + ' chars=' + value.length);
+  sendWatchText(requestId, value, true);
 }
 
 function trim(value) {
@@ -140,6 +353,40 @@ function safeJson(value) {
   } catch (e) {
     return 'null';
   }
+}
+
+function truncate(value, maxLength) {
+  value = String(value || '');
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return value.substring(0, maxLength - 3) + '...';
+}
+
+function summarizeToolArgs(args) {
+  var parts = [];
+  var keys = ['query', 'url', 'max_results', 'time_range', 'search_depth'];
+  var i;
+  var key;
+
+  args = args || {};
+  for (i = 0; i < keys.length; i += 1) {
+    key = keys[i];
+    if (args[key] !== undefined && args[key] !== null && args[key] !== '') {
+      parts.push(key + ': ' + truncate(args[key], 80));
+    }
+  }
+
+  if (!parts.length) {
+    return truncate(safeJson(args), 100);
+  }
+
+  return parts.join(', ');
+}
+
+function formatToolLabel(toolInfo) {
+  return toolInfo.server.label + ' ' + toolInfo.toolName;
 }
 
 function parseJsonOrSse(text) {
@@ -516,7 +763,7 @@ function callMcpTool(toolInfo, args, callback) {
   });
 }
 
-function runToolCalls(toolCalls, toolMap, callback) {
+function runToolCalls(requestId, toolCalls, toolMap, callback) {
   var results = [];
   var index = 0;
 
@@ -545,6 +792,7 @@ function runToolCalls(toolCalls, toolMap, callback) {
 
     toolInfo = toolMap[name];
     if (!toolInfo) {
+      progressDone(requestId, String(name || 'unknown'), 'unknown tool');
       results.push({
         id: call.id || name || String(index),
         name: name || 'unknown',
@@ -554,8 +802,10 @@ function runToolCalls(toolCalls, toolMap, callback) {
       return;
     }
 
+    progressSet(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
     callMcpTool(toolInfo, args, function(error, resultText) {
       if (error) {
+        progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + truncate(error, 90));
         results.push({
           id: call.id || name,
           name: name,
@@ -567,6 +817,7 @@ function runToolCalls(toolCalls, toolMap, callback) {
           name: name,
           result: resultText
         });
+        progressDone(requestId, formatToolLabel(toolInfo), String(resultText || '').length + ' chars');
       }
       next();
     });
@@ -599,17 +850,18 @@ function expandSystemPromptVariables(prompt) {
   return String(prompt || '').replace(/\$DATETIME/g, formatDateTime(new Date()));
 }
 
-function buildToolInstructions(tools) {
+function buildToolInstructions(tools, maxToolCalls) {
   var text;
   var i;
 
-  if (!tools.length) {
+  if (!tools.length || maxToolCalls <= 0) {
     return '';
   }
 
   text = '\n\nPhone-side MCP tools are available. If a tool is needed, respond with only JSON in this exact shape:' +
     '\n{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{}}]}' +
     '\nDo not include markdown, explanation, or final answer with tool call JSON. After tool results are provided, answer the user normally or request more tools with the same JSON shape.' +
+    '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.' +
     '\nAvailable tools:';
 
   for (i = 0; i < tools.length; i += 1) {
@@ -826,11 +1078,13 @@ function appendToolResults(conversation, assistantText, results) {
   });
 }
 
-function completeWithTools(settings, conversation, toolMap, round, callback) {
-  logDebug('tool loop round=' + round + ' availableTools=' + Object.keys(toolMap).length);
+function completeWithTools(requestId, settings, conversation, toolMap, round, usedToolCalls, callback) {
+  logDebug('tool loop round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
+  progressSet(requestId, round === 0 ? 'Thinking' : 'Thinking with tool results', 'round ' + (round + 1));
   requestModel(settings, conversation, function(error, json) {
     var assistantText;
     var toolCalls;
+    var remainingToolCalls;
 
     if (error) {
       callback(error);
@@ -847,23 +1101,31 @@ function completeWithTools(settings, conversation, toolMap, round, callback) {
       return;
     }
 
-    if (round >= MAX_TOOL_ROUNDS) {
-      callback('Tool loop limit reached');
+    remainingToolCalls = settings.MaxToolCalls - usedToolCalls;
+    if (remainingToolCalls <= 0) {
+      callback('Tool call limit reached');
       return;
     }
 
-    runToolCalls(toolCalls, toolMap, function(results) {
+    if (toolCalls.length > remainingToolCalls) {
+      logDebug('tool loop truncating toolCalls=' + toolCalls.length + ' remaining=' + remainingToolCalls);
+      toolCalls = toolCalls.slice(0, remainingToolCalls);
+    }
+
+    runToolCalls(requestId, toolCalls, toolMap, function(results) {
       logDebug('tool loop results=' + results.length);
       appendToolResults(conversation, assistantText, results);
-      completeWithTools(settings, conversation, toolMap, round + 1, callback);
+      completeWithTools(requestId, settings, conversation, toolMap, round + 1, usedToolCalls + toolCalls.length, callback);
     });
   });
 }
 
 function requestCompletion(requestId, userText) {
   var settings = loadSettings();
+  var conversation;
 
-  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model);
+  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls);
+  progressStart(requestId, 'Starting request', 'dictation: ' + String(userText || '').length + ' chars');
 
   if (!settings.Endpoint) {
     sendError(requestId, 'Endpoint missing. Open settings on phone.');
@@ -875,17 +1137,31 @@ function requestCompletion(requestId, userText) {
     return;
   }
 
-  discoverMcpTools(settings, function(error, tools, toolMap) {
-    var conversation;
+  if (settings.MaxToolCalls <= 0) {
+    logDebug('mcp disabled maxToolCalls=0');
+    conversation = buildInitialConversation(settings, userText, '');
+    completeWithTools(requestId, settings, conversation, {}, 0, 0, function(completionError, text) {
+      if (completionError) {
+        sendError(requestId, completionError);
+        return;
+      }
 
+      sendResponse(requestId, text);
+    });
+    return;
+  }
+
+  progressSet(requestId, 'Loading MCP tools', 'discovering servers');
+  discoverMcpTools(settings, function(error, tools, toolMap) {
     if (error) {
       sendError(requestId, error);
       return;
     }
 
-    conversation = buildInitialConversation(settings, userText, buildToolInstructions(tools));
+    conversation = buildInitialConversation(settings, userText, buildToolInstructions(tools, settings.MaxToolCalls));
     logDebug('mcp discover done tools=' + tools.length);
-    completeWithTools(settings, conversation, toolMap, 0, function(completionError, text) {
+    progressDone(requestId, 'MCP tools loaded', tools.length + ' tools');
+    completeWithTools(requestId, settings, conversation, toolMap, 0, 0, function(completionError, text) {
       if (completionError) {
         sendError(requestId, completionError);
         return;

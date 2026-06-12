@@ -75,6 +75,19 @@ module.exports = [
         "label": "Web Search",
         "description": "Ask models with web access to search when useful.",
         "defaultValue": false
+      },
+      {
+        "type": "input",
+        "messageKey": "MaxToolCalls",
+        "label": "Max Tool Calls",
+        "description": "Maximum phone-side MCP tool calls per request. Use 0 to disable MCP tools.",
+        "defaultValue": 4,
+        "attributes": {
+          "type": "number",
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
       }
     ]
   },

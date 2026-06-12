@@ -2,6 +2,7 @@
 
 #define DICTATION_BUFFER_SIZE 384
 #define RESPONSE_BUFFER_SIZE 6144
+#define SCROLL_LINE_DELTA 20
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
@@ -13,8 +14,15 @@ static DictationSession *s_dictation_session;
 static char s_response[RESPONSE_BUFFER_SIZE];
 static int16_t s_text_width;
 static int16_t s_min_text_height;
+static int16_t s_content_height;
 static uint32_t s_request_id;
 static bool s_response_truncated;
+static bool s_progress_mode;
+static bool s_follow_bottom;
+
+static void prv_set_status(const char *text) {
+  (void)text;
+}
 
 static void prv_update_scroll_text(void) {
   if (!s_text_layer || !s_scroll_layer) {
@@ -31,13 +39,80 @@ static void prv_update_scroll_text(void) {
 
   text_layer_set_size(s_text_layer, GSize(s_text_width, content_size.h));
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_size.h));
+  s_content_height = content_size.h;
+}
+
+static int16_t prv_bottom_offset_y(void) {
+  if (s_content_height <= s_min_text_height) {
+    return 0;
+  }
+
+  return s_min_text_height - s_content_height;
+}
+
+static void prv_clamp_scroll_offset(void) {
+  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
+  int16_t bottom_y = prv_bottom_offset_y();
+
+  if (offset.y > 0) {
+    offset.y = 0;
+  } else if (offset.y < bottom_y) {
+    offset.y = bottom_y;
+  }
+
+  scroll_layer_set_content_offset(s_scroll_layer, offset, false);
+}
+
+static bool prv_is_at_bottom(void) {
+  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
+  int16_t bottom_y = prv_bottom_offset_y();
+
+  return offset.y <= bottom_y + (SCROLL_LINE_DELTA / 2);
+}
+
+static void prv_scroll_to_bottom(void) {
+  scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, prv_bottom_offset_y()), false);
+}
+
+static void prv_scroll_by(int16_t delta_y) {
+  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
+  int16_t bottom_y = prv_bottom_offset_y();
+
+  offset.y += delta_y;
+  if (offset.y > 0) {
+    offset.y = 0;
+  } else if (offset.y < bottom_y) {
+    offset.y = bottom_y;
+  }
+
+  scroll_layer_set_content_offset(s_scroll_layer, offset, false);
 }
 
 static void prv_set_response(const char *text) {
+  s_progress_mode = false;
+  s_follow_bottom = false;
   snprintf(s_response, sizeof(s_response), "%s", text);
   s_response_truncated = false;
   prv_update_scroll_text();
   scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+}
+
+static void prv_set_progress(const char *text) {
+  if (!s_progress_mode) {
+    s_progress_mode = true;
+    s_follow_bottom = true;
+  } else if (prv_is_at_bottom()) {
+    s_follow_bottom = true;
+  }
+
+  snprintf(s_response, sizeof(s_response), "%s", text);
+  s_response_truncated = false;
+  prv_update_scroll_text();
+  if (s_follow_bottom) {
+    prv_scroll_to_bottom();
+  } else {
+    prv_clamp_scroll_offset();
+  }
 }
 
 static void prv_append_response(const char *text) {
@@ -71,6 +146,7 @@ static void prv_send_request(const char *text) {
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox begin failed result=%d", result);
+    prv_set_status("Phone unavailable");
     prv_set_response("Could not contact phone. Try again.");
     return;
   }
@@ -83,11 +159,13 @@ static void prv_send_request(const char *text) {
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)s_request_id, result);
+    prv_set_status("Send failed");
     prv_set_response("Could not send request to phone.");
     return;
   }
 
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
+  prv_set_status("Waiting for phone");
   prv_set_response("Waiting for response...");
 }
 
@@ -99,19 +177,24 @@ static void prv_dictation_callback(DictationSession *session, DictationSessionSt
       if (transcription && transcription[0] != '\0') {
         prv_send_request(transcription);
       } else {
+        prv_set_status("No speech");
         prv_set_response("No speech detected.");
       }
       break;
     case DictationSessionStatusFailureTranscriptionRejected:
+      prv_set_status("Cancelled");
       prv_set_response("Dictation cancelled.");
       break;
     case DictationSessionStatusFailureConnectivityError:
+      prv_set_status("Dictation offline");
       prv_set_response("Dictation needs phone connection and internet.");
       break;
     case DictationSessionStatusFailureDisabled:
+      prv_set_status("Dictation disabled");
       prv_set_response("Voice dictation is disabled in Pebble settings.");
       break;
     default:
+      prv_set_status("Dictation failed");
       prv_set_response("Dictation failed. Try again.");
       break;
   }
@@ -141,19 +224,36 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
     return;
   }
 
+  prv_set_status("Listening");
   prv_set_response("Listening...");
   DictationSessionStatus status = dictation_session_start(s_dictation_session);
   if (status != DictationSessionStatusSuccess) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "dictation start failed status=%d", status);
+    prv_set_status("Dictation failed");
     prv_set_response("Could not start dictation.");
   }
 #else
   APP_LOG(APP_LOG_LEVEL_WARNING, "select pressed: microphone unsupported");
+  prv_set_status("Unsupported");
   prv_set_response("Voice dictation unsupported on this watch.");
 #endif
 }
 
+static void prv_up_click_handler(ClickRecognizerRef recognizer, void *context) {
+  s_follow_bottom = false;
+  prv_scroll_by(SCROLL_LINE_DELTA);
+}
+
+static void prv_down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  prv_scroll_by(-SCROLL_LINE_DELTA);
+  if (s_progress_mode && prv_is_at_bottom()) {
+    s_follow_bottom = true;
+  }
+}
+
 static void prv_scroll_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_UP, prv_up_click_handler);
+  window_single_click_subscribe(BUTTON_ID_DOWN, prv_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, prv_select_click_handler);
 }
 
@@ -168,9 +268,19 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
+    prv_set_status("Receiving");
+    s_progress_mode = false;
+    s_follow_bottom = false;
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
+    scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+  }
+
+  Tuple *progress_t = dict_find(iter, MESSAGE_KEY_ProgressText);
+  if (progress_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress text len=%u", (unsigned int)strlen(progress_t->value->cstring));
+    prv_set_progress(progress_t->value->cstring);
   }
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
@@ -182,12 +292,14 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
   if (error_t) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
+    prv_set_status("Error");
     prv_set_response(error_t->value->cstring);
   }
 
   Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
   if (done_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
+    prv_set_status("Done");
     if (s_response[0] == '\0') {
       prv_set_response("No response text.");
     } else {
@@ -198,11 +310,13 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
 static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "inbox dropped reason=%d", reason);
+  prv_set_status("Message dropped");
   prv_set_response("Response message dropped. Try again.");
 }
 
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
+  prv_set_status("Phone failed");
   prv_set_response("Phone connection failed. Try again.");
 }
 
@@ -215,7 +329,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_callbacks(s_scroll_layer, (ScrollLayerCallbacks) {
     .click_config_provider = prv_scroll_click_config_provider
   });
-  scroll_layer_set_paging(s_scroll_layer, true);
+  scroll_layer_set_paging(s_scroll_layer, false);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_width = bounds.size.w - 8;
@@ -230,6 +344,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_add_child(s_scroll_layer, text_layer_get_layer(s_text_layer));
   text_layer_enable_screen_text_flow_and_paging(s_text_layer, 4);
 
+  prv_set_status("Ready");
   prv_set_response("Press SELECT to dictate.\n\nUse UP/DOWN to scroll responses.");
 }
 
