@@ -59,6 +59,7 @@ var DEFAULT_SETTINGS = {
   WebSearchEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   FontSize: 18,
+  BuzzStrength: 1,
   McpServersJson: '[]'
 };
 
@@ -112,6 +113,7 @@ function extend(base, extra) {
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
     result.FontSize = 18;
   }
+  result.BuzzStrength = clampNumber(result.BuzzStrength, 0, 3, 1);
   return result;
 }
 
@@ -128,7 +130,7 @@ function saveSettings(settings) {
 }
 
 function syncWatchSettings(settings) {
-  sendMessage({ FontSize: settings.FontSize });
+  sendMessage({ FontSize: settings.FontSize, BuzzStrength: settings.BuzzStrength });
 }
 
 function sendMessage(dict, onSuccess, onFailure) {

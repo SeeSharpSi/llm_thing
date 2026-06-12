@@ -121,6 +121,30 @@ module.exports = [
             "value": "28"
           }
         ]
+      },
+      {
+        "type": "select",
+        "messageKey": "BuzzStrength",
+        "label": "Response Buzz",
+        "defaultValue": "1",
+        "options": [
+          {
+            "label": "Off",
+            "value": "0"
+          },
+          {
+            "label": "Light",
+            "value": "1"
+          },
+          {
+            "label": "Medium",
+            "value": "2"
+          },
+          {
+            "label": "Strong",
+            "value": "3"
+          }
+        ]
       }
     ]
   },

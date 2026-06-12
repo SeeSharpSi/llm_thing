@@ -4,7 +4,9 @@
 #define DICTATION_BUFFER_SIZE 384
 #define RESPONSE_BUFFER_SIZE 6144
 #define FONT_SIZE_DEFAULT 18
+#define BUZZ_STRENGTH_DEFAULT 1
 #define PERSIST_KEY_FONT_SIZE 1
+#define PERSIST_KEY_BUZZ_STRENGTH 2
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_MEASURE_HEIGHT 24000
 
@@ -19,6 +21,7 @@ static char s_response[RESPONSE_BUFFER_SIZE];
 static int16_t s_text_width;
 static int16_t s_min_text_height;
 static int s_font_size = FONT_SIZE_DEFAULT;
+static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static uint32_t s_request_id;
 static bool s_response_truncated;
 static bool s_progress_mode;
@@ -55,9 +58,17 @@ static const char *prv_font_key_for_size(int size) {
   }
 }
 
-static int prv_font_size_from_tuple(Tuple *tuple) {
+static int prv_normalize_buzz_strength(int strength) {
+  if (strength >= 0 && strength <= 3) {
+    return strength;
+  }
+
+  return BUZZ_STRENGTH_DEFAULT;
+}
+
+static int prv_int_from_tuple(Tuple *tuple, int fallback) {
   if (!tuple) {
-    return s_font_size;
+    return fallback;
   }
 
   if (tuple->type == TUPLE_CSTRING) {
@@ -68,6 +79,38 @@ static int prv_font_size_from_tuple(Tuple *tuple) {
   }
 
   return tuple->value->uint32;
+}
+
+static void prv_apply_buzz_strength(int strength, bool should_persist) {
+  s_buzz_strength = prv_normalize_buzz_strength(strength);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, s_buzz_strength);
+  }
+}
+
+static void prv_buzz_response_done(void) {
+  switch (s_buzz_strength) {
+    case 0:
+      return;
+    case 1: {
+      static const uint32_t segments[] = { 75 };
+      VibePattern pattern = {
+        .durations = segments,
+        .num_segments = 1,
+      };
+      vibes_enqueue_custom_pattern(pattern);
+      return;
+    }
+    case 2:
+      vibes_short_pulse();
+      return;
+    case 3:
+      vibes_double_pulse();
+      return;
+    default:
+      return;
+  }
 }
 
 static void prv_apply_font_size(int size, bool should_persist) {
@@ -277,7 +320,13 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   Tuple *font_size_t = dict_find(iter, MESSAGE_KEY_FontSize);
   if (font_size_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "font size update");
-    prv_apply_font_size(prv_font_size_from_tuple(font_size_t), true);
+    prv_apply_font_size(prv_int_from_tuple(font_size_t, s_font_size), true);
+  }
+
+  Tuple *buzz_strength_t = dict_find(iter, MESSAGE_KEY_BuzzStrength);
+  if (buzz_strength_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "buzz strength update");
+    prv_apply_buzz_strength(prv_int_from_tuple(buzz_strength_t, s_buzz_strength), true);
   }
 
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
@@ -331,6 +380,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     } else {
       prv_update_scroll_text();
     }
+    prv_buzz_response_done();
   }
 }
 
@@ -383,6 +433,9 @@ static void prv_init(void) {
   APP_LOG(APP_LOG_LEVEL_DEBUG, "app init");
   if (persist_exists(PERSIST_KEY_FONT_SIZE)) {
     s_font_size = prv_normalize_font_size(persist_read_int(PERSIST_KEY_FONT_SIZE));
+  }
+  if (persist_exists(PERSIST_KEY_BUZZ_STRENGTH)) {
+    s_buzz_strength = prv_normalize_buzz_strength(persist_read_int(PERSIST_KEY_BUZZ_STRENGTH));
   }
 
   s_window = window_create();

@@ -47,7 +47,8 @@
       "WebSearchEnabled",
       "MaxToolCalls",
       "FontSize",
-      "McpServersJson"
+      "McpServersJson",
+      "BuzzStrength"
     ],
     "resources": {
       "media": []
