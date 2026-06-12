@@ -55,9 +55,9 @@ module.exports = [
       {
         "type": "input",
         "messageKey": "SystemPrompt",
-        "label": "System Prompt <button type=\"button\" aria-label=\"System prompt help\" title=\"System prompt help\" onclick=\"event.preventDefault(); event.stopPropagation(); alert('Use $DATETIME in the system prompt to insert the phone current date and time.'); return false;\" style=\"display:inline-block;width:1.35rem;height:1.35rem;margin-left:.35rem;border:1px solid #8d98a8;border-radius:50%;background:#eef2f7;color:#263241;font-weight:bold;line-height:1.1rem;text-align:center;padding:0;\">?</button>",
-        "defaultValue": "You are a helpful assistant. Keep answers concise for a watch screen.",
-        "description": "Use $DATETIME to insert the phone current date and time.",
+        "label": "System Prompt <button type=\"button\" aria-label=\"System prompt help\" title=\"System prompt help\" onclick=\"event.preventDefault(); event.stopPropagation(); alert('Use $DATETIME to insert the phone current date and time. Watch display currently supports bold Markdown only; italics and strikethrough are not rendered.'); return false;\" style=\"appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;vertical-align:middle;width:20px;min-width:20px;max-width:20px;height:20px;min-height:20px;max-height:20px;margin:0 0 2px 6px;border:1px solid #6b7788;border-radius:999px;background:linear-gradient(#ffffff,#e8edf4);color:#263241;font-size:12px;font-weight:700;line-height:20px;text-align:center;padding:0;box-shadow:0 1px 2px rgba(15,23,42,.18);\">?</button>",
+        "defaultValue": "You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.",
+        "description": "Use $DATETIME to insert the phone current date and time. Watch display supports bold Markdown only.",
         "attributes": {
           "placeholder": "System prompt, e.g. Today is $DATETIME."
         }

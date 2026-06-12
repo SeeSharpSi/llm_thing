@@ -57,7 +57,7 @@ var DEFAULT_SETTINGS = {
   Endpoint: 'https://api.openai.com/v1/responses',
   ApiKey: '',
   Model: 'gpt-4.1-mini',
-  SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen.',
+  SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
   ShowThinking: false,
   WebSearchEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
