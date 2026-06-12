@@ -8,7 +8,7 @@
 #define PERSIST_KEY_FONT_SIZE 1
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define TEXT_BOTTOM_PADDING 16
-#define TEXT_MEASURE_HEIGHT 24000
+#define TEXT_MEASURE_HEIGHT 32000
 #define PROGRESS_TITLE_BUFFER_SIZE 96
 #define PROGRESS_DETAIL_BUFFER_SIZE 192
 #define PROGRESS_LOADING_HEIGHT 28
@@ -159,17 +159,32 @@ static void prv_update_scroll_text(void) {
   text_layer_set_size(s_text_layer, GSize(s_text_width, TEXT_MEASURE_HEIGHT));
 
   GSize content_size = text_layer_get_content_size(s_text_layer);
-  int32_t content_height = content_size.h;
-  if (content_height < s_min_text_height) {
-    content_height = s_min_text_height;
-  }
-  content_height += s_font_size + TEXT_BOTTOM_PADDING;
-  if (content_height > TEXT_MEASURE_HEIGHT) {
-    content_height = TEXT_MEASURE_HEIGHT;
+  int32_t measured_height = content_size.h;
+  int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
+  int32_t scroll_height;
+  int32_t page_remainder;
+
+  if (text_height < s_min_text_height) {
+    text_height = s_min_text_height;
   }
 
-  text_layer_set_size(s_text_layer, GSize(s_text_width, content_height));
-  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_height));
+  scroll_height = text_height;
+  if (measured_height > s_min_text_height) {
+    // Match TextLayer paging: final offset should land on a page boundary,
+    // with one blank page for bottom clearance across font sizes.
+    scroll_height += s_min_text_height;
+    page_remainder = scroll_height % s_min_text_height;
+    if (page_remainder) {
+      scroll_height += s_min_text_height - page_remainder;
+    }
+  }
+
+  if (scroll_height > TEXT_MEASURE_HEIGHT) {
+    scroll_height = TEXT_MEASURE_HEIGHT;
+  }
+
+  text_layer_set_size(s_text_layer, GSize(s_text_width, scroll_height));
+  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, scroll_height));
 }
 
 static void prv_schedule_progress_loading_timer(void) {
@@ -611,7 +626,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_callbacks(s_scroll_layer, (ScrollLayerCallbacks) {
     .click_config_provider = prv_scroll_click_config_provider
   });
-  scroll_layer_set_paging(s_scroll_layer, false);
+  scroll_layer_set_paging(s_scroll_layer, true);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_width = bounds.size.w - 8;

@@ -176,6 +176,33 @@ function sendWatchText(requestId, text, includeDone, onDone) {
   sendReset(requestId, sendNext);
 }
 
+function maxResponseCharsForFontSize(settings) {
+  var fontSize = parseInt(settings && settings.FontSize, 10);
+
+  if (fontSize >= 28) {
+    return 2400;
+  }
+  if (fontSize >= 24) {
+    return 3200;
+  }
+
+  return MAX_RESPONSE_CHARS;
+}
+
+function truncateResponseForWatch(text, limit) {
+  var value = String(text || '');
+  var suffix = '\n\n[Truncated]';
+
+  if (value.length <= limit) {
+    return value;
+  }
+  if (limit <= suffix.length) {
+    return value.substring(0, limit);
+  }
+
+  return value.substring(0, limit - suffix.length) + suffix;
+}
+
 function sendProgressState(requestId, current, detail, reset, onDone) {
   var dict = {
     RequestId: requestId,
@@ -240,11 +267,12 @@ function sendError(requestId, message) {
   });
 }
 
-function sendResponse(requestId, text) {
-  var value = String(text || '').substring(0, MAX_RESPONSE_CHARS);
+function sendResponse(requestId, settings, text) {
+  var limit = maxResponseCharsForFontSize(settings);
+  var value = truncateResponseForWatch(text, limit);
 
   progressStop(requestId);
-  logDebug('send response request=' + requestId + ' chars=' + value.length);
+  logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + limit);
   sendWatchText(requestId, value, true);
 }
 
@@ -1091,7 +1119,7 @@ function requestCompletion(requestId, userText) {
         return;
       }
 
-      sendResponse(requestId, text);
+      sendResponse(requestId, settings, text);
     });
     return;
   }
@@ -1112,7 +1140,7 @@ function requestCompletion(requestId, userText) {
         return;
       }
 
-      sendResponse(requestId, text);
+      sendResponse(requestId, settings, text);
     });
   });
 }
