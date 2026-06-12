@@ -55,10 +55,11 @@ module.exports = [
       {
         "type": "input",
         "messageKey": "SystemPrompt",
-        "label": "System Prompt",
+        "label": "System Prompt <button type=\"button\" aria-label=\"System prompt help\" title=\"System prompt help\" onclick=\"event.preventDefault(); event.stopPropagation(); alert('Use $DATETIME in the system prompt to insert the phone current date and time.'); return false;\" style=\"display:inline-block;width:1.35rem;height:1.35rem;margin-left:.35rem;border:1px solid #8d98a8;border-radius:50%;background:#eef2f7;color:#263241;font-weight:bold;line-height:1.1rem;text-align:center;padding:0;\">?</button>",
         "defaultValue": "You are a helpful assistant. Keep answers concise for a watch screen.",
+        "description": "Use $DATETIME to insert the phone current date and time.",
         "attributes": {
-          "placeholder": "System prompt"
+          "placeholder": "System prompt, e.g. Today is $DATETIME."
         }
       },
       {

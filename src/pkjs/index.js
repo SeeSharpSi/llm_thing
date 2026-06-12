@@ -183,12 +183,38 @@ function addWebSearchTool(tools, settings) {
   });
 }
 
-function buildSystemPrompt(settings) {
-  if (!settings.WebSearchEnabled) {
-    return settings.SystemPrompt;
+function pad2(value) {
+  return value < 10 ? '0' + value : String(value);
+}
+
+function formatDateTime(date) {
+  var offsetMinutes = -date.getTimezoneOffset();
+  var offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  var absOffset = Math.abs(offsetMinutes);
+
+  return date.getFullYear() + '-' +
+    pad2(date.getMonth() + 1) + '-' +
+    pad2(date.getDate()) + ' ' +
+    pad2(date.getHours()) + ':' +
+    pad2(date.getMinutes()) + ':' +
+    pad2(date.getSeconds()) + ' GMT' +
+    offsetSign +
+    pad2(Math.floor(absOffset / 60)) + ':' +
+    pad2(absOffset % 60);
+}
+
+function expandSystemPromptVariables(prompt) {
+  return String(prompt || '').replace(/\$DATETIME/g, formatDateTime(new Date()));
+}
+
+function buildSystemPrompt(settings, includeWebSearchInstruction) {
+  var prompt = expandSystemPromptVariables(settings.SystemPrompt);
+
+  if (!includeWebSearchInstruction || !settings.WebSearchEnabled) {
+    return prompt;
   }
 
-  return settings.SystemPrompt + '\nIf web search is useful, use it and cite sources briefly.';
+  return prompt + '\nIf web search is useful, use it and cite sources briefly.';
 }
 
 function buildBody(settings, userText) {
@@ -198,16 +224,17 @@ function buildBody(settings, userText) {
   var systemPrompt;
 
   if (endpoint.indexOf('/chat/completions') !== -1) {
+    systemPrompt = buildSystemPrompt(settings, false);
     return {
       model: settings.Model,
       messages: [
-        { role: 'system', content: settings.SystemPrompt },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userText }
       ]
     };
   }
 
-  systemPrompt = buildSystemPrompt(settings);
+  systemPrompt = buildSystemPrompt(settings, true);
   body = {
     model: settings.Model,
     input: [
