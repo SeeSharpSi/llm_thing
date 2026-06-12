@@ -14,6 +14,7 @@ var DEFAULT_MAX_TOOL_CALLS = 4;
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
+var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
 var s_mcp_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
@@ -60,6 +61,8 @@ var DEFAULT_SETTINGS = {
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
   ShowThinking: false,
   WebSearchEnabled: false,
+  GeolocationToolEnabled: false,
+  TimelineToolEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   FontSize: 18,
   BuzzStrength: 1,
@@ -125,6 +128,8 @@ function extend(base, extra) {
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
+  result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
+  result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
@@ -377,13 +382,19 @@ function truncate(value, maxLength) {
 
 function summarizeToolArgs(args) {
   var parts = [];
-  var keys = ['query', 'url', 'max_results', 'time_range', 'search_depth'];
+  var keys = ['id', 'time', 'query', 'url', 'max_results', 'time_range', 'search_depth'];
   var i;
   var key;
 
   args = args || {};
+  if (args.pin && args.pin.id !== undefined && args.pin.id !== null && args.pin.id !== '') {
+    return 'pin: ' + truncate(args.pin.id, 120);
+  }
   if (args.query !== undefined && args.query !== null && args.query !== '') {
     return truncate(args.query, 120);
+  }
+  if (args.id !== undefined && args.id !== null && args.id !== '') {
+    return 'id: ' + truncate(args.id, 120);
   }
   if (args.url !== undefined && args.url !== null && args.url !== '') {
     return truncate(args.url, 120);
@@ -420,6 +431,10 @@ function formatToolWords(value) {
 }
 
 function formatToolLabel(toolInfo) {
+  if (toolInfo.kind === 'builtin') {
+    return toolInfo.label || toolInfo.name || 'Built-in Tool';
+  }
+
   return toolInfo.server.displayLabel || toolInfo.server.label;
 }
 
@@ -746,6 +761,7 @@ function discoverMcpTools(settings, callback) {
         parameters: tool.inputSchema || { type: 'object', properties: {} }
       });
       toolMap[exposedName] = {
+        kind: 'mcp',
         server: server,
         toolName: tool.name
       };
@@ -781,6 +797,322 @@ function discoverMcpTools(settings, callback) {
   });
 }
 
+function formatIsoDateTime(date) {
+  if (date && date.toISOString) {
+    return date.toISOString();
+  }
+
+  return formatDateTime(date || new Date());
+}
+
+function boolArg(value, fallback) {
+  var normalized;
+
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  if (value === true || value === 1) {
+    return true;
+  }
+  if (value === false || value === 0) {
+    return false;
+  }
+
+  normalized = String(value).toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+}
+
+function parseObjectArg(value) {
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  return value;
+}
+
+function callGeolocationBuiltin(args, callback) {
+  var options;
+
+  args = args || {};
+  if (typeof navigator === 'undefined' || !navigator.geolocation || !navigator.geolocation.getCurrentPosition) {
+    callback('Geolocation unavailable');
+    return;
+  }
+
+  options = {
+    enableHighAccuracy: boolArg(args.enableHighAccuracy, false),
+    timeout: clampNumber(args.timeoutMs, 1000, 60000, 10000),
+    maximumAge: clampNumber(args.maximumAgeMs, 0, 3600000, 300000)
+  };
+
+  navigator.geolocation.getCurrentPosition(function(position) {
+    var coords = position.coords || {};
+    var result = {
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+      accuracyMeters: coords.accuracy,
+      timestamp: formatIsoDateTime(position.timestamp ? new Date(position.timestamp) : new Date())
+    };
+
+    if (coords.altitude !== undefined && coords.altitude !== null) {
+      result.altitudeMeters = coords.altitude;
+    }
+    if (coords.altitudeAccuracy !== undefined && coords.altitudeAccuracy !== null) {
+      result.altitudeAccuracyMeters = coords.altitudeAccuracy;
+    }
+    if (coords.heading !== undefined && coords.heading !== null) {
+      result.headingDegrees = coords.heading;
+    }
+    if (coords.speed !== undefined && coords.speed !== null) {
+      result.speedMetersPerSecond = coords.speed;
+    }
+
+    callback(null, safeJson(result));
+  }, function(error) {
+    if (error && error.message) {
+      callback('Geolocation error: ' + error.message);
+      return;
+    }
+    if (error && error.code) {
+      callback('Geolocation error code ' + error.code);
+      return;
+    }
+
+    callback('Geolocation error');
+  }, options);
+}
+
+function getTimelineToken(callback) {
+  if (!Pebble.getTimelineToken) {
+    callback('Timeline token API unavailable');
+    return;
+  }
+
+  Pebble.getTimelineToken(function(token) {
+    if (!token) {
+      callback('Timeline token unavailable');
+      return;
+    }
+
+    callback(null, token);
+  }, function(error) {
+    callback('Timeline token error: ' + (error || 'unknown error'));
+  });
+}
+
+function validateTimelinePin(pin) {
+  if (!pin || typeof pin !== 'object') {
+    return 'Pin must be an object';
+  }
+
+  pin.id = trim(pin.id);
+  if (!pin.id) {
+    return 'Pin id is required';
+  }
+  if (pin.id.length > 64) {
+    return 'Pin id must be 64 characters or fewer';
+  }
+  if (!trim(pin.time)) {
+    return 'Pin time is required';
+  }
+  if (!pin.layout || typeof pin.layout !== 'object') {
+    return 'Pin layout is required';
+  }
+  if (!trim(pin.layout.type)) {
+    return 'Pin layout.type is required';
+  }
+
+  return '';
+}
+
+function timelinePinRequest(method, id, pin, callback) {
+  getTimelineToken(function(tokenError, token) {
+    var request;
+
+    if (tokenError) {
+      callback(tokenError);
+      return;
+    }
+
+    request = new XMLHttpRequest();
+    request.open(method, TIMELINE_API_BASE + encodeURIComponent(id), true);
+    request.setRequestHeader('X-User-Token', token);
+    if (pin) {
+      request.setRequestHeader('Content-Type', 'application/json');
+    }
+    request.timeout = 30000;
+
+    request.onload = function() {
+      var responseText = String(request.responseText || '');
+
+      if (request.status < 200 || request.status >= 300) {
+        callback('Timeline HTTP ' + request.status + ': ' + responseText.substring(0, 180));
+        return;
+      }
+
+      callback(null, safeJson({
+        ok: true,
+        action: method === 'DELETE' ? 'deleted' : 'created_or_updated',
+        id: id,
+        note: 'Timeline pins may take up to 15 minutes to appear on the watch.'
+      }));
+    };
+
+    request.onerror = function() {
+      callback('Timeline network error');
+    };
+
+    request.ontimeout = function() {
+      callback('Timeline request timed out');
+    };
+
+    request.send(pin ? JSON.stringify(pin) : null);
+  });
+}
+
+function extractTimelinePin(args) {
+  args = parseObjectArg(args) || {};
+  if (args.pin !== undefined) {
+    return parseObjectArg(args.pin);
+  }
+
+  return args;
+}
+
+function extractTimelinePinId(args) {
+  args = parseObjectArg(args) || {};
+  if (args.id !== undefined) {
+    return trim(args.id);
+  }
+  if (args.pinId !== undefined) {
+    return trim(args.pinId);
+  }
+  if (args.pin_id !== undefined) {
+    return trim(args.pin_id);
+  }
+  if (args.pin && args.pin.id !== undefined) {
+    return trim(args.pin.id);
+  }
+
+  return '';
+}
+
+function callTimelineUpsertBuiltin(args, callback) {
+  var pin = extractTimelinePin(args);
+  var validationError = validateTimelinePin(pin);
+
+  if (validationError) {
+    callback(validationError);
+    return;
+  }
+
+  timelinePinRequest('PUT', pin.id, pin, callback);
+}
+
+function callTimelineDeleteBuiltin(args, callback) {
+  var id = extractTimelinePinId(args);
+
+  if (!id) {
+    callback('Pin id is required');
+    return;
+  }
+  if (id.length > 64) {
+    callback('Pin id must be 64 characters or fewer');
+    return;
+  }
+
+  timelinePinRequest('DELETE', id, null, callback);
+}
+
+function addBuiltinTool(tools, toolMap, definition) {
+  var baseName = definition.name;
+  var exposedName = baseName;
+  var suffix = 2;
+
+  while (toolMap[exposedName]) {
+    exposedName = baseName + '_' + suffix;
+    suffix += 1;
+  }
+
+  tools.push({
+    name: exposedName,
+    description: definition.description,
+    parameters: definition.parameters
+  });
+  toolMap[exposedName] = {
+    kind: 'builtin',
+    name: exposedName,
+    label: definition.label,
+    call: definition.call
+  };
+  logDebug('builtin tool exposed=' + exposedName);
+}
+
+function addBuiltinTools(settings, tools, toolMap) {
+  if (settings.GeolocationToolEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_get_location',
+      label: 'Geolocation',
+      description: 'Get the phone current geolocation. Use only when user request needs current location.',
+      parameters: {
+        type: 'object',
+        properties: {
+          enableHighAccuracy: { type: 'boolean', description: 'Use GPS/high accuracy when available. Default false.' },
+          timeoutMs: { type: 'integer', minimum: 1000, maximum: 60000, description: 'Maximum wait time in milliseconds. Default 10000.' },
+          maximumAgeMs: { type: 'integer', minimum: 0, maximum: 3600000, description: 'Accept cached location up to this age in milliseconds. Default 300000.' }
+        }
+      },
+      call: callGeolocationBuiltin
+    });
+  }
+
+  if (settings.TimelineToolEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_timeline_create_or_update_pin',
+      label: 'Timeline Pins',
+      description: 'Create or update one of this app\'s Pebble timeline pins. Provide complete Pebble timeline pin JSON in pin. Updating uses the same id. Deleted pin ids should not be reused.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pin: { type: 'object', description: 'Complete timeline pin object. Required: id, time as ISO date-time, layout.type. Include layout fields, reminders, notifications, and actions as needed.' }
+        },
+        required: ['pin']
+      },
+      call: callTimelineUpsertBuiltin
+    });
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_timeline_delete_pin',
+      label: 'Timeline Pins',
+      description: 'Delete one of this app\'s Pebble timeline pins by id.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Pin id to delete.' }
+        },
+        required: ['id']
+      },
+      call: callTimelineDeleteBuiltin
+    });
+  }
+}
+
+function discoverPhoneTools(settings, callback) {
+  discoverMcpTools(settings, function(error, tools, toolMap) {
+    if (error) {
+      callback(error);
+      return;
+    }
+
+    addBuiltinTools(settings, tools, toolMap);
+    callback(null, tools, toolMap);
+  });
+}
+
 function callMcpTool(toolInfo, args, callback) {
   logDebug('mcp tool call server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' args=' + safeJson(args).substring(0, 240));
   mcpJsonRpc(toolInfo.server, 'tools/call', {
@@ -795,6 +1127,20 @@ function callMcpTool(toolInfo, args, callback) {
 
     logDebug('mcp tool result server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' chars=' + formatMcpToolResult(result).length);
     callback(null, formatMcpToolResult(result));
+  });
+}
+
+function callBuiltinTool(toolInfo, args, callback) {
+  logDebug('builtin tool call name=' + toolInfo.name + ' args=' + safeJson(args).substring(0, 240));
+  toolInfo.call(args, function(error, resultText) {
+    if (error) {
+      logDebug('builtin tool error name=' + toolInfo.name + ' error=' + error);
+      callback(error);
+      return;
+    }
+
+    logDebug('builtin tool result name=' + toolInfo.name + ' chars=' + String(resultText || '').length);
+    callback(null, resultText);
   });
 }
 
@@ -831,14 +1177,13 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       results.push({
         id: call.id || name || String(index),
         name: name || 'unknown',
-        error: 'Unknown or unavailable MCP tool'
+        error: 'Unknown or unavailable tool'
       });
       next();
       return;
     }
 
-    progressSet(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
-    callMcpTool(toolInfo, args, function(error, resultText) {
+    function finishToolCall(error, resultText) {
       if (error) {
         progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + truncate(error, 90));
         results.push({
@@ -855,7 +1200,14 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
         progressDone(requestId, formatToolLabel(toolInfo), String(resultText || '').length + ' chars');
       }
       next();
-    });
+    }
+
+    progressSet(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
+    if (toolInfo.kind === 'builtin') {
+      callBuiltinTool(toolInfo, args, finishToolCall);
+    } else {
+      callMcpTool(toolInfo, args, finishToolCall);
+    }
   }
 
   next();
@@ -893,9 +1245,10 @@ function buildToolInstructions(tools, maxToolCalls) {
     return '';
   }
 
-  text = '\n\nPhone-side MCP tools are available. If a tool is needed, respond with only JSON in this exact shape:' +
+  text = '\n\nPhone-side tools are available. If a tool is needed, respond with only JSON in this exact shape:' +
     '\n{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{}}]}' +
     '\nDo not include markdown, explanation, or final answer with tool call JSON. After tool results are provided, answer the user normally or request more tools with the same JSON shape.' +
+    '\nOnly tools listed here are enabled in app settings.' +
     '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.' +
     '\nAvailable tools:';
 
@@ -1159,7 +1512,7 @@ function requestCompletion(requestId, userText) {
   var settings = loadSettings();
   var conversation;
 
-  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls);
+  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled);
   syncWatchSettings(settings);
   progressStart(requestId, 'thinking', '');
 
@@ -1174,7 +1527,7 @@ function requestCompletion(requestId, userText) {
   }
 
   if (settings.MaxToolCalls <= 0) {
-    logDebug('mcp disabled maxToolCalls=0');
+    logDebug('tools disabled maxToolCalls=0');
     conversation = buildInitialConversation(settings, userText, '');
     completeWithTools(requestId, settings, conversation, {}, 0, 0, function(completionError, text) {
       if (completionError) {
@@ -1187,16 +1540,16 @@ function requestCompletion(requestId, userText) {
     return;
   }
 
-  progressSet(requestId, 'Loading MCP tools', 'discovering servers');
-  discoverMcpTools(settings, function(error, tools, toolMap) {
+  progressSet(requestId, 'Loading tools', 'discovering phone tools');
+  discoverPhoneTools(settings, function(error, tools, toolMap) {
     if (error) {
       sendError(requestId, error);
       return;
     }
 
     conversation = buildInitialConversation(settings, userText, buildToolInstructions(tools, settings.MaxToolCalls));
-    logDebug('mcp discover done tools=' + tools.length);
-    progressDone(requestId, 'MCP tools loaded', tools.length + ' tools');
+    logDebug('tools discover done tools=' + tools.length);
+    progressDone(requestId, 'Tools loaded', tools.length + ' tools');
     completeWithTools(requestId, settings, conversation, toolMap, 0, 0, function(completionError, text) {
       if (completionError) {
         sendError(requestId, completionError);

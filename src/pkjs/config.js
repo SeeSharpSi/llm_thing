@@ -5,7 +5,7 @@ module.exports = [
   },
   {
     "type": "text",
-    "defaultValue": "Configure the OpenAI-compatible endpoint used by the phone. MCP tools are called by the phone, so endpoints do not need native MCP support."
+    "defaultValue": "Configure the OpenAI-compatible endpoint used by the phone. Built-in and MCP tools are called by the phone, so endpoints do not need native tool support."
   },
   {
     "type": "section",
@@ -77,10 +77,24 @@ module.exports = [
         "defaultValue": false
       },
       {
+        "type": "toggle",
+        "messageKey": "GeolocationToolEnabled",
+        "label": "Geolocation Tool",
+        "description": "Allow the model to request the phone's current location.",
+        "defaultValue": false
+      },
+      {
+        "type": "toggle",
+        "messageKey": "TimelineToolEnabled",
+        "label": "Timeline Pins Tool",
+        "description": "Allow the model to create, update, and delete this app's Pebble timeline pins.",
+        "defaultValue": false
+      },
+      {
         "type": "input",
         "messageKey": "MaxToolCalls",
         "label": "Max Tool Calls",
-        "description": "Maximum phone-side MCP tool calls per request. Use 0 to disable MCP tools.",
+        "description": "Maximum phone-side tool calls per request. Use 0 to disable all tools.",
         "defaultValue": 4,
         "attributes": {
           "type": "number",

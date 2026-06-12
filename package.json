@@ -15,7 +15,8 @@
     "sdkVersion": "3",
     "enableMultiJS": true,
     "capabilities": [
-      "configurable"
+      "configurable",
+      "location"
     ],
     "targetPlatforms": [
       "aplite",
@@ -45,6 +46,8 @@
       "SystemPrompt",
       "ShowThinking",
       "WebSearchEnabled",
+      "GeolocationToolEnabled",
+      "TimelineToolEnabled",
       "MaxToolCalls",
       "FontSize",
       "McpServersJson",
