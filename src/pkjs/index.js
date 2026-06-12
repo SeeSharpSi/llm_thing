@@ -358,7 +358,7 @@ function formatToolWords(value) {
 }
 
 function formatToolLabel(toolInfo) {
-  return formatToolWords(toolInfo.server.label + ' ' + toolInfo.toolName);
+  return toolInfo.server.displayLabel || toolInfo.server.label;
 }
 
 function parseJsonOrSse(text) {
@@ -428,6 +428,7 @@ function parseMcpServers(settings) {
     server = parsed[i] || {};
     if (server.enabled === true || server.enabled === 1 || server.enabled === '1') {
       server = {
+        displayLabel: trim(server.label),
         label: slugify(server.label),
         url: trim(server.url),
         description: trim(server.description),
