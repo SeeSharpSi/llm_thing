@@ -5,6 +5,8 @@
 #define RESPONSE_BUFFER_SIZE 6144
 #define FONT_SIZE_DEFAULT 18
 #define PERSIST_KEY_FONT_SIZE 1
+#define TEXT_BOTTOM_PADDING 16
+#define TEXT_MEASURE_HEIGHT 24000
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
@@ -19,6 +21,7 @@ static int16_t s_min_text_height;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static uint32_t s_request_id;
 static bool s_response_truncated;
+static bool s_progress_mode;
 
 static void prv_update_scroll_text(void);
 
@@ -86,31 +89,23 @@ static void prv_update_scroll_text(void) {
   }
 
   text_layer_set_text(s_text_layer, s_response);
-  text_layer_set_size(s_text_layer, GSize(s_text_width, s_min_text_height));
+  text_layer_set_size(s_text_layer, GSize(s_text_width, TEXT_MEASURE_HEIGHT));
 
   GSize content_size = text_layer_get_content_size(s_text_layer);
-  if (content_size.h < s_min_text_height) {
-    content_size.h = s_min_text_height;
+  int32_t content_height = content_size.h;
+  if (content_height < s_min_text_height) {
+    content_height = s_min_text_height;
+  }
+  content_height += s_font_size + TEXT_BOTTOM_PADDING;
+  if (content_height > TEXT_MEASURE_HEIGHT) {
+    content_height = TEXT_MEASURE_HEIGHT;
   }
 
-  text_layer_set_size(s_text_layer, GSize(s_text_width, content_size.h));
-  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_size.h));
+  text_layer_set_size(s_text_layer, GSize(s_text_width, content_height));
+  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, content_height));
 }
 
-static void prv_set_response(const char *text) {
-  snprintf(s_response, sizeof(s_response), "%s", text);
-  s_response_truncated = false;
-  prv_update_scroll_text();
-  scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
-}
-
-static void prv_set_progress(const char *text) {
-  snprintf(s_response, sizeof(s_response), "%s", text);
-  s_response_truncated = false;
-  prv_update_scroll_text();
-}
-
-static void prv_append_response(const char *text) {
+static void prv_append_text_limited(const char *text) {
   size_t used = strlen(s_response);
   size_t incoming = strlen(text);
 
@@ -129,7 +124,40 @@ static void prv_append_response(const char *text) {
     memcpy(s_response + used, suffix, suffix_len + 1);
     s_response_truncated = true;
   }
+}
 
+static void prv_progress_reset(void) {
+  s_progress_mode = true;
+  s_response[0] = '\0';
+  s_response_truncated = false;
+  prv_update_scroll_text();
+  scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+}
+
+static void prv_progress_append(const char *text) {
+  if (!s_progress_mode) {
+    prv_progress_reset();
+  }
+
+  prv_append_text_limited(text);
+  prv_append_text_limited("\n");
+  prv_update_scroll_text();
+}
+
+static void prv_set_response(const char *text) {
+  s_progress_mode = false;
+  snprintf(s_response, sizeof(s_response), "%s", text);
+  s_response_truncated = false;
+  prv_update_scroll_text();
+  scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+}
+
+static void prv_set_progress(const char *text) {
+  prv_progress_append(text);
+}
+
+static void prv_append_response(const char *text) {
+  prv_append_text_limited(text);
   prv_update_scroll_text();
 }
 
@@ -256,10 +284,23 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
     prv_set_status("Receiving");
+    s_progress_mode = false;
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
     scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+  }
+
+  Tuple *progress_reset_t = dict_find(iter, MESSAGE_KEY_ProgressReset);
+  if (progress_reset_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress reset");
+    prv_progress_reset();
+  }
+
+  Tuple *progress_append_t = dict_find(iter, MESSAGE_KEY_ProgressAppend);
+  if (progress_append_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress append len=%u", (unsigned int)strlen(progress_append_t->value->cstring));
+    prv_progress_append(progress_append_t->value->cstring);
   }
 
   Tuple *progress_t = dict_find(iter, MESSAGE_KEY_ProgressText);
@@ -314,7 +355,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_callbacks(s_scroll_layer, (ScrollLayerCallbacks) {
     .click_config_provider = prv_scroll_click_config_provider
   });
-  scroll_layer_set_paging(s_scroll_layer, true);
+  scroll_layer_set_paging(s_scroll_layer, false);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_width = bounds.size.w - 8;

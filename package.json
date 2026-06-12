@@ -37,6 +37,8 @@
       "ResponseError",
       "ResponseReset",
       "ProgressText",
+      "ProgressReset",
+      "ProgressAppend",
       "Endpoint",
       "ApiKey",
       "Model",

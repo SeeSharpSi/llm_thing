@@ -17,15 +17,9 @@ var s_send_busy = false;
 var s_progress = {
   requestId: 0,
   active: false,
-  sending: false,
-  dirty: false,
-  spinnerIndex: 0,
-  timer: null,
   current: '',
-  detail: '',
-  history: []
+  detail: ''
 };
-var SPINNER_FRAMES = ['|', '/', '-', '\\'];
 
 function logDebug(message) {
   console.log('[llm_thing] ' + message);
@@ -180,83 +174,35 @@ function sendWatchText(requestId, text, includeDone, onDone) {
   sendReset(requestId, sendNext);
 }
 
-function sendProgressText(requestId, text, onDone) {
+function sendProgressReset(requestId, onDone) {
   sendMessage({
-    ProgressText: truncate(text, 1500),
+    ProgressReset: 1,
     RequestId: requestId
   }, onDone);
 }
 
-function progressTrimHistory() {
-  while (s_progress.history.length > 18) {
-    s_progress.history.shift();
-  }
+function sendProgressAppend(requestId, text, onDone) {
+  sendMessage({
+    ProgressAppend: truncate(text, 380),
+    RequestId: requestId
+  }, onDone);
 }
 
-function progressArchiveCurrent() {
-  if (!s_progress.current) {
-    return;
-  }
-
-  s_progress.history.push('ok ' + s_progress.current);
-  if (s_progress.detail) {
-    s_progress.history.push('  ' + s_progress.detail);
-  }
-  progressTrimHistory();
-}
-
-function progressRender() {
-  var frame = SPINNER_FRAMES[s_progress.spinnerIndex % SPINNER_FRAMES.length];
+function progressLine(prefix, text, detail) {
   var lines = [];
-  var i;
 
-  for (i = 0; i < s_progress.history.length; i += 1) {
-    lines.push(s_progress.history[i]);
+  if (text) {
+    lines.push(prefix + ' ' + text);
   }
-
-  if (s_progress.current) {
-    lines.push(frame + ' ' + s_progress.current);
-  }
-  if (s_progress.detail) {
-    lines.push('  ' + s_progress.detail);
+  if (detail) {
+    lines.push('  ' + detail);
   }
 
   return lines.join('\n');
 }
 
-function progressSendLatest() {
-  if (!s_progress.active || s_progress.sending) {
-    s_progress.dirty = true;
-    return;
-  }
-
-  s_progress.sending = true;
-  s_progress.dirty = false;
-  sendProgressText(s_progress.requestId, progressRender(), function() {
-    s_progress.sending = false;
-    if (s_progress.dirty && s_progress.active) {
-      progressSendLatest();
-    }
-  });
-}
-
-function progressSchedule() {
-  if (!s_progress.active) {
-    return;
-  }
-
-  progressSendLatest();
-}
-
-function progressTick() {
-  if (!s_progress.active || !s_progress.current) {
-    s_progress.timer = null;
-    return;
-  }
-
-  s_progress.spinnerIndex += 1;
-  progressSchedule();
-  s_progress.timer = setTimeout(progressTick, 350);
+function progressDoneText(text, detail) {
+  return progressLine('ok', text, detail);
 }
 
 function progressStart(requestId, current, detail) {
@@ -264,12 +210,9 @@ function progressStart(requestId, current, detail) {
   s_progress.active = true;
   s_progress.current = current || '';
   s_progress.detail = detail || '';
-  s_progress.history = [];
-  s_progress.spinnerIndex = 0;
-  progressSchedule();
-  if (!s_progress.timer) {
-    s_progress.timer = setTimeout(progressTick, 350);
-  }
+  sendProgressReset(requestId, function() {
+    sendProgressAppend(requestId, progressLine('...', s_progress.current, s_progress.detail));
+  });
 }
 
 function progressSet(requestId, current, detail) {
@@ -278,14 +221,14 @@ function progressSet(requestId, current, detail) {
     return;
   }
 
-  if (s_progress.current && s_progress.current !== current) {
-    progressArchiveCurrent();
+  if (s_progress.current === current && s_progress.detail === detail) {
+    return;
   }
+
   s_progress.current = current || '';
   s_progress.detail = detail || '';
-  progressSchedule();
-  if (s_progress.current && !s_progress.timer) {
-    s_progress.timer = setTimeout(progressTick, 350);
+  if (s_progress.current) {
+    sendProgressAppend(requestId, progressLine('...', s_progress.current, s_progress.detail));
   }
 }
 
@@ -294,14 +237,9 @@ function progressDone(requestId, text, detail) {
     return;
   }
 
-  s_progress.history.push('ok ' + text);
-  if (detail) {
-    s_progress.history.push('  ' + detail);
-  }
-  progressTrimHistory();
+  sendProgressAppend(requestId, progressDoneText(text, detail));
   s_progress.current = '';
   s_progress.detail = '';
-  progressSchedule();
 }
 
 function progressStop(requestId) {
@@ -310,14 +248,8 @@ function progressStop(requestId) {
   }
 
   s_progress.active = false;
-  s_progress.dirty = false;
   s_progress.current = '';
   s_progress.detail = '';
-  s_progress.history = [];
-  if (s_progress.timer) {
-    clearTimeout(s_progress.timer);
-    s_progress.timer = null;
-  }
 }
 
 function sendError(requestId, message) {
