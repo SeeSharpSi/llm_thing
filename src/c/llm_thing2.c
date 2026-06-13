@@ -519,8 +519,8 @@ static void prv_update_progress_text(void) {
   int16_t history_height = 0;
   int16_t title_height;
   int16_t detail_height = 0;
-  int16_t group_height;
-  int16_t group_y;
+  int16_t title_y;
+  int16_t detail_available;
   int16_t max_y;
 
   if (s_progress_history_layer) {
@@ -548,29 +548,37 @@ static void prv_update_progress_text(void) {
     history_height = prv_clamp_int16(text_layer_get_content_size(s_progress_history_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_HISTORY_MAX_HEIGHT);
   }
 
-  group_height = title_height + (detail_height ? PROGRESS_TEXT_GAP + detail_height : 0);
-  group_y = (s_progress_height - group_height) / 2;
-  max_y = s_progress_height - PROGRESS_LOADING_HEIGHT - group_height;
+  title_y = (s_progress_height - title_height) / 2;
+  max_y = s_progress_height - PROGRESS_LOADING_HEIGHT - title_height;
   if (max_y < 0) {
     max_y = 0;
   }
-  if (group_y > max_y) {
-    group_y = max_y;
+  if (title_y > max_y) {
+    title_y = max_y;
   }
-  if (group_y < 0) {
-    group_y = 0;
+  if (title_y < 0) {
+    title_y = 0;
+  }
+
+  if (detail_height) {
+    detail_available = s_progress_height - PROGRESS_LOADING_HEIGHT - (title_y + title_height + PROGRESS_TEXT_GAP);
+    if (detail_available < PROGRESS_DETAIL_MIN_HEIGHT) {
+      detail_height = 0;
+    } else if (detail_height > detail_available) {
+      detail_height = detail_available;
+    }
   }
 
   if (s_progress_history_layer) {
     layer_set_hidden(text_layer_get_layer(s_progress_history_layer), history_height == 0);
     if (history_height) {
-      layer_set_frame(text_layer_get_layer(s_progress_history_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y - PROGRESS_TEXT_GAP - history_height, s_progress_width, history_height));
+      layer_set_frame(text_layer_get_layer(s_progress_history_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y - PROGRESS_TEXT_GAP - history_height, s_progress_width, history_height));
     }
   }
-  layer_set_frame(text_layer_get_layer(s_progress_title_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y, s_progress_width, title_height));
+  layer_set_frame(text_layer_get_layer(s_progress_title_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y, s_progress_width, title_height));
   layer_set_hidden(text_layer_get_layer(s_progress_detail_layer), detail_height == 0);
   if (detail_height) {
-    layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
+    layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
   }
 }
 
