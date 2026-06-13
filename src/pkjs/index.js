@@ -380,35 +380,112 @@ function truncate(value, maxLength) {
   return value.substring(0, maxLength - 3) + '...';
 }
 
+function hasToolArgValue(value) {
+  return value !== undefined && value !== null && value !== '';
+}
+
+function summarizeToolArgValue(value, maxLength) {
+  var parts = [];
+  var i;
+
+  if (!hasToolArgValue(value)) {
+    return '';
+  }
+
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return truncate(value, maxLength);
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Array]') {
+    for (i = 0; i < value.length; i += 1) {
+      if (hasToolArgValue(value[i])) {
+        parts.push(summarizeToolArgValue(value[i], 40));
+      }
+    }
+    return truncate(parts.join(', '), maxLength);
+  }
+
+  if (typeof value === 'object') {
+    if (hasToolArgValue(value.query)) {
+      return summarizeToolArgValue(value.query, maxLength);
+    }
+    if (hasToolArgValue(value.text)) {
+      return summarizeToolArgValue(value.text, maxLength);
+    }
+    if (hasToolArgValue(value.input)) {
+      return summarizeToolArgValue(value.input, maxLength);
+    }
+    return truncate(safeJson(value), maxLength);
+  }
+
+  return truncate(String(value), maxLength);
+}
+
+function firstToolArg(args, keys) {
+  var i;
+  var key;
+
+  for (i = 0; i < keys.length; i += 1) {
+    key = keys[i];
+    if (hasToolArgValue(args[key])) {
+      return {
+        key: key,
+        value: args[key]
+      };
+    }
+  }
+
+  return null;
+}
+
+function hasOwnToolArgs(args) {
+  var key;
+
+  for (key in args) {
+    if (args.hasOwnProperty(key)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function summarizeToolArgs(args) {
   var parts = [];
-  var keys = ['id', 'time', 'query', 'url', 'max_results', 'time_range', 'search_depth'];
+  var searchArg;
+  var primaryArg;
+  var keys = ['id', 'url', 'time', 'max_results', 'time_range', 'search_depth'];
   var i;
   var key;
 
   args = args || {};
-  if (args.pin && args.pin.id !== undefined && args.pin.id !== null && args.pin.id !== '') {
-    return 'pin: ' + truncate(args.pin.id, 120);
+  if (typeof args !== 'object') {
+    return summarizeToolArgValue(args, 120);
   }
-  if (args.query !== undefined && args.query !== null && args.query !== '') {
-    return truncate(args.query, 120);
+
+  if (args.pin && hasToolArgValue(args.pin.id)) {
+    return 'pin: ' + summarizeToolArgValue(args.pin.id, 120);
   }
-  if (args.id !== undefined && args.id !== null && args.id !== '') {
-    return 'id: ' + truncate(args.id, 120);
+
+  searchArg = firstToolArg(args, ['query', 'q', 'search_query', 'searchQuery', 'search', 'terms', 'keywords', 'prompt', 'text', 'input']);
+  if (searchArg) {
+    return 'query: ' + summarizeToolArgValue(searchArg.value, 120);
   }
-  if (args.url !== undefined && args.url !== null && args.url !== '') {
-    return truncate(args.url, 120);
+
+  primaryArg = firstToolArg(args, ['id', 'url']);
+  if (primaryArg) {
+    return primaryArg.key + ': ' + summarizeToolArgValue(primaryArg.value, 120);
   }
 
   for (i = 0; i < keys.length; i += 1) {
     key = keys[i];
-    if (args[key] !== undefined && args[key] !== null && args[key] !== '') {
-      parts.push(key + ': ' + truncate(args[key], 80));
+    if (hasToolArgValue(args[key])) {
+      parts.push(key + ': ' + summarizeToolArgValue(args[key], 80));
     }
   }
 
   if (!parts.length) {
-    return truncate(safeJson(args), 100);
+    return hasOwnToolArgs(args) ? truncate(safeJson(args), 100) : 'no arguments';
   }
 
   return parts.join(', ');
