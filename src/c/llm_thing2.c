@@ -917,7 +917,7 @@ static void prv_window_load(Window *window) {
   s_progress_detail_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_detail_layer, GColorClear);
   text_layer_set_text_color(s_progress_detail_layer, GColorBlack);
-  text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_progress_detail_layer, GTextAlignmentCenter);
   layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_detail_layer));
