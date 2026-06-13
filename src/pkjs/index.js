@@ -22,7 +22,10 @@ var s_progress = {
   requestId: 0,
   active: false,
   current: '',
-  detail: ''
+  detail: '',
+  toolHistory: [],
+  currentTool: '',
+  currentToolRemembered: false
 };
 
 function logDebug(message) {
@@ -270,11 +273,28 @@ function formatMarkdownBoldForWatch(text, maxLength) {
   return output;
 }
 
+function formatProgressHistory(items) {
+  var text = '';
+  var candidate;
+  var i;
+
+  for (i = items.length - 1; i >= 0; i -= 1) {
+    candidate = truncate(items[i], 48) + (text ? '\n' + text : '');
+    if (candidate.length > 240) {
+      break;
+    }
+    text = candidate;
+  }
+
+  return text;
+}
+
 function sendProgressState(requestId, current, detail, reset, onDone) {
   var dict = {
     RequestId: requestId,
     ProgressText: truncate(current || 'thinking', 80),
-    ProgressDetail: truncate(detail || '', 160)
+    ProgressDetail: truncate(detail || '', 160),
+    ProgressHistory: formatProgressHistory(s_progress.toolHistory)
   };
 
   if (reset) {
@@ -289,7 +309,20 @@ function progressStart(requestId, current, detail) {
   s_progress.active = true;
   s_progress.current = current || 'thinking';
   s_progress.detail = detail || '';
+  s_progress.toolHistory = [];
+  s_progress.currentTool = '';
+  s_progress.currentToolRemembered = false;
   sendProgressState(requestId, s_progress.current, s_progress.detail, true);
+}
+
+function progressToolStart(requestId, current, detail) {
+  if (!s_progress.active || s_progress.requestId !== requestId) {
+    progressStart(requestId, current, detail);
+  }
+
+  s_progress.currentTool = current || 'thinking';
+  s_progress.currentToolRemembered = false;
+  progressSet(requestId, current, detail);
 }
 
 function progressSet(requestId, current, detail) {
@@ -310,9 +343,17 @@ function progressSet(requestId, current, detail) {
   sendProgressState(requestId, s_progress.current, s_progress.detail, false);
 }
 
-function progressDone(requestId, text, detail) {
+function progressDone(requestId) {
+  var toolName;
+
   if (!s_progress.active || s_progress.requestId !== requestId) {
     return;
+  }
+
+  toolName = s_progress.currentTool;
+  if (toolName && !s_progress.currentToolRemembered) {
+    s_progress.toolHistory.push(toolName);
+    s_progress.currentToolRemembered = true;
   }
 }
 
@@ -324,6 +365,9 @@ function progressStop(requestId) {
   s_progress.active = false;
   s_progress.current = '';
   s_progress.detail = '';
+  s_progress.toolHistory = [];
+  s_progress.currentTool = '';
+  s_progress.currentToolRemembered = false;
 }
 
 function sendError(requestId, message) {
@@ -1279,7 +1323,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       next();
     }
 
-    progressSet(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
+    progressToolStart(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
     if (toolInfo.kind === 'builtin') {
       callBuiltinTool(toolInfo, args, finishToolCall);
     } else {

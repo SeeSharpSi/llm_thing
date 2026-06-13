@@ -16,6 +16,7 @@
 #define TEXT_BOLD_OFF '\x02'
 #define PROGRESS_TITLE_BUFFER_SIZE 96
 #define PROGRESS_DETAIL_BUFFER_SIZE 192
+#define PROGRESS_HISTORY_BUFFER_SIZE 256
 #define PROGRESS_LOADING_HEIGHT 28
 #define PROGRESS_LOADING_MARGIN 16
 #define PROGRESS_LOADING_TIMER_MS 80
@@ -26,11 +27,13 @@
 #define PROGRESS_TITLE_MAX_HEIGHT 60
 #define PROGRESS_DETAIL_MIN_HEIGHT 22
 #define PROGRESS_DETAIL_MAX_HEIGHT 44
+#define PROGRESS_HISTORY_MAX_HEIGHT 240
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
 static Layer *s_text_layer;
 static Layer *s_progress_layer;
+static TextLayer *s_progress_history_layer;
 static TextLayer *s_progress_title_layer;
 static TextLayer *s_progress_detail_layer;
 static Layer *s_progress_loading_layer;
@@ -43,6 +46,7 @@ static char s_response[RESPONSE_BUFFER_SIZE];
 static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
+static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
 static int16_t s_text_width;
 static int16_t s_min_text_height;
 static int16_t s_progress_width;
@@ -512,12 +516,17 @@ static int16_t prv_clamp_int16(int16_t value, int16_t min, int16_t max) {
 }
 
 static void prv_update_progress_text(void) {
+  int16_t history_height = 0;
   int16_t title_height;
   int16_t detail_height = 0;
   int16_t group_height;
   int16_t group_y;
   int16_t max_y;
 
+  if (s_progress_history_layer) {
+    text_layer_set_size(s_progress_history_layer, GSize(s_progress_width, PROGRESS_HISTORY_MAX_HEIGHT));
+    text_layer_set_text(s_progress_history_layer, s_progress_history);
+  }
   if (s_progress_title_layer) {
     text_layer_set_size(s_progress_title_layer, GSize(s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
     text_layer_set_text(s_progress_title_layer, s_progress_title);
@@ -535,6 +544,9 @@ static void prv_update_progress_text(void) {
   if (s_progress_detail[0] != '\0') {
     detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
   }
+  if (s_progress_history_layer && s_progress_history[0] != '\0') {
+    history_height = prv_clamp_int16(text_layer_get_content_size(s_progress_history_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_HISTORY_MAX_HEIGHT);
+  }
 
   group_height = title_height + (detail_height ? PROGRESS_TEXT_GAP + detail_height : 0);
   group_y = (s_progress_height - group_height) / 2;
@@ -549,6 +561,12 @@ static void prv_update_progress_text(void) {
     group_y = 0;
   }
 
+  if (s_progress_history_layer) {
+    layer_set_hidden(text_layer_get_layer(s_progress_history_layer), history_height == 0);
+    if (history_height) {
+      layer_set_frame(text_layer_get_layer(s_progress_history_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y - PROGRESS_TEXT_GAP - history_height, s_progress_width, history_height));
+    }
+  }
   layer_set_frame(text_layer_get_layer(s_progress_title_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, group_y, s_progress_width, title_height));
   layer_set_hidden(text_layer_get_layer(s_progress_detail_layer), detail_height == 0);
   if (detail_height) {
@@ -563,6 +581,11 @@ static void prv_set_progress_title(const char *text) {
 
 static void prv_set_progress_detail(const char *text) {
   snprintf(s_progress_detail, sizeof(s_progress_detail), "%s", text ? text : "");
+  prv_update_progress_text();
+}
+
+static void prv_set_progress_history(const char *text) {
+  snprintf(s_progress_history, sizeof(s_progress_history), "%s", text ? text : "");
   prv_update_progress_text();
 }
 
@@ -593,6 +616,7 @@ static void prv_progress_reset(void) {
   s_response_truncated = false;
   snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
   s_progress_detail[0] = '\0';
+  s_progress_history[0] = '\0';
   prv_update_scroll_text();
   prv_update_progress_text();
   prv_set_progress_visible(true);
@@ -794,6 +818,15 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_set_progress_detail(progress_detail_t->value->cstring);
   }
 
+  Tuple *progress_history_t = dict_find(iter, MESSAGE_KEY_ProgressHistory);
+  if (progress_history_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress history len=%u", (unsigned int)strlen(progress_history_t->value->cstring));
+    if (!s_progress_mode) {
+      prv_progress_reset();
+    }
+    prv_set_progress_history(progress_history_t->value->cstring);
+  }
+
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
   if (chunk_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk len=%u", (unsigned int)strlen(chunk_t->value->cstring));
@@ -857,6 +890,14 @@ static void prv_window_load(Window *window) {
   layer_set_hidden(s_progress_layer, true);
   layer_add_child(window_layer, s_progress_layer);
 
+  s_progress_history_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_HISTORY_MAX_HEIGHT));
+  text_layer_set_background_color(s_progress_history_layer, GColorClear);
+  text_layer_set_text_color(s_progress_history_layer, GColorBlack);
+  text_layer_set_font(s_progress_history_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_overflow_mode(s_progress_history_layer, GTextOverflowModeWordWrap);
+  text_layer_set_text_alignment(s_progress_history_layer, GTextAlignmentCenter);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_history_layer));
+
   s_progress_title_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_title_layer, GColorClear);
   text_layer_set_text_color(s_progress_title_layer, GColorBlack);
@@ -886,6 +927,7 @@ static void prv_window_unload(Window *window) {
   layer_destroy(s_progress_loading_layer);
   text_layer_destroy(s_progress_detail_layer);
   text_layer_destroy(s_progress_title_layer);
+  text_layer_destroy(s_progress_history_layer);
   layer_destroy(s_progress_layer);
   layer_destroy(s_text_layer);
   scroll_layer_destroy(s_scroll_layer);
