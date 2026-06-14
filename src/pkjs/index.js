@@ -11,6 +11,8 @@ var MAX_RESPONSE_CHARS = 6000;
 var WATCH_BOLD_ON = '\u0001';
 var WATCH_BOLD_OFF = '\u0002';
 var DEFAULT_MAX_TOOL_CALLS = 4;
+var MAX_CHAT_HISTORY_MESSAGES = 16;
+var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
@@ -18,6 +20,8 @@ var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
 var s_mcp_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
+var s_chat_history = [];
+var s_latest_request_id = 0;
 var s_progress = {
   requestId: 0,
   active: false,
@@ -378,13 +382,13 @@ function sendError(requestId, message) {
   });
 }
 
-function sendResponse(requestId, settings, text) {
+function sendResponse(requestId, settings, text, onDone) {
   var limit = maxResponseCharsForFontSize(settings);
   var value = formatMarkdownBoldForWatch(truncateResponseForWatch(text, limit), MAX_RESPONSE_CHARS);
 
   progressStop(requestId);
   logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + limit);
-  sendWatchText(requestId, value, true);
+  sendWatchText(requestId, value, true, onDone);
 }
 
 function trim(value) {
@@ -1394,11 +1398,37 @@ function isChatEndpoint(settings) {
   return String(settings.Endpoint || '').toLowerCase().indexOf('/chat/completions') !== -1;
 }
 
-function buildInitialConversation(settings, userText, toolInstructions) {
-  return [
-    { role: 'system', content: buildSystemPrompt(settings, toolInstructions) },
-    { role: 'user', content: userText }
+function buildConversation(settings, userText, toolInstructions) {
+  var conversation = [
+    { role: 'system', content: buildSystemPrompt(settings, toolInstructions) }
   ];
+  var i;
+
+  for (i = 0; i < s_chat_history.length; i += 1) {
+    conversation.push(s_chat_history[i]);
+  }
+
+  conversation.push({ role: 'user', content: userText });
+  return conversation;
+}
+
+function rememberChatTurn(userText, assistantText) {
+  s_chat_history.push({
+    role: 'user',
+    content: truncate(userText, MAX_CHAT_HISTORY_MESSAGE_CHARS)
+  });
+  s_chat_history.push({
+    role: 'assistant',
+    content: truncate(assistantText, MAX_CHAT_HISTORY_MESSAGE_CHARS)
+  });
+
+  while (s_chat_history.length > MAX_CHAT_HISTORY_MESSAGES) {
+    s_chat_history.splice(0, 2);
+  }
+}
+
+function resetChatHistory() {
+  s_chat_history = [];
 }
 
 function buildBody(settings, conversation) {
@@ -1633,7 +1663,8 @@ function requestCompletion(requestId, userText) {
   var settings = loadSettings();
   var conversation;
 
-  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled);
+  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' history=' + s_chat_history.length);
+  s_latest_request_id = requestId;
   syncWatchSettings(settings);
   progressStart(requestId, 'thinking', '');
 
@@ -1649,14 +1680,18 @@ function requestCompletion(requestId, userText) {
 
   if (settings.MaxToolCalls <= 0) {
     logDebug('tools disabled maxToolCalls=0');
-    conversation = buildInitialConversation(settings, userText, '');
+    conversation = buildConversation(settings, userText, '');
     completeWithTools(requestId, settings, conversation, {}, 0, 0, function(completionError, text) {
       if (completionError) {
         sendError(requestId, completionError);
         return;
       }
 
-      sendResponse(requestId, settings, text);
+      sendResponse(requestId, settings, text, function() {
+        if (requestId === s_latest_request_id) {
+          rememberChatTurn(userText, text);
+        }
+      });
     });
     return;
   }
@@ -1668,7 +1703,7 @@ function requestCompletion(requestId, userText) {
       return;
     }
 
-    conversation = buildInitialConversation(settings, userText, buildToolInstructions(tools, settings.MaxToolCalls));
+    conversation = buildConversation(settings, userText, buildToolInstructions(tools, settings.MaxToolCalls));
     logDebug('tools discover done tools=' + tools.length);
     progressDone(requestId, 'Tools loaded', tools.length + ' tools');
     completeWithTools(requestId, settings, conversation, toolMap, 0, 0, function(completionError, text) {
@@ -1677,13 +1712,18 @@ function requestCompletion(requestId, userText) {
         return;
       }
 
-      sendResponse(requestId, settings, text);
+      sendResponse(requestId, settings, text, function() {
+        if (requestId === s_latest_request_id) {
+          rememberChatTurn(userText, text);
+        }
+      });
     });
   });
 }
 
 Pebble.addEventListener('ready', function() {
   logDebug('ready');
+  resetChatHistory();
   syncWatchSettings(loadSettings());
 });
 
@@ -1708,6 +1748,11 @@ Pebble.addEventListener('webviewclosed', function(e) {
 Pebble.addEventListener('appmessage', function(e) {
   var dict = e.payload || {};
   var requestId = dict.RequestId || 0;
+
+  if (dict.ChatReset) {
+    logDebug('appmessage chat reset');
+    resetChatHistory();
+  }
 
   if (dict.RequestText) {
     logDebug('appmessage request id=' + requestId + ' textChars=' + String(dict.RequestText || '').length);

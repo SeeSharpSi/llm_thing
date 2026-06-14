@@ -2,18 +2,22 @@
 #include <stdlib.h>
 
 #define DICTATION_BUFFER_SIZE 384
-#define RESPONSE_BUFFER_SIZE 6144
+#define RESPONSE_BUFFER_SIZE 8192
 #define FONT_SIZE_DEFAULT 18
 #define BUZZ_STRENGTH_DEFAULT 1
 #define PERSIST_KEY_FONT_SIZE 1
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define TEXT_BOTTOM_PADDING 16
+#define TEXT_SIDE_PADDING 4
+#define PROMPT_BACKGROUND_BOTTOM_PADDING 6
 #define TEXT_MEASURE_HEIGHT 32000
 #define TEXT_MEASURE_WIDTH 32000
 #define TEXT_RUN_BUFFER_SIZE 256
 // Phone-side Markdown parsing sends these non-NUL markers inside ResponseChunk.
 #define TEXT_BOLD_ON '\x01'
 #define TEXT_BOLD_OFF '\x02'
+#define TEXT_PROMPT_ON '\x03'
+#define TEXT_PROMPT_OFF '\x04'
 #define PROGRESS_TITLE_BUFFER_SIZE 96
 #define PROGRESS_DETAIL_BUFFER_SIZE 192
 #define PROGRESS_HISTORY_BUFFER_SIZE 256
@@ -48,18 +52,24 @@ static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
 static int16_t s_text_width;
+static int16_t s_text_layer_width;
 static int16_t s_min_text_height;
 static int16_t s_progress_width;
 static int16_t s_progress_height;
+static int32_t s_scroll_content_height;
+static int32_t s_scroll_text_height;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static uint32_t s_request_id;
 static uint16_t s_progress_loading_frame;
 static bool s_response_truncated;
 static bool s_progress_mode;
+static bool s_chat_started;
+static bool s_chat_reset_pending = true;
 
 static void prv_update_scroll_text(void);
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
+static void prv_set_response(const char *text);
 
 static void prv_progress_loading_timer_callback(void *context);
 
@@ -261,9 +271,25 @@ static size_t prv_fit_chunk_length(const char *text, size_t length, GFont font) 
   return chunk_length;
 }
 
-static void prv_layout_word(const char *text, size_t length, bool bold, GContext *ctx,
-                            bool should_draw, int16_t *x, int16_t *y, int16_t line_height) {
-  GFont font = prv_response_font(bold);
+static void prv_fill_prompt_line(GContext *ctx, bool should_draw, bool prompt,
+                                 int16_t y, int16_t line_height, int16_t *filled_y) {
+  if (!should_draw || !ctx || !prompt || *filled_y == y) {
+    return;
+  }
+
+#if defined(PBL_COLOR)
+  graphics_context_set_fill_color(ctx, GColorLightGray);
+#else
+  graphics_context_set_fill_color(ctx, GColorWhite);
+#endif
+  graphics_fill_rect(ctx, GRect(0, y, s_text_layer_width, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING), 0, GCornerNone);
+  *filled_y = y;
+}
+
+static void prv_layout_word(const char *text, size_t length, bool bold, bool prompt, GContext *ctx,
+                            bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
+                            int16_t *prompt_filled_y) {
+  GFont font = prv_response_font(bold || prompt);
 
   while (length > 0) {
     size_t chunk_length = prv_fit_chunk_length(text, length, font);
@@ -281,13 +307,15 @@ static void prv_layout_word(const char *text, size_t length, bool bold, GContext
       *y += line_height;
     }
 
+    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
+
     draw_width = width;
     if (draw_width > s_text_width - *x) {
       draw_width = s_text_width - *x;
     }
 
     if (should_draw && ctx && draw_width > 0) {
-      graphics_draw_text(ctx, s_text_run, font, GRect(*x, *y, draw_width + 2, line_height),
+      graphics_draw_text(ctx, s_text_run, font, GRect(*x + TEXT_SIDE_PADDING, *y, draw_width + 2, line_height),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     }
 
@@ -301,9 +329,10 @@ static void prv_layout_word(const char *text, size_t length, bool bold, GContext
   }
 }
 
-static void prv_layout_spaces(const char *text, size_t length, bool bold, int16_t *x,
-                              int16_t *y, int16_t line_height) {
-  GFont font = prv_response_font(bold);
+static void prv_layout_spaces(const char *text, size_t length, bool bold, bool prompt, GContext *ctx,
+                              bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
+                              int16_t *prompt_filled_y) {
+  GFont font = prv_response_font(bold || prompt);
   int16_t space_width = prv_space_width(font);
   int32_t width = 0;
   size_t i;
@@ -312,6 +341,8 @@ static void prv_layout_spaces(const char *text, size_t length, bool bold, int16_
     return;
   }
 
+  prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
+
   for (i = 0; i < length; i += 1) {
     width += text[i] == '\t' ? space_width * 2 : space_width;
   }
@@ -319,6 +350,7 @@ static void prv_layout_spaces(const char *text, size_t length, bool bold, int16_
   if ((int32_t)*x + width > s_text_width) {
     *x = 0;
     *y += line_height;
+    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
     return;
   }
 
@@ -330,7 +362,9 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
   int16_t x = 0;
   int16_t y = 0;
   int16_t line_height = prv_line_height();
+  int16_t prompt_filled_y = -1;
   bool bold = false;
+  bool prompt = false;
 
   if (should_draw && ctx) {
     graphics_context_set_text_color(ctx, GColorBlack);
@@ -343,7 +377,14 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
     } else if (*cursor == TEXT_BOLD_OFF) {
       bold = false;
       cursor += 1;
+    } else if (*cursor == TEXT_PROMPT_ON) {
+      prompt = true;
+      cursor += 1;
+    } else if (*cursor == TEXT_PROMPT_OFF) {
+      prompt = false;
+      cursor += 1;
     } else if (*cursor == '\n') {
+      prv_fill_prompt_line(ctx, should_draw, prompt, y, line_height, &prompt_filled_y);
       x = 0;
       y += line_height;
       cursor += 1;
@@ -352,14 +393,15 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
       while (*cursor == ' ' || *cursor == '\t') {
         cursor += 1;
       }
-      prv_layout_spaces(start, cursor - start, bold, &x, &y, line_height);
+      prv_layout_spaces(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y);
     } else {
       const char *start = cursor;
       while (*cursor != '\0' && *cursor != TEXT_BOLD_ON && *cursor != TEXT_BOLD_OFF &&
+             *cursor != TEXT_PROMPT_ON && *cursor != TEXT_PROMPT_OFF &&
              *cursor != '\n' && *cursor != ' ' && *cursor != '\t') {
         cursor += 1;
       }
-      prv_layout_word(start, cursor - start, bold, ctx, should_draw, &x, &y, line_height);
+      prv_layout_word(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y);
     }
   }
 
@@ -379,6 +421,7 @@ static void prv_update_scroll_text(void) {
   if (text_height < s_min_text_height) {
     text_height = s_min_text_height;
   }
+  s_scroll_text_height = text_height;
 
   scroll_height = text_height;
   if (measured_height > s_min_text_height) {
@@ -395,9 +438,25 @@ static void prv_update_scroll_text(void) {
     scroll_height = TEXT_MEASURE_HEIGHT;
   }
 
-  layer_set_frame(s_text_layer, GRect(4, 0, s_text_width, scroll_height));
+  s_scroll_content_height = scroll_height;
+  layer_set_frame(s_text_layer, GRect(0, 0, s_text_layer_width, scroll_height));
   layer_mark_dirty(s_text_layer);
-  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_width, scroll_height));
+  scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_layer_width, scroll_height));
+}
+
+static void prv_scroll_to_bottom(bool animated) {
+  int32_t offset_y;
+
+  if (!s_scroll_layer || s_scroll_text_height <= s_min_text_height) {
+    return;
+  }
+
+  offset_y = s_min_text_height - s_scroll_text_height;
+  if (offset_y < -TEXT_MEASURE_HEIGHT) {
+    offset_y = -TEXT_MEASURE_HEIGHT;
+  }
+
+  scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)offset_y), animated);
 }
 
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
@@ -597,9 +656,33 @@ static void prv_set_progress_history(const char *text) {
   prv_update_progress_text();
 }
 
+static bool prv_trim_oldest_turn(void) {
+  char *next_turn;
+
+  if (s_response[0] == '\0') {
+    return false;
+  }
+
+  next_turn = strchr(s_response + 1, TEXT_PROMPT_ON);
+
+  if (next_turn) {
+    memmove(s_response, next_turn, strlen(next_turn) + 1);
+    s_response_truncated = false;
+    return true;
+  }
+
+  s_response[0] = '\0';
+  s_response_truncated = false;
+  return true;
+}
+
 static void prv_append_text_limited(const char *text) {
   size_t used = strlen(s_response);
   size_t incoming = strlen(text);
+
+  while (used + incoming >= sizeof(s_response) && prv_trim_oldest_turn()) {
+    used = strlen(s_response);
+  }
 
   if (used + incoming < sizeof(s_response)) {
     memcpy(s_response + used, text, incoming + 1);
@@ -618,10 +701,54 @@ static void prv_append_text_limited(const char *text) {
   }
 }
 
+#if defined(PBL_MICROPHONE)
+static void prv_append_prompt(const char *text) {
+  prv_show_response_view();
+  s_response_truncated = false;
+
+  if (!s_chat_started) {
+    s_response[0] = '\0';
+    s_chat_started = true;
+  } else if (s_response[0] != '\0') {
+    prv_append_text_limited("\n\n");
+  }
+
+  prv_append_text_limited("\x03");
+  prv_append_text_limited(text);
+  prv_append_text_limited("\x04\n\n");
+  prv_update_scroll_text();
+  prv_scroll_to_bottom(false);
+}
+
+static void prv_preserve_chat_or_set_response(const char *text) {
+  if (s_chat_started) {
+    prv_show_response_view();
+    prv_update_scroll_text();
+    prv_scroll_to_bottom(false);
+    return;
+  }
+
+  prv_set_response(text);
+}
+#endif
+
+static void prv_append_notice(const char *text) {
+  if (!s_chat_started) {
+    prv_set_response(text);
+    return;
+  }
+
+  prv_show_response_view();
+  if (s_response[0] != '\0') {
+    prv_append_text_limited("\n\n");
+  }
+  prv_append_text_limited(text);
+  prv_update_scroll_text();
+  prv_scroll_to_bottom(false);
+}
+
 static void prv_progress_reset(void) {
   s_progress_mode = true;
-  s_response[0] = '\0';
-  s_response_truncated = false;
   snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
   s_progress_detail[0] = '\0';
   s_progress_history[0] = '\0';
@@ -659,6 +786,7 @@ static void prv_append_response(const char *text) {
   prv_show_response_view();
   prv_append_text_limited(text);
   prv_update_scroll_text();
+  prv_scroll_to_bottom(false);
 }
 
 #if defined(PBL_MICROPHONE)
@@ -670,12 +798,15 @@ static void prv_send_request(const char *text) {
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox begin failed result=%d", result);
     prv_set_status("Phone unavailable");
-    prv_set_response("Could not contact phone. Try again.");
+    prv_append_notice("Could not contact phone. Try again.");
     return;
   }
 
   s_request_id += 1;
   dict_write_uint32(iter, MESSAGE_KEY_RequestId, s_request_id);
+  if (s_chat_reset_pending) {
+    dict_write_uint8(iter, MESSAGE_KEY_ChatReset, 1);
+  }
   dict_write_cstring(iter, MESSAGE_KEY_RequestText, text);
   dict_write_end(iter);
 
@@ -683,11 +814,13 @@ static void prv_send_request(const char *text) {
   if (result != APP_MSG_OK) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)s_request_id, result);
     prv_set_status("Send failed");
-    prv_set_response("Could not send request to phone.");
+    prv_append_notice("Could not send request to phone.");
     return;
   }
 
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
+  s_chat_reset_pending = false;
+  prv_append_prompt(text);
   prv_set_status("Waiting for phone");
   prv_progress_reset();
   prv_set_progress("thinking");
@@ -703,24 +836,24 @@ static void prv_dictation_callback(DictationSession *session, DictationSessionSt
         prv_send_request(transcription);
       } else {
         prv_set_status("No speech");
-        prv_set_response("No speech detected.");
+        prv_preserve_chat_or_set_response("No speech detected.");
       }
       break;
     case DictationSessionStatusFailureTranscriptionRejected:
       prv_set_status("Cancelled");
-      prv_set_response("Dictation cancelled.");
+      prv_preserve_chat_or_set_response("Dictation cancelled.");
       break;
     case DictationSessionStatusFailureConnectivityError:
       prv_set_status("Dictation offline");
-      prv_set_response("Dictation needs phone connection and internet.");
+      prv_preserve_chat_or_set_response("Dictation needs phone connection and internet.");
       break;
     case DictationSessionStatusFailureDisabled:
       prv_set_status("Dictation disabled");
-      prv_set_response("Voice dictation is disabled in Pebble settings.");
+      prv_preserve_chat_or_set_response("Voice dictation is disabled in Pebble settings.");
       break;
     default:
       prv_set_status("Dictation failed");
-      prv_set_response("Dictation failed. Try again.");
+      prv_preserve_chat_or_set_response("Dictation failed. Try again.");
       break;
   }
 }
@@ -732,7 +865,7 @@ static bool prv_ensure_dictation_session(void) {
 
   s_dictation_session = dictation_session_create(DICTATION_BUFFER_SIZE, prv_dictation_callback, NULL);
   if (!s_dictation_session) {
-    prv_set_response("Voice dictation unavailable. Check phone connection.");
+    prv_preserve_chat_or_set_response("Voice dictation unavailable. Check phone connection.");
     return false;
   }
 
@@ -750,12 +883,11 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
   }
 
   prv_set_status("Listening");
-  prv_set_response("Listening...");
   DictationSessionStatus status = dictation_session_start(s_dictation_session);
   if (status != DictationSessionStatusSuccess) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "dictation start failed status=%d", status);
     prv_set_status("Dictation failed");
-    prv_set_response("Could not start dictation.");
+    prv_preserve_chat_or_set_response("Could not start dictation.");
   }
 #else
   APP_LOG(APP_LOG_LEVEL_WARNING, "select pressed: microphone unsupported");
@@ -793,10 +925,9 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
     prv_set_status("Receiving");
     prv_show_response_view();
-    s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
-    scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+    prv_scroll_to_bottom(false);
   }
 
   Tuple *progress_reset_t = dict_find(iter, MESSAGE_KEY_ProgressReset);
@@ -845,7 +976,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (error_t) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
     prv_set_status("Error");
-    prv_set_response(error_t->value->cstring);
+    prv_append_response(error_t->value->cstring);
   }
 
   Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
@@ -856,6 +987,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       prv_set_response("No response text.");
     } else {
       prv_update_scroll_text();
+      prv_scroll_to_bottom(false);
     }
     prv_buzz_response_done();
   }
@@ -864,13 +996,16 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "inbox dropped reason=%d", reason);
   prv_set_status("Message dropped");
-  prv_set_response("Response message dropped. Try again.");
+  prv_append_notice("Response message dropped. Try again.");
 }
 
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
+  if (iter && dict_find(iter, MESSAGE_KEY_ChatReset)) {
+    s_chat_reset_pending = true;
+  }
   prv_set_status("Phone failed");
-  prv_set_response("Phone connection failed. Try again.");
+  prv_append_notice("Phone connection failed. Try again.");
 }
 
 static void prv_window_load(Window *window) {
@@ -885,12 +1020,13 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_paging(s_scroll_layer, true);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
-  s_text_width = bounds.size.w - 8;
+  s_text_layer_width = bounds.size.w;
+  s_text_width = bounds.size.w - (TEXT_SIDE_PADDING * 2);
   s_min_text_height = bounds.size.h;
   s_progress_width = bounds.size.w - (PROGRESS_TEXT_SIDE_PADDING * 2);
   s_progress_height = bounds.size.h;
 
-  s_text_layer = layer_create(GRect(4, 0, s_text_width, s_min_text_height));
+  s_text_layer = layer_create(GRect(0, 0, s_text_layer_width, s_min_text_height));
   layer_set_update_proc(s_text_layer, prv_text_layer_update_proc);
   scroll_layer_add_child(s_scroll_layer, s_text_layer);
 

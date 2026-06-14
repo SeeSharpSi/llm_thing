@@ -53,7 +53,8 @@
       "McpServersJson",
       "BuzzStrength",
       "ProgressDetail",
-      "ProgressHistory"
+      "ProgressHistory",
+      "ChatReset"
     ],
     "resources": {
       "media": []
