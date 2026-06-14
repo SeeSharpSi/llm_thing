@@ -73,6 +73,7 @@ var DEFAULT_SETTINGS = {
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   FontSize: 18,
   BuzzStrength: 1,
+  ScrollLines: 3,
   StartDictationQuickLaunch: false,
   McpServersJson: '[]'
 };
@@ -145,6 +146,7 @@ function extend(base, extra) {
     result.FontSize = 18;
   }
   result.BuzzStrength = clampNumber(result.BuzzStrength, 0, 3, 1);
+  result.ScrollLines = clampNumber(result.ScrollLines, 1, 10, 3);
   return result;
 }
 
@@ -164,6 +166,7 @@ function syncWatchSettings(settings) {
   sendMessage({
     FontSize: settings.FontSize,
     BuzzStrength: settings.BuzzStrength,
+    ScrollLines: settings.ScrollLines,
     StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0
   });
 }

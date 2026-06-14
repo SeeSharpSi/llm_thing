@@ -160,6 +160,19 @@ module.exports = [
         ]
       },
       {
+        "type": "input",
+        "messageKey": "ScrollLines",
+        "label": "Scroll Lines",
+        "description": "Lines moved per UP/DOWN click.",
+        "defaultValue": 3,
+        "attributes": {
+          "type": "number",
+          "min": 1,
+          "max": 10,
+          "step": 1
+        }
+      },
+      {
         "type": "toggle",
         "messageKey": "StartDictationQuickLaunch",
         "label": "Start in Dictation when Quick Launched",

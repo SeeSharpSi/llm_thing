@@ -5,10 +5,13 @@
 #define RESPONSE_BUFFER_SIZE 8192
 #define FONT_SIZE_DEFAULT 18
 #define BUZZ_STRENGTH_DEFAULT 1
+#define SCROLL_LINES_DEFAULT 3
 #define PERSIST_KEY_FONT_SIZE 1
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
+#define PERSIST_KEY_SCROLL_LINES 4
 #define QUICK_LAUNCH_DICTATION_DELAY_MS 250
+#define SCROLL_REPEAT_INTERVAL_MS 100
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_SIDE_PADDING 4
 #define PROMPT_BACKGROUND_BOTTOM_PADDING 6
@@ -63,6 +66,7 @@ static int32_t s_scroll_content_height;
 static int32_t s_scroll_text_height;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
+static int s_scroll_lines = SCROLL_LINES_DEFAULT;
 static uint32_t s_request_id;
 static uint16_t s_progress_loading_frame;
 static bool s_start_dictation_quick_launch;
@@ -131,6 +135,14 @@ static int prv_normalize_buzz_strength(int strength) {
   return BUZZ_STRENGTH_DEFAULT;
 }
 
+static int prv_normalize_scroll_lines(int lines) {
+  if (lines >= 1 && lines <= 10) {
+    return lines;
+  }
+
+  return SCROLL_LINES_DEFAULT;
+}
+
 static int prv_int_from_tuple(Tuple *tuple, int fallback) {
   if (!tuple) {
     return fallback;
@@ -151,6 +163,14 @@ static void prv_apply_buzz_strength(int strength, bool should_persist) {
 
   if (should_persist) {
     persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, s_buzz_strength);
+  }
+}
+
+static void prv_apply_scroll_lines(int lines, bool should_persist) {
+  s_scroll_lines = prv_normalize_scroll_lines(lines);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SCROLL_LINES, s_scroll_lines);
   }
 }
 
@@ -435,7 +455,6 @@ static void prv_update_scroll_text(void) {
   int32_t measured_height = prv_layout_response_text(NULL, false);
   int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
   int32_t scroll_height;
-  int32_t page_remainder;
 
   if (text_height < s_min_text_height) {
     text_height = s_min_text_height;
@@ -443,15 +462,6 @@ static void prv_update_scroll_text(void) {
   s_scroll_text_height = text_height;
 
   scroll_height = text_height;
-  if (measured_height > s_min_text_height) {
-    // Match TextLayer paging: final offset should land on a page boundary,
-    // with one blank page for bottom clearance across font sizes.
-    scroll_height += s_min_text_height;
-    page_remainder = scroll_height % s_min_text_height;
-    if (page_remainder) {
-      scroll_height += s_min_text_height - page_remainder;
-    }
-  }
 
   if (scroll_height > TEXT_MEASURE_HEIGHT) {
     scroll_height = TEXT_MEASURE_HEIGHT;
@@ -463,6 +473,19 @@ static void prv_update_scroll_text(void) {
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_layer_width, scroll_height));
 }
 
+static int32_t prv_min_scroll_offset_y(void) {
+  int32_t min_y = s_min_text_height - s_scroll_text_height;
+
+  if (min_y < -TEXT_MEASURE_HEIGHT) {
+    min_y = -TEXT_MEASURE_HEIGHT;
+  }
+  if (min_y > 0) {
+    min_y = 0;
+  }
+
+  return min_y;
+}
+
 static void prv_scroll_to_bottom(bool animated) {
   int32_t offset_y;
 
@@ -470,12 +493,34 @@ static void prv_scroll_to_bottom(bool animated) {
     return;
   }
 
-  offset_y = s_min_text_height - s_scroll_text_height;
-  if (offset_y < -TEXT_MEASURE_HEIGHT) {
-    offset_y = -TEXT_MEASURE_HEIGHT;
-  }
+  offset_y = prv_min_scroll_offset_y();
 
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)offset_y), animated);
+}
+
+static void prv_scroll_by_lines(int lines, bool animated) {
+  int32_t line_height;
+  int32_t min_y;
+  int32_t next_y;
+  GPoint offset;
+
+  if (!s_scroll_layer || s_scroll_text_height <= s_min_text_height) {
+    return;
+  }
+
+  line_height = prv_line_height();
+  min_y = prv_min_scroll_offset_y();
+  offset = scroll_layer_get_content_offset(s_scroll_layer);
+  next_y = offset.y - ((int32_t)lines * line_height);
+
+  if (next_y < min_y) {
+    next_y = min_y;
+  }
+  if (next_y > 0) {
+    next_y = 0;
+  }
+
+  scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), animated);
 }
 
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
@@ -951,7 +996,21 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
   prv_start_dictation();
 }
 
+static void prv_up_click_handler(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  prv_scroll_by_lines(-s_scroll_lines, true);
+}
+
+static void prv_down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  prv_scroll_by_lines(s_scroll_lines, true);
+}
+
 static void prv_scroll_click_config_provider(void *context) {
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, SCROLL_REPEAT_INTERVAL_MS, prv_up_click_handler);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, SCROLL_REPEAT_INTERVAL_MS, prv_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, prv_select_click_handler);
 }
 
@@ -973,6 +1032,12 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (buzz_strength_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "buzz strength update");
     prv_apply_buzz_strength(prv_int_from_tuple(buzz_strength_t, s_buzz_strength), true);
+  }
+
+  Tuple *scroll_lines_t = dict_find(iter, MESSAGE_KEY_ScrollLines);
+  if (scroll_lines_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "scroll lines update");
+    prv_apply_scroll_lines(prv_int_from_tuple(scroll_lines_t, s_scroll_lines), true);
   }
 
   Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
@@ -1080,7 +1145,7 @@ static void prv_window_load(Window *window) {
   scroll_layer_set_callbacks(s_scroll_layer, (ScrollLayerCallbacks) {
     .click_config_provider = prv_scroll_click_config_provider
   });
-  scroll_layer_set_paging(s_scroll_layer, true);
+  scroll_layer_set_paging(s_scroll_layer, false);
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_layer_width = bounds.size.w;
@@ -1147,6 +1212,9 @@ static void prv_init(void) {
   }
   if (persist_exists(PERSIST_KEY_BUZZ_STRENGTH)) {
     s_buzz_strength = prv_normalize_buzz_strength(persist_read_int(PERSIST_KEY_BUZZ_STRENGTH));
+  }
+  if (persist_exists(PERSIST_KEY_SCROLL_LINES)) {
+    s_scroll_lines = prv_normalize_scroll_lines(persist_read_int(PERSIST_KEY_SCROLL_LINES));
   }
   if (persist_exists(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH)) {
     s_start_dictation_quick_launch = persist_read_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH) != 0;

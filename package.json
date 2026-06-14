@@ -55,7 +55,8 @@
       "ProgressDetail",
       "ProgressHistory",
       "ChatReset",
-      "StartDictationQuickLaunch"
+      "StartDictationQuickLaunch",
+      "ScrollLines"
     ],
     "resources": {
       "media": []
