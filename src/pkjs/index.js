@@ -616,6 +616,53 @@ function authHeader(value) {
   return 'Bearer ' + header;
 }
 
+function isValidHttpHeaderName(value) {
+  return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(value);
+}
+
+function isReservedMcpHeader(value) {
+  var name = String(value || '').toLowerCase();
+
+  return name === 'content-type' ||
+    name === 'accept' ||
+    name === 'mcp-protocol-version' ||
+    name === 'mcp-session-id';
+}
+
+function normalizeMcpHeaders(value) {
+  var headers = [];
+  var seen = {};
+  var i;
+  var header;
+  var name;
+  var headerValue;
+  var lowerName;
+
+  if (!value || !value.length) {
+    return headers;
+  }
+
+  for (i = 0; i < value.length; i += 1) {
+    header = value[i] || {};
+    name = trim(header.name);
+    headerValue = trim(String(header.value || '').replace(/[\r\n]+/g, ' '));
+    lowerName = name.toLowerCase();
+
+    if (!name || !headerValue || !isValidHttpHeaderName(name) || isReservedMcpHeader(name) || seen[lowerName]) {
+      continue;
+    }
+
+    seen[lowerName] = true;
+    headers.push({
+      name: name,
+      value: headerValue,
+      lowerName: lowerName
+    });
+  }
+
+  return headers;
+}
+
 function parseMcpServers(settings) {
   var parsed;
   var servers = [];
@@ -642,6 +689,7 @@ function parseMcpServers(settings) {
         description: trim(server.description),
         allowedTools: splitCsv(server.allowedTools),
         authorization: trim(server.authorization),
+        headers: normalizeMcpHeaders(server.headers),
         sessionId: ''
       };
       if (server.label && server.url) {
@@ -667,6 +715,23 @@ function isAllowedTool(server, name) {
   }
 
   return false;
+}
+
+function applyMcpCustomHeaders(request, server, authorization) {
+  var headers = server.headers || [];
+  var i;
+
+  for (i = 0; i < headers.length; i += 1) {
+    if (headers[i].lowerName === 'authorization' && authorization) {
+      continue;
+    }
+
+    try {
+      request.setRequestHeader(headers[i].name, headers[i].value);
+    } catch (e) {
+      logDebug('mcp custom header skipped server=' + server.label + ' name=' + headers[i].name);
+    }
+  }
 }
 
 function mcpJsonRpc(server, method, params, expectBody, callback) {
@@ -695,6 +760,7 @@ function mcpJsonRpc(server, method, params, expectBody, callback) {
   if (authorization) {
     request.setRequestHeader('Authorization', authorization);
   }
+  applyMcpCustomHeaders(request, server, authorization);
   request.timeout = 30000;
 
   logDebug('mcp request server=' + server.label + ' method=' + method + ' id=' + (payload.id || 'notification'));

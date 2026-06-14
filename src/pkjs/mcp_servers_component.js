@@ -39,6 +39,100 @@ module.exports = {
       });
     }
 
+    function emptyServer() {
+      return { enabled: false, label: '', url: '', description: '', allowedTools: '', authorization: '', headers: [] };
+    }
+
+    function normalizeHeaders(value) {
+      var headers = [];
+      var i;
+      var header;
+
+      if (!value || !value.length) {
+        return headers;
+      }
+
+      for (i = 0; i < value.length; i += 1) {
+        header = value[i] || {};
+        headers.push({
+          name: trim(header.name),
+          value: trim(header.value)
+        });
+      }
+
+      return headers;
+    }
+
+    function collectHeaders(card) {
+      var rows = card.querySelectorAll('[data-mcp-header-row]');
+      var headers = [];
+      var i;
+
+      for (i = 0; i < rows.length; i += 1) {
+        headers.push({
+          name: trim(rows[i].querySelector('[data-mcp-header-field="name"]').value),
+          value: trim(rows[i].querySelector('[data-mcp-header-field="value"]').value)
+        });
+      }
+
+      return headers;
+    }
+
+    function renderHeaders(headers) {
+      var html = '';
+      var i;
+      var header;
+
+      headers = headers || [];
+      for (i = 0; i < headers.length; i += 1) {
+        header = headers[i] || {};
+        html += '<div class="mcp-header-row" data-mcp-header-row>' +
+          '<label><span class="mcp-label">Header Name</span><input type="text" data-mcp-header-field="name" placeholder="X-API-Key" value="' + escapeHtml(header.name) + '" /></label>' +
+          '<label><span class="mcp-label">Header Value</span><input type="password" data-mcp-header-field="value" placeholder="Secret value" value="' + escapeHtml(header.value) + '" /></label>' +
+          '<button type="button" class="mcp-delete" data-mcp-header-delete>- Delete Header</button>' +
+          '</div>';
+      }
+
+      return html;
+    }
+
+    function closestByAttr(element, attr) {
+      while (element && element !== root) {
+        if (element.getAttribute && element.getAttribute(attr) !== null) {
+          return element;
+        }
+        element = element.parentNode;
+      }
+
+      return null;
+    }
+
+    function serverIndex(card) {
+      var cards = root.querySelectorAll('[data-mcp-server]');
+      var i;
+
+      for (i = 0; i < cards.length; i += 1) {
+        if (cards[i] === card) {
+          return i;
+        }
+      }
+
+      return -1;
+    }
+
+    function headerIndex(card, row) {
+      var rows = card.querySelectorAll('[data-mcp-header-row]');
+      var i;
+
+      for (i = 0; i < rows.length; i += 1) {
+        if (rows[i] === row) {
+          return i;
+        }
+      }
+
+      return -1;
+    }
+
     item.parseServers = function(value) {
       var parsed;
       var servers = [];
@@ -63,12 +157,13 @@ module.exports = {
           url: trim(server.url),
           description: trim(server.description),
           allowedTools: trim(server.allowedTools),
-          authorization: trim(server.authorization)
+          authorization: trim(server.authorization),
+          headers: normalizeHeaders(server.headers)
         });
       }
 
       if (!servers.length) {
-        servers.push({ enabled: false, label: '', url: '', description: '', allowedTools: '', authorization: '' });
+        servers.push(emptyServer());
       }
 
       return servers;
@@ -86,7 +181,8 @@ module.exports = {
           url: trim(cards[i].querySelector('[data-mcp-field="url"]').value),
           description: trim(cards[i].querySelector('[data-mcp-field="description"]').value),
           allowedTools: trim(cards[i].querySelector('[data-mcp-field="allowedTools"]').value),
-          authorization: trim(cards[i].querySelector('[data-mcp-field="authorization"]').value)
+          authorization: trim(cards[i].querySelector('[data-mcp-field="authorization"]').value),
+          headers: collectHeaders(cards[i])
         });
       }
 
@@ -109,6 +205,8 @@ module.exports = {
           '<label><span class="mcp-label">Description</span><input type="text" data-mcp-field="description" placeholder="What this server helps with" value="' + escapeHtml(server.description) + '" /></label>' +
           '<label><span class="mcp-label">Allowed Tools</span><input type="text" data-mcp-field="allowedTools" placeholder="ask_question,read_wiki_structure" value="' + escapeHtml(server.allowedTools) + '" /></label>' +
           '<label><span class="mcp-label">Auth Token</span><input type="password" data-mcp-field="authorization" placeholder="Optional OAuth token" value="' + escapeHtml(server.authorization) + '" /></label>' +
+          '<div class="mcp-header-list" data-mcp-header-list>' + renderHeaders(server.headers) + '</div>' +
+          '<button type="button" class="mcp-add" data-mcp-header-add>+ Add Custom Header</button>' +
           '</div>';
       }
 
@@ -123,6 +221,10 @@ module.exports = {
 
     root.addEventListener('click', function(e) {
       var servers;
+      var card;
+      var row;
+      var index;
+      var header;
 
       if (e.target.getAttribute('data-mcp-toggle') !== null) {
         if (body.style.display === 'none') {
@@ -137,9 +239,35 @@ module.exports = {
 
       if (e.target.getAttribute('data-mcp-add') !== null) {
         servers = item.collectServers();
-        servers.push({ enabled: false, label: '', url: '', description: '', allowedTools: '', authorization: '' });
+        servers.push(emptyServer());
         item.renderServers(servers);
         syncValue();
+        return;
+      }
+
+      if (e.target.getAttribute('data-mcp-header-add') !== null) {
+        card = closestByAttr(e.target, 'data-mcp-server');
+        index = serverIndex(card);
+        if (index >= 0) {
+          servers = item.collectServers();
+          servers[index].headers.push({ name: '', value: '' });
+          item.renderServers(servers);
+          syncValue();
+        }
+        return;
+      }
+
+      if (e.target.getAttribute('data-mcp-header-delete') !== null) {
+        card = closestByAttr(e.target, 'data-mcp-server');
+        row = closestByAttr(e.target, 'data-mcp-header-row');
+        index = serverIndex(card);
+        header = card ? headerIndex(card, row) : -1;
+        if (index >= 0 && header >= 0) {
+          servers = item.collectServers();
+          servers[index].headers.splice(header, 1);
+          item.renderServers(servers);
+          syncValue();
+        }
         return;
       }
 
@@ -147,7 +275,7 @@ module.exports = {
         servers = item.collectServers();
         servers.splice(Array.prototype.indexOf.call(root.querySelectorAll('[data-mcp-delete]'), e.target), 1);
         if (!servers.length) {
-          servers.push({ enabled: false, label: '', url: '', description: '', allowedTools: '', authorization: '' });
+          servers.push(emptyServer());
         }
         item.renderServers(servers);
         syncValue();
