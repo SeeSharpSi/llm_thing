@@ -7,6 +7,8 @@
 #define BUZZ_STRENGTH_DEFAULT 1
 #define PERSIST_KEY_FONT_SIZE 1
 #define PERSIST_KEY_BUZZ_STRENGTH 2
+#define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
+#define QUICK_LAUNCH_DICTATION_DELAY_MS 250
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_SIDE_PADDING 4
 #define PROMPT_BACKGROUND_BOTTOM_PADDING 6
@@ -42,6 +44,7 @@ static TextLayer *s_progress_title_layer;
 static TextLayer *s_progress_detail_layer;
 static Layer *s_progress_loading_layer;
 static AppTimer *s_progress_loading_timer;
+static AppTimer *s_quick_launch_dictation_timer;
 #if defined(PBL_MICROPHONE)
 static DictationSession *s_dictation_session;
 #endif
@@ -62,6 +65,9 @@ static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static uint32_t s_request_id;
 static uint16_t s_progress_loading_frame;
+static bool s_start_dictation_quick_launch;
+static bool s_launched_from_quick_launch;
+static bool s_quick_launch_dictation_started;
 static bool s_response_truncated;
 static bool s_progress_mode;
 static bool s_chat_started;
@@ -145,6 +151,19 @@ static void prv_apply_buzz_strength(int strength, bool should_persist) {
 
   if (should_persist) {
     persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, s_buzz_strength);
+  }
+}
+
+static void prv_apply_start_dictation_quick_launch(int enabled, bool should_persist) {
+  s_start_dictation_quick_launch = enabled != 0;
+
+  if (!s_start_dictation_quick_launch && s_quick_launch_dictation_timer) {
+    app_timer_cancel(s_quick_launch_dictation_timer);
+    s_quick_launch_dictation_timer = NULL;
+  }
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH, s_start_dictation_quick_launch ? 1 : 0);
   }
 }
 
@@ -875,9 +894,17 @@ static bool prv_ensure_dictation_session(void) {
 }
 #endif
 
-static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+static void prv_start_dictation(void) {
+  if (s_launched_from_quick_launch) {
+    s_quick_launch_dictation_started = true;
+    if (s_quick_launch_dictation_timer) {
+      app_timer_cancel(s_quick_launch_dictation_timer);
+      s_quick_launch_dictation_timer = NULL;
+    }
+  }
+
 #if defined(PBL_MICROPHONE)
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "select pressed: start dictation");
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "start dictation");
   if (!prv_ensure_dictation_session()) {
     return;
   }
@@ -894,6 +921,34 @@ static void prv_select_click_handler(ClickRecognizerRef recognizer, void *contex
   prv_set_status("Unsupported");
   prv_set_response("Voice dictation unsupported on this watch.");
 #endif
+}
+
+static void prv_quick_launch_dictation_timer_callback(void *context) {
+  (void)context;
+  s_quick_launch_dictation_timer = NULL;
+
+  if (s_start_dictation_quick_launch && !s_quick_launch_dictation_started) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation start");
+    prv_start_dictation();
+  }
+}
+
+static void prv_maybe_schedule_quick_launch_dictation(void) {
+  if (!s_launched_from_quick_launch || !s_start_dictation_quick_launch ||
+      s_quick_launch_dictation_started || s_quick_launch_dictation_timer) {
+    return;
+  }
+
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation scheduled");
+  s_quick_launch_dictation_timer = app_timer_register(QUICK_LAUNCH_DICTATION_DELAY_MS,
+      prv_quick_launch_dictation_timer_callback, NULL);
+}
+
+static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "select pressed: start dictation");
+  prv_start_dictation();
 }
 
 static void prv_scroll_click_config_provider(void *context) {
@@ -918,6 +973,14 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   if (buzz_strength_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "buzz strength update");
     prv_apply_buzz_strength(prv_int_from_tuple(buzz_strength_t, s_buzz_strength), true);
+  }
+
+  Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
+  if (start_dictation_quick_launch_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation setting update");
+    prv_apply_start_dictation_quick_launch(prv_int_from_tuple(start_dictation_quick_launch_t,
+        s_start_dictation_quick_launch ? 1 : 0), true);
+    prv_maybe_schedule_quick_launch_dictation();
   }
 
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
@@ -1085,6 +1148,12 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_BUZZ_STRENGTH)) {
     s_buzz_strength = prv_normalize_buzz_strength(persist_read_int(PERSIST_KEY_BUZZ_STRENGTH));
   }
+  if (persist_exists(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH)) {
+    s_start_dictation_quick_launch = persist_read_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH) != 0;
+  }
+  AppLaunchReason reason = launch_reason();
+  s_launched_from_quick_launch = reason == APP_LAUNCH_QUICK_LAUNCH;
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "launch reason=%d quick_dictation=%d", reason, s_start_dictation_quick_launch ? 1 : 0);
 
   s_window = window_create();
   window_set_background_color(s_window, GColorWhite);
@@ -1104,9 +1173,15 @@ static void prv_init(void) {
 #endif
 
   window_stack_push(s_window, true);
+  prv_maybe_schedule_quick_launch_dictation();
 }
 
 static void prv_deinit(void) {
+  if (s_quick_launch_dictation_timer) {
+    app_timer_cancel(s_quick_launch_dictation_timer);
+    s_quick_launch_dictation_timer = NULL;
+  }
+
 #if defined(PBL_MICROPHONE)
   if (s_dictation_session) {
     dictation_session_destroy(s_dictation_session);

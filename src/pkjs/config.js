@@ -158,6 +158,13 @@ module.exports = [
             "value": "3"
           }
         ]
+      },
+      {
+        "type": "toggle",
+        "messageKey": "StartDictationQuickLaunch",
+        "label": "Start in Dictation when Quick Launched",
+        "description": "Open dictation automatically when the app is launched from Quick Launch.",
+        "defaultValue": false
       }
     ]
   },

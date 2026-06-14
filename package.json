@@ -54,7 +54,8 @@
       "BuzzStrength",
       "ProgressDetail",
       "ProgressHistory",
-      "ChatReset"
+      "ChatReset",
+      "StartDictationQuickLaunch"
     ],
     "resources": {
       "media": []

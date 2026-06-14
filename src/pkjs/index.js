@@ -73,6 +73,7 @@ var DEFAULT_SETTINGS = {
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   FontSize: 18,
   BuzzStrength: 1,
+  StartDictationQuickLaunch: false,
   McpServersJson: '[]'
 };
 
@@ -137,6 +138,7 @@ function extend(base, extra) {
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
   result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
+  result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
@@ -159,7 +161,11 @@ function saveSettings(settings) {
 }
 
 function syncWatchSettings(settings) {
-  sendMessage({ FontSize: settings.FontSize, BuzzStrength: settings.BuzzStrength });
+  sendMessage({
+    FontSize: settings.FontSize,
+    BuzzStrength: settings.BuzzStrength,
+    StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0
+  });
 }
 
 function sendMessage(dict, onSuccess, onFailure) {
