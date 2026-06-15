@@ -287,12 +287,33 @@ function formatMarkdownBoldForWatch(text, maxLength) {
 }
 
 function formatProgressHistory(items) {
+  var groups = [];
   var text = '';
   var candidate;
   var i;
+  var label;
+  var group;
+  var suffix;
+  var line;
 
-  for (i = items.length - 1; i >= 0; i -= 1) {
-    candidate = truncate(items[i], 48) + (text ? '\n' + text : '');
+  for (i = 0; i < items.length; i += 1) {
+    label = String(items[i] || '');
+    if (!label) {
+      continue;
+    }
+
+    group = groups.length ? groups[groups.length - 1] : null;
+    if (group && group.label === label) {
+      group.count += 1;
+    } else {
+      groups.push({ label: label, count: 1 });
+    }
+  }
+
+  for (i = groups.length - 1; i >= 0; i -= 1) {
+    suffix = groups[i].count > 1 ? ' ' + groups[i].count + 'x' : '';
+    line = truncate(groups[i].label, 48 - suffix.length) + suffix;
+    candidate = line + (text ? '\n' + text : '');
     if (candidate.length > 240) {
       break;
     }
