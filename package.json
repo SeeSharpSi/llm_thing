@@ -42,6 +42,7 @@
       "ProgressAppend",
       "Endpoint",
       "ApiKey",
+      "UseCustomModel",
       "Model",
       "SystemPrompt",
       "ShowThinking",
