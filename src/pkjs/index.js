@@ -1702,14 +1702,46 @@ function parseToolCalls(text) {
   return [];
 }
 
-function appendToolResults(conversation, assistantText, results) {
+function buildToolCapNotice(skippedCount) {
+  var text = 'Tool call budget exhausted for this request. No more tool calls are available.';
+  if (skippedCount > 0) {
+    text += ' ' + skippedCount + ' requested tool call(s) were not run.';
+  }
+  return text +
+    '\nDo not output tool_calls JSON.' +
+    '\nWrite the final answer now using only the original request, prior conversation, and tool results already provided.' +
+    '\nIf you needed more tool calls, start with a brief caveat that you are out of tool calls.';
+}
+function appendToolResults(conversation, assistantText, results, noMoreTools, skippedCount) {
+  var content = 'Tool results:\n' + safeJson(results);
+  if (noMoreTools) {
+    content += '\n' + buildToolCapNotice(skippedCount);
+  } else {
+    content += '\nUse these results to answer the original request. If another tool is needed, respond only with the same tool_calls JSON shape.';
+  }
   conversation.push({
     role: 'assistant',
     content: assistantText
   });
   conversation.push({
     role: 'user',
-    content: 'Tool results:\n' + safeJson(results) + '\nUse these results to answer the original request. If another tool is needed, respond only with the same tool_calls JSON shape.'
+    content: content
+  });
+}
+function requestFinalAfterToolCap(requestId, settings, conversation, callback) {
+  progressSet(requestId, 'thinking', 'tool call limit reached');
+  requestModel(settings, conversation, function(error, json) {
+    var assistantText;
+    if (error) {
+      callback(error);
+      return;
+    }
+    assistantText = extractResponseText(json);
+    if (parseToolCalls(assistantText).length) {
+      callback(null, 'I am out of tool calls, and the model requested another tool instead of producing a final answer. I can only answer from information already gathered.');
+      return;
+    }
+    callback(null, parseResponse(json, settings.ShowThinking));
   });
 }
 
@@ -1720,6 +1752,8 @@ function completeWithTools(requestId, settings, conversation, toolMap, round, us
     var assistantText;
     var toolCalls;
     var remainingToolCalls;
+    var noMoreTools;
+    var skippedCount;
 
     if (error) {
       callback(error);
@@ -1738,18 +1772,31 @@ function completeWithTools(requestId, settings, conversation, toolMap, round, us
 
     remainingToolCalls = settings.MaxToolCalls - usedToolCalls;
     if (remainingToolCalls <= 0) {
-      callback('Tool call limit reached');
+      conversation.push({
+        role: 'assistant',
+        content: assistantText
+      });
+      conversation.push({
+        role: 'user',
+        content: buildToolCapNotice(toolCalls.length)
+      });
+      requestFinalAfterToolCap(requestId, settings, conversation, callback);
       return;
     }
-
+    noMoreTools = toolCalls.length >= remainingToolCalls;
+    skippedCount = 0;
     if (toolCalls.length > remainingToolCalls) {
+      skippedCount = toolCalls.length - remainingToolCalls;
       logDebug('tool loop truncating toolCalls=' + toolCalls.length + ' remaining=' + remainingToolCalls);
       toolCalls = toolCalls.slice(0, remainingToolCalls);
     }
-
     runToolCalls(requestId, toolCalls, toolMap, function(results) {
       logDebug('tool loop results=' + results.length);
-      appendToolResults(conversation, assistantText, results);
+      appendToolResults(conversation, assistantText, results, noMoreTools, skippedCount);
+      if (noMoreTools) {
+        requestFinalAfterToolCap(requestId, settings, conversation, callback);
+        return;
+      }
       completeWithTools(requestId, settings, conversation, toolMap, round + 1, usedToolCalls + toolCalls.length, callback);
     });
   });
