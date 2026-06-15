@@ -37,6 +37,10 @@
 #define PROGRESS_DETAIL_MIN_HEIGHT 22
 #define PROGRESS_DETAIL_MAX_HEIGHT 72
 #define PROGRESS_HISTORY_MAX_HEIGHT 240
+#define HOME_CARD_MARGIN 8
+#define HOME_CARD_RADIUS 8
+#define HOME_BUTTON_WIDTH 82
+#define HOME_BUTTON_HEIGHT 24
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
@@ -77,6 +81,7 @@ static bool s_response_truncated;
 static bool s_progress_mode;
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
+static bool s_home_screen_visible;
 
 static void prv_update_scroll_text(void);
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
@@ -546,9 +551,78 @@ static void prv_scroll_by_lines(int lines, bool animated) {
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), animated);
 }
 
-static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
+static void prv_draw_home_button(GContext *ctx, const char *text, GRect frame) {
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, frame, HOME_BUTTON_HEIGHT / 2, GCornersAll);
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, text, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), frame,
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+static void prv_draw_home_centered_text(GContext *ctx, const char *text, GFont font, GRect frame) {
+  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_draw_text(ctx, text, font, frame,
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+}
+
+static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
+  int16_t margin = HOME_CARD_MARGIN;
+  int16_t card_width;
+  int16_t card_height;
+  GRect card;
+  int16_t center_x;
+  int16_t y;
+
+#if defined(PBL_ROUND)
+  margin = 18;
+#endif
+
+  card_width = bounds.size.w - (margin * 2);
+  card_height = bounds.size.h - (margin * 2);
+  card = GRect(margin, margin, card_width, card_height);
+  center_x = card.origin.x + (card.size.w / 2);
+  y = card.origin.y + 10;
+
   graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+  graphics_fill_rect(ctx, card, HOME_CARD_RADIUS, GCornersAll);
+
+  prv_draw_home_centered_text(ctx, "llm_thing", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+      GRect(card.origin.x + 8, y, card.size.w - 16, 28));
+  y += 34;
+
+#if defined(PBL_COLOR)
+  graphics_context_set_fill_color(ctx, GColorBlue);
+#else
+  graphics_context_set_fill_color(ctx, GColorBlack);
+#endif
+  graphics_fill_rect(ctx, GRect(card.origin.x + 26, y, card.size.w - 52, 3), 1, GCornersAll);
+  y += 21;
+
+  prv_draw_home_button(ctx, "SELECT", GRect(center_x - (HOME_BUTTON_WIDTH / 2), y,
+      HOME_BUTTON_WIDTH, HOME_BUTTON_HEIGHT));
+  y += HOME_BUTTON_HEIGHT + 2;
+  prv_draw_home_centered_text(ctx, "Dictate a prompt", fonts_get_system_font(FONT_KEY_GOTHIC_18),
+      GRect(card.origin.x + 8, y, card.size.w - 16, 20));
+  y += 40;
+
+  prv_draw_home_button(ctx, "UP/DOWN", GRect(center_x - (HOME_BUTTON_WIDTH / 2), y,
+      HOME_BUTTON_WIDTH, HOME_BUTTON_HEIGHT));
+  y += HOME_BUTTON_HEIGHT + 2;
+  prv_draw_home_centered_text(ctx, "Scroll responses", fonts_get_system_font(FONT_KEY_GOTHIC_18),
+      GRect(card.origin.x + 8, y, card.size.w - 16, 20));
+}
+
+static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+
+  if (s_home_screen_visible) {
+    prv_draw_home_screen(ctx, bounds);
+    return;
+  }
+
   prv_layout_response_text(ctx, true, NULL);
 }
 
@@ -791,6 +865,7 @@ static void prv_append_text_limited(const char *text) {
 #if defined(PBL_MICROPHONE)
 static void prv_append_prompt(const char *text) {
   prv_show_response_view();
+  s_home_screen_visible = false;
   s_response_truncated = false;
 
   if (!s_chat_started) {
@@ -855,10 +930,23 @@ static void prv_progress_append(const char *text) {
 
 static void prv_set_response(const char *text) {
   prv_show_response_view();
+  s_home_screen_visible = false;
   snprintf(s_response, sizeof(s_response), "%s", text);
   s_response_truncated = false;
   prv_update_scroll_text();
   scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+}
+
+static void prv_show_home_screen(void) {
+  prv_show_response_view();
+  s_home_screen_visible = true;
+  s_response[0] = '\0';
+  s_response_truncated = false;
+  prv_update_scroll_text();
+
+  if (s_scroll_layer) {
+    scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+  }
 }
 
 static void prv_set_progress(const char *text) {
@@ -871,6 +959,7 @@ static void prv_set_progress(const char *text) {
 
 static void prv_append_response(const char *text) {
   prv_show_response_view();
+  s_home_screen_visible = false;
   prv_append_text_limited(text);
   prv_update_scroll_text();
   prv_scroll_to_latest_prompt(false);
@@ -1214,7 +1303,7 @@ static void prv_window_load(Window *window) {
   layer_add_child(s_progress_layer, s_progress_loading_layer);
 
   prv_set_status("Ready");
-  prv_set_response("Press SELECT to dictate.\n\nUse UP/DOWN to scroll responses.");
+  prv_show_home_screen();
 }
 
 static void prv_window_unload(Window *window) {
