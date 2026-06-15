@@ -35,18 +35,13 @@ module.exports = [
         }
       },
       {
-        "type": "toggle",
-        "messageKey": "UseCustomModel",
-        "label": "Custom Model",
-        "description": "Enter a model ID manually instead of selecting from /models.",
-        "defaultValue": false
-      },
-      {
-        "type": "model_picker",
+        "type": "input",
         "messageKey": "Model",
         "label": "Model",
         "defaultValue": "gpt-4.1-mini",
-        "description": "Select from /models, or enable Custom Model to type an ID."
+        "attributes": {
+          "placeholder": "gpt-4.1-mini"
+        }
       }
     ]
   },

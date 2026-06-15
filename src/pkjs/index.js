@@ -1,10 +1,8 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var mcpServersComponent = require('./mcp_servers_component');
-var modelPickerComponent = require('./model_picker_component');
 var clay = new Clay(clayConfig, null, { autoHandleEvents: false });
 clay.registerComponent(mcpServersComponent);
-clay.registerComponent(modelPickerComponent);
 
 var SETTINGS_KEY = 'llm_thing_settings';
 var CHUNK_SIZE = 400;
@@ -15,7 +13,6 @@ var WATCH_BOLD_OFF = '\u0002';
 var DEFAULT_MAX_TOOL_CALLS = 4;
 var MAX_CHAT_HISTORY_MESSAGES = 16;
 var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
-var MAX_MODEL_OPTIONS = 300;
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
@@ -67,7 +64,6 @@ function processSendQueue() {
 var DEFAULT_SETTINGS = {
   Endpoint: 'https://api.openai.com/v1/responses',
   ApiKey: '',
-  UseCustomModel: false,
   Model: 'gpt-4.1-mini',
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
   ShowThinking: false,
@@ -144,7 +140,6 @@ function extend(base, extra) {
   result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
-  result.UseCustomModel = result.UseCustomModel === true || result.UseCustomModel === 1 || result.UseCustomModel === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
@@ -183,129 +178,6 @@ function sendMessage(dict, onSuccess, onFailure) {
     onFailure: onFailure
   });
   processSendQueue();
-}
-
-function trimString(value) {
-  return String(value || '').replace(/^\s+|\s+$/g, '');
-}
-
-function modelsUrlForEndpoint(endpoint) {
-  var url = trimString(endpoint).replace(/[?#].*$/, '').replace(/\/+$/, '');
-
-  if (!url) {
-    return '';
-  }
-  if (/\/models$/i.test(url)) {
-    return url;
-  }
-  if (/\/chat\/completions$/i.test(url)) {
-    return url.replace(/\/chat\/completions$/i, '/models');
-  }
-  if (/\/responses$/i.test(url)) {
-    return url.replace(/\/responses$/i, '/models');
-  }
-  if (/\/completions$/i.test(url)) {
-    return url.replace(/\/completions$/i, '/models');
-  }
-
-  return url + '/models';
-}
-
-function parseModelIds(responseText) {
-  var json;
-  var data;
-  var result = [];
-  var seen = {};
-  var i;
-  var value;
-
-  json = JSON.parse(responseText || '{}');
-  data = json.data || json.models || [];
-  if (!Array.isArray(data)) {
-    return result;
-  }
-
-  for (i = 0; i < data.length && result.length < MAX_MODEL_OPTIONS; i += 1) {
-    value = typeof data[i] === 'string' ? data[i] : data[i] && data[i].id;
-    value = trimString(value);
-    if (value && !seen[value]) {
-      seen[value] = true;
-      result.push(value);
-    }
-  }
-
-  result.sort();
-  return result;
-}
-
-function requestModelOptions(settings, callback) {
-  var url = modelsUrlForEndpoint(settings && settings.Endpoint);
-  var apiKey = settings && settings.ApiKey;
-  var done = false;
-
-  function finish(models, error) {
-    if (done) {
-      return;
-    }
-    done = true;
-    callback(models || [], error || '', url);
-  }
-
-  function sendRequest(useAuth) {
-    var request;
-
-    if (!url) {
-      finish([], 'Enter an endpoint URL to load models.');
-      return;
-    }
-
-    request = new XMLHttpRequest();
-    request.open('GET', url, true);
-    if (useAuth && trimString(apiKey)) {
-      request.setRequestHeader('Authorization', 'Bearer ' + trimString(apiKey));
-    }
-    request.timeout = 15000;
-
-    request.onload = function() {
-      var models;
-
-      if (!useAuth && trimString(apiKey) && (request.status === 401 || request.status === 403)) {
-        sendRequest(true);
-        return;
-      }
-      if (request.status < 200 || request.status >= 300) {
-        finish([], 'Could not load models: HTTP ' + request.status + '.');
-        return;
-      }
-      try {
-        models = parseModelIds(request.responseText);
-      } catch (e) {
-        finish([], 'Could not load models: bad JSON.');
-        return;
-      }
-      finish(models, models.length ? '' : 'No models returned by endpoint.');
-    };
-
-    request.onerror = function() {
-      if (!useAuth && trimString(apiKey)) {
-        sendRequest(true);
-        return;
-      }
-      finish([], 'Could not load models from phone network.');
-    };
-
-    request.ontimeout = function() {
-      if (!useAuth && trimString(apiKey)) {
-        sendRequest(true);
-        return;
-      }
-      finish([], 'Model list request timed out.');
-    };
-
-    request.send();
-  }
-
-  sendRequest(false);
 }
 
 function sendReset(requestId, onSuccess) {
@@ -1999,19 +1871,9 @@ Pebble.addEventListener('ready', function() {
 });
 
 Pebble.addEventListener('showConfiguration', function() {
-  var settings = loadSettings();
-
   logDebug('show configuration');
-  clay.setSettings(settings);
-  requestModelOptions(settings, function(models, error, url) {
-    logDebug('configuration model options url=' + url + ' count=' + models.length + (error ? ' error=' + error : ''));
-    clay.meta.userData = clay.meta.userData || {};
-    clay.meta.userData.ModelOptions = models;
-    clay.meta.userData.ModelOptionsError = error;
-    clay.meta.userData.ModelOptionsEndpoint = settings.Endpoint;
-    clay.meta.userData.ModelOptionsUrl = url;
-    Pebble.openURL(clay.generateUrl());
-  });
+  clay.setSettings(loadSettings());
+  Pebble.openURL(clay.generateUrl());
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
