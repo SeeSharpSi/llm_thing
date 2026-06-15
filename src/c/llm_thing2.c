@@ -64,6 +64,7 @@ static int16_t s_progress_width;
 static int16_t s_progress_height;
 static int32_t s_scroll_content_height;
 static int32_t s_scroll_text_height;
+static int32_t s_latest_prompt_y;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static int s_scroll_lines = SCROLL_LINES_DEFAULT;
@@ -396,7 +397,7 @@ static void prv_layout_spaces(const char *text, size_t length, bool bold, bool p
   *x += (int16_t)width;
 }
 
-static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
+static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t *latest_prompt_y) {
   const char *cursor = s_response;
   int16_t x = 0;
   int16_t y = 0;
@@ -404,6 +405,10 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
   int16_t prompt_filled_y = -1;
   bool bold = false;
   bool prompt = false;
+
+  if (latest_prompt_y) {
+    *latest_prompt_y = 0;
+  }
 
   if (should_draw && ctx) {
     graphics_context_set_text_color(ctx, GColorBlack);
@@ -418,6 +423,9 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw) {
       cursor += 1;
     } else if (*cursor == TEXT_PROMPT_ON) {
       prompt = true;
+      if (latest_prompt_y) {
+        *latest_prompt_y = y;
+      }
       cursor += 1;
     } else if (*cursor == TEXT_PROMPT_OFF) {
       prompt = false;
@@ -452,12 +460,18 @@ static void prv_update_scroll_text(void) {
     return;
   }
 
-  int32_t measured_height = prv_layout_response_text(NULL, false);
+  int32_t latest_prompt_y = 0;
+  int32_t measured_height = prv_layout_response_text(NULL, false, &latest_prompt_y);
   int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
   int32_t scroll_height;
 
+  s_latest_prompt_y = latest_prompt_y;
+
   if (text_height < s_min_text_height) {
     text_height = s_min_text_height;
+  }
+  if (s_latest_prompt_y > 0 && text_height < s_latest_prompt_y + s_min_text_height) {
+    text_height = s_latest_prompt_y + s_min_text_height;
   }
   s_scroll_text_height = text_height;
 
@@ -486,14 +500,23 @@ static int32_t prv_min_scroll_offset_y(void) {
   return min_y;
 }
 
-static void prv_scroll_to_bottom(bool animated) {
+static void prv_scroll_to_latest_prompt(bool animated) {
   int32_t offset_y;
+  int32_t min_y;
 
-  if (!s_scroll_layer || s_scroll_text_height <= s_min_text_height) {
+  if (!s_scroll_layer) {
     return;
   }
 
-  offset_y = prv_min_scroll_offset_y();
+  min_y = prv_min_scroll_offset_y();
+  offset_y = -s_latest_prompt_y;
+
+  if (offset_y < min_y) {
+    offset_y = min_y;
+  }
+  if (offset_y > 0) {
+    offset_y = 0;
+  }
 
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)offset_y), animated);
 }
@@ -526,7 +549,7 @@ static void prv_scroll_by_lines(int lines, bool animated) {
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
   graphics_context_set_fill_color(ctx, GColorWhite);
   graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
-  prv_layout_response_text(ctx, true);
+  prv_layout_response_text(ctx, true, NULL);
 }
 
 static void prv_schedule_progress_loading_timer(void) {
@@ -781,14 +804,14 @@ static void prv_append_prompt(const char *text) {
   prv_append_text_limited(text);
   prv_append_text_limited("\x04\n\n");
   prv_update_scroll_text();
-  prv_scroll_to_bottom(false);
+  prv_scroll_to_latest_prompt(false);
 }
 
 static void prv_preserve_chat_or_set_response(const char *text) {
   if (s_chat_started) {
     prv_show_response_view();
     prv_update_scroll_text();
-    prv_scroll_to_bottom(false);
+    prv_scroll_to_latest_prompt(false);
     return;
   }
 
@@ -808,7 +831,7 @@ static void prv_append_notice(const char *text) {
   }
   prv_append_text_limited(text);
   prv_update_scroll_text();
-  prv_scroll_to_bottom(false);
+  prv_scroll_to_latest_prompt(false);
 }
 
 static void prv_progress_reset(void) {
@@ -850,7 +873,7 @@ static void prv_append_response(const char *text) {
   prv_show_response_view();
   prv_append_text_limited(text);
   prv_update_scroll_text();
-  prv_scroll_to_bottom(false);
+  prv_scroll_to_latest_prompt(false);
 }
 
 #if defined(PBL_MICROPHONE)
@@ -1055,7 +1078,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_show_response_view();
     s_response_truncated = false;
     prv_update_scroll_text();
-    prv_scroll_to_bottom(false);
+    prv_scroll_to_latest_prompt(false);
   }
 
   Tuple *progress_reset_t = dict_find(iter, MESSAGE_KEY_ProgressReset);
@@ -1115,7 +1138,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       prv_set_response("No response text.");
     } else {
       prv_update_scroll_text();
-      prv_scroll_to_bottom(false);
+      prv_scroll_to_latest_prompt(false);
     }
     prv_buzz_response_done();
   }
