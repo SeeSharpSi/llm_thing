@@ -271,6 +271,9 @@ static void prv_apply_bold_text_color(uint32_t hex, bool should_persist) {
   if (s_text_layer) {
     layer_mark_dirty(s_text_layer);
   }
+  if (s_progress_loading_layer) {
+    layer_mark_dirty(s_progress_loading_layer);
+  }
 }
 
 static void prv_buzz_response_done(void) {
@@ -667,7 +670,7 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
       GRect(card.origin.x + 8, y, card.size.w - 16, 28));
   y += 34;
 
-  graphics_context_set_fill_color(ctx, s_text_color);
+  graphics_context_set_fill_color(ctx, s_bold_text_color);
   graphics_fill_rect(ctx, GRect(card.origin.x + 26, y, card.size.w - 52, 3), 1, GCornersAll);
   y += 21;
 
@@ -768,7 +771,7 @@ static void prv_progress_loading_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, GRect(x0, y - 1, track_width, 2), 0, GCornerNone);
 
   if (right > left) {
-    graphics_context_set_fill_color(ctx, s_text_color);
+    graphics_context_set_fill_color(ctx, s_bold_text_color);
     graphics_fill_rect(ctx, GRect(left, y - 2, right - left, 4), 1, GCornersAll);
   }
 }

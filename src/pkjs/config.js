@@ -202,6 +202,12 @@ module.exports = [
         "label": "Start in Dictation when Quick Launched",
         "description": "Open dictation automatically when the app is launched from Quick Launch.",
         "defaultValue": false
+      },
+      {
+        "type": "button",
+        "id": "ResetWatchDisplay",
+        "defaultValue": "Reset Watch Display Defaults",
+        "description": "Restore all Watch Display options to their defaults."
       }
     ]
   },

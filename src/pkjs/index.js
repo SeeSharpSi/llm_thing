@@ -1,7 +1,37 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var mcpServersComponent = require('./mcp_servers_component');
-var clay = new Clay(clayConfig, null, { autoHandleEvents: false });
+function clayCustomFn() {
+  var self = this;
+  var watchDisplayKeys = [
+    'FontSize',
+    'BuzzStrength',
+    'ScrollLines',
+    'TextColor',
+    'BackgroundColor',
+    'PromptBackgroundColor',
+    'BoldTextColor',
+    'StartDictationQuickLaunch'
+  ];
+
+  self.on(self.EVENTS.AFTER_BUILD, function() {
+    var resetButton = self.getItemById('ResetWatchDisplay');
+    if (!resetButton) {
+      return;
+    }
+
+    resetButton.on('click', function() {
+      watchDisplayKeys.forEach(function(key) {
+        var item = self.getItemByMessageKey(key);
+        if (item) {
+          item.set(item.config.defaultValue);
+        }
+      });
+    });
+  });
+}
+
+var clay = new Clay(clayConfig, clayCustomFn, { autoHandleEvents: false });
 clay.registerComponent(mcpServersComponent);
 
 var SETTINGS_KEY = 'llm_thing_settings';
