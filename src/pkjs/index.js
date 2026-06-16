@@ -1333,7 +1333,7 @@ function addBuiltinTools(settings, tools, toolMap) {
   if (settings.TimelineToolEnabled) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_create_or_update_pin',
-      label: 'Timeline Pins',
+      label: 'Timeline',
       description: 'Create or update one of this app\'s Pebble timeline pins. Provide complete Pebble timeline pin JSON in pin. Updating uses the same id. Deleted pin ids should not be reused.',
       parameters: {
         type: 'object',
@@ -1346,7 +1346,7 @@ function addBuiltinTools(settings, tools, toolMap) {
     });
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_delete_pin',
-      label: 'Timeline Pins',
+      label: 'Timeline',
       description: 'Delete one of this app\'s Pebble timeline pins by id.',
       parameters: {
         type: 'object',
