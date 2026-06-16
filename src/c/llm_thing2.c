@@ -20,6 +20,7 @@
 #define BOLD_TEXT_COLOR_DEFAULT 0x000000
 #define QUICK_LAUNCH_DICTATION_DELAY_MS 250
 #define SCROLL_REPEAT_INTERVAL_MS 100
+#define TOUCH_DRAG_THRESHOLD 8
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_SIDE_PADDING 4
 #define PROMPT_BACKGROUND_BOTTOM_PADDING 6
@@ -94,6 +95,13 @@ static bool s_progress_mode;
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
 static bool s_home_screen_visible;
+
+#if defined(PBL_TOUCH)
+static bool s_touch_active;
+static bool s_touch_threshold_met;
+static int16_t s_touch_start_y;
+static int32_t s_touch_start_offset_y;
+#endif
 
 static void prv_update_scroll_text(void);
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
@@ -630,6 +638,58 @@ static void prv_scroll_by_lines(int lines, bool animated) {
 
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), animated);
 }
+
+#if defined(PBL_TOUCH)
+static void prv_touch_handler(const TouchEvent *event, void *context) {
+  (void)context;
+
+  if (!s_scroll_layer || s_progress_mode || s_home_screen_visible) {
+    return;
+  }
+
+  if (s_scroll_text_height <= s_min_text_height) {
+    return;
+  }
+
+  switch (event->type) {
+    case TouchEvent_Touchdown:
+      s_touch_active = false;
+      s_touch_threshold_met = false;
+      s_touch_start_y = event->y;
+      s_touch_start_offset_y = scroll_layer_get_content_offset(s_scroll_layer).y;
+      break;
+    case TouchEvent_PositionUpdate: {
+      int32_t delta = (int32_t)event->y - (int32_t)s_touch_start_y;
+
+      if (!s_touch_threshold_met) {
+        if (delta < -TOUCH_DRAG_THRESHOLD || delta > TOUCH_DRAG_THRESHOLD) {
+          s_touch_threshold_met = true;
+          s_touch_active = true;
+        } else {
+          break;
+        }
+      }
+
+      int32_t min_y = prv_min_scroll_offset_y();
+      int32_t next_y = s_touch_start_offset_y + delta;
+
+      if (next_y < min_y) {
+        next_y = min_y;
+      }
+      if (next_y > 0) {
+        next_y = 0;
+      }
+
+      scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), false);
+      break;
+    }
+    case TouchEvent_Liftoff:
+      s_touch_active = false;
+      s_touch_threshold_met = false;
+      break;
+  }
+}
+#endif
 
 static void prv_draw_home_button(GContext *ctx, const char *text, GRect frame) {
   graphics_context_set_fill_color(ctx, s_text_color);
@@ -1400,9 +1460,19 @@ static void prv_window_load(Window *window) {
 
   prv_set_status("Ready");
   prv_show_home_screen();
+
+#if defined(PBL_TOUCH)
+  if (touch_service_is_enabled()) {
+    touch_service_subscribe(prv_touch_handler, NULL);
+  }
+#endif
 }
 
 static void prv_window_unload(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
+
   prv_stop_progress_loading();
   layer_destroy(s_progress_loading_layer);
   text_layer_destroy(s_progress_detail_layer);
