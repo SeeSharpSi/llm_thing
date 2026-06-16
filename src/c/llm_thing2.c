@@ -10,6 +10,14 @@
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
 #define PERSIST_KEY_SCROLL_LINES 4
+#define PERSIST_KEY_TEXT_COLOR 10
+#define PERSIST_KEY_BACKGROUND_COLOR 11
+#define PERSIST_KEY_PROMPT_BACKGROUND_COLOR 12
+#define PERSIST_KEY_BOLD_TEXT_COLOR 13
+#define TEXT_COLOR_DEFAULT 0x000000
+#define BACKGROUND_COLOR_DEFAULT 0xFFFFFF
+#define PROMPT_BACKGROUND_COLOR_DEFAULT 0xAAAAAA
+#define BOLD_TEXT_COLOR_DEFAULT 0x000000
 #define QUICK_LAUNCH_DICTATION_DELAY_MS 250
 #define SCROLL_REPEAT_INTERVAL_MS 100
 #define TEXT_BOTTOM_PADDING 16
@@ -72,6 +80,10 @@ static int32_t s_latest_prompt_y;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static int s_scroll_lines = SCROLL_LINES_DEFAULT;
+static GColor s_text_color;
+static GColor s_background_color;
+static GColor s_prompt_background_color;
+static GColor s_bold_text_color;
 static uint32_t s_request_id;
 static uint16_t s_progress_loading_frame;
 static bool s_start_dictation_quick_launch;
@@ -190,6 +202,74 @@ static void prv_apply_start_dictation_quick_launch(int enabled, bool should_pers
 
   if (should_persist) {
     persist_write_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH, s_start_dictation_quick_launch ? 1 : 0);
+  }
+}
+
+static GColor prv_color_from_hex(uint32_t hex) {
+#if defined(PBL_COLOR)
+  return GColorFromHEX(hex);
+#else
+  return hex == 0x000000 ? GColorBlack : GColorWhite;
+#endif
+}
+
+static void prv_apply_text_color(uint32_t hex, bool should_persist) {
+  s_text_color = prv_color_from_hex(hex);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_TEXT_COLOR, hex);
+  }
+
+  if (s_progress_title_layer) {
+    text_layer_set_text_color(s_progress_title_layer, s_text_color);
+  }
+  if (s_progress_detail_layer) {
+    text_layer_set_text_color(s_progress_detail_layer, s_text_color);
+  }
+  if (s_progress_history_layer) {
+    text_layer_set_text_color(s_progress_history_layer, s_text_color);
+  }
+  if (s_text_layer) {
+    layer_mark_dirty(s_text_layer);
+  }
+}
+
+static void prv_apply_background_color(uint32_t hex, bool should_persist) {
+  s_background_color = prv_color_from_hex(hex);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_BACKGROUND_COLOR, hex);
+  }
+
+  if (s_window) {
+    window_set_background_color(s_window, s_background_color);
+  }
+  if (s_text_layer) {
+    layer_mark_dirty(s_text_layer);
+  }
+}
+
+static void prv_apply_prompt_background_color(uint32_t hex, bool should_persist) {
+  s_prompt_background_color = prv_color_from_hex(hex);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR, hex);
+  }
+
+  if (s_text_layer) {
+    layer_mark_dirty(s_text_layer);
+  }
+}
+
+static void prv_apply_bold_text_color(uint32_t hex, bool should_persist) {
+  s_bold_text_color = prv_color_from_hex(hex);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_BOLD_TEXT_COLOR, hex);
+  }
+
+  if (s_text_layer) {
+    layer_mark_dirty(s_text_layer);
   }
 }
 
@@ -322,11 +402,7 @@ static void prv_fill_prompt_line(GContext *ctx, bool should_draw, bool prompt,
     return;
   }
 
-#if defined(PBL_COLOR)
-  graphics_context_set_fill_color(ctx, GColorLightGray);
-#else
-  graphics_context_set_fill_color(ctx, GColorWhite);
-#endif
+  graphics_context_set_fill_color(ctx, s_prompt_background_color);
   graphics_fill_rect(ctx, GRect(0, y, s_text_layer_width, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING), 0, GCornerNone);
   *filled_y = y;
 }
@@ -360,6 +436,7 @@ static void prv_layout_word(const char *text, size_t length, bool bold, bool pro
     }
 
     if (should_draw && ctx && draw_width > 0) {
+      graphics_context_set_text_color(ctx, bold ? s_bold_text_color : s_text_color);
       graphics_draw_text(ctx, s_text_run, font, GRect(*x + TEXT_SIDE_PADDING, *y, draw_width + 2, line_height),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     }
@@ -416,7 +493,7 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t
   }
 
   if (should_draw && ctx) {
-    graphics_context_set_text_color(ctx, GColorBlack);
+    graphics_context_set_text_color(ctx, s_text_color);
   }
 
   while (*cursor != '\0' && y < TEXT_MEASURE_HEIGHT - line_height) {
@@ -552,15 +629,15 @@ static void prv_scroll_by_lines(int lines, bool animated) {
 }
 
 static void prv_draw_home_button(GContext *ctx, const char *text, GRect frame) {
-  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, s_text_color);
   graphics_fill_rect(ctx, frame, HOME_BUTTON_HEIGHT / 2, GCornersAll);
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, s_background_color);
   graphics_draw_text(ctx, text, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD), frame,
       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
 
 static void prv_draw_home_centered_text(GContext *ctx, const char *text, GFont font, GRect frame) {
-  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_context_set_text_color(ctx, s_text_color);
   graphics_draw_text(ctx, text, font, frame,
       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
 }
@@ -583,18 +660,14 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
   center_x = card.origin.x + (card.size.w / 2);
   y = card.origin.y + 10;
 
-  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_context_set_fill_color(ctx, s_background_color);
   graphics_fill_rect(ctx, card, HOME_CARD_RADIUS, GCornersAll);
 
   prv_draw_home_centered_text(ctx, "llm_thing", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
       GRect(card.origin.x + 8, y, card.size.w - 16, 28));
   y += 34;
 
-#if defined(PBL_COLOR)
-  graphics_context_set_fill_color(ctx, GColorBlue);
-#else
-  graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
+  graphics_context_set_fill_color(ctx, s_text_color);
   graphics_fill_rect(ctx, GRect(card.origin.x + 26, y, card.size.w - 52, 3), 1, GCornersAll);
   y += 21;
 
@@ -615,7 +688,7 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
-  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_context_set_fill_color(ctx, s_background_color);
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   if (s_home_screen_visible) {
@@ -691,15 +764,11 @@ static void prv_progress_loading_update_proc(Layer *layer, GContext *ctx) {
   left = x < x0 ? x0 : x;
   right = x + segment_width > x0 + track_width ? x0 + track_width : x + segment_width;
 
-#if defined(PBL_COLOR)
-  graphics_context_set_fill_color(ctx, GColorLightGray);
-#else
-  graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
+  graphics_context_set_fill_color(ctx, s_prompt_background_color);
   graphics_fill_rect(ctx, GRect(x0, y - 1, track_width, 2), 0, GCornerNone);
 
   if (right > left) {
-    graphics_context_set_fill_color(ctx, GColorBlack);
+    graphics_context_set_fill_color(ctx, s_text_color);
     graphics_fill_rect(ctx, GRect(left, y - 2, right - left, 4), 1, GCornersAll);
   }
 }
@@ -1160,6 +1229,30 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_maybe_schedule_quick_launch_dictation();
   }
 
+  Tuple *text_color_t = dict_find(iter, MESSAGE_KEY_TextColor);
+  if (text_color_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "text color update");
+    prv_apply_text_color(prv_int_from_tuple(text_color_t, TEXT_COLOR_DEFAULT), true);
+  }
+
+  Tuple *background_color_t = dict_find(iter, MESSAGE_KEY_BackgroundColor);
+  if (background_color_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "background color update");
+    prv_apply_background_color(prv_int_from_tuple(background_color_t, BACKGROUND_COLOR_DEFAULT), true);
+  }
+
+  Tuple *prompt_background_color_t = dict_find(iter, MESSAGE_KEY_PromptBackgroundColor);
+  if (prompt_background_color_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "prompt background color update");
+    prv_apply_prompt_background_color(prv_int_from_tuple(prompt_background_color_t, PROMPT_BACKGROUND_COLOR_DEFAULT), true);
+  }
+
+  Tuple *bold_text_color_t = dict_find(iter, MESSAGE_KEY_BoldTextColor);
+  if (bold_text_color_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "bold text color update");
+    prv_apply_bold_text_color(prv_int_from_tuple(bold_text_color_t, BOLD_TEXT_COLOR_DEFAULT), true);
+  }
+
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
@@ -1276,7 +1369,7 @@ static void prv_window_load(Window *window) {
 
   s_progress_history_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_HISTORY_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_history_layer, GColorClear);
-  text_layer_set_text_color(s_progress_history_layer, GColorBlack);
+  text_layer_set_text_color(s_progress_history_layer, s_text_color);
   text_layer_set_font(s_progress_history_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_overflow_mode(s_progress_history_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_progress_history_layer, GTextAlignmentCenter);
@@ -1284,7 +1377,7 @@ static void prv_window_load(Window *window) {
 
   s_progress_title_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_title_layer, GColorClear);
-  text_layer_set_text_color(s_progress_title_layer, GColorBlack);
+  text_layer_set_text_color(s_progress_title_layer, s_text_color);
   text_layer_set_font(s_progress_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
   text_layer_set_overflow_mode(s_progress_title_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_progress_title_layer, GTextAlignmentCenter);
@@ -1292,7 +1385,7 @@ static void prv_window_load(Window *window) {
 
   s_progress_detail_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_detail_layer, GColorClear);
-  text_layer_set_text_color(s_progress_detail_layer, GColorBlack);
+  text_layer_set_text_color(s_progress_detail_layer, s_text_color);
   text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_progress_detail_layer, GTextAlignmentCenter);
@@ -1331,12 +1424,18 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH)) {
     s_start_dictation_quick_launch = persist_read_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH) != 0;
   }
+
+  prv_apply_text_color(persist_exists(PERSIST_KEY_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_TEXT_COLOR) : TEXT_COLOR_DEFAULT, false);
+  prv_apply_background_color(persist_exists(PERSIST_KEY_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_BACKGROUND_COLOR) : BACKGROUND_COLOR_DEFAULT, false);
+  prv_apply_prompt_background_color(persist_exists(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) : PROMPT_BACKGROUND_COLOR_DEFAULT, false);
+  prv_apply_bold_text_color(persist_exists(PERSIST_KEY_BOLD_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_BOLD_TEXT_COLOR) : BOLD_TEXT_COLOR_DEFAULT, false);
+
   AppLaunchReason reason = launch_reason();
   s_launched_from_quick_launch = reason == APP_LAUNCH_QUICK_LAUNCH;
   APP_LOG(APP_LOG_LEVEL_DEBUG, "launch reason=%d quick_dictation=%d", reason, s_start_dictation_quick_launch ? 1 : 0);
 
   s_window = window_create();
-  window_set_background_color(s_window, GColorWhite);
+  window_set_background_color(s_window, s_background_color);
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = prv_window_load,
     .unload = prv_window_unload,

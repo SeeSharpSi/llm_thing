@@ -173,6 +173,30 @@ module.exports = [
         }
       },
       {
+        "type": "color",
+        "messageKey": "TextColor",
+        "label": "Text Color",
+        "defaultValue": 0
+      },
+      {
+        "type": "color",
+        "messageKey": "BackgroundColor",
+        "label": "Background Color",
+        "defaultValue": 16777215
+      },
+      {
+        "type": "color",
+        "messageKey": "PromptBackgroundColor",
+        "label": "Prompt Background Color",
+        "defaultValue": 11184810
+      },
+      {
+        "type": "color",
+        "messageKey": "BoldTextColor",
+        "label": "Bold Text Color",
+        "defaultValue": 0
+      },
+      {
         "type": "toggle",
         "messageKey": "StartDictationQuickLaunch",
         "label": "Start in Dictation when Quick Launched",

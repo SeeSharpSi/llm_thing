@@ -75,6 +75,10 @@ var DEFAULT_SETTINGS = {
   BuzzStrength: 1,
   ScrollLines: 3,
   StartDictationQuickLaunch: false,
+  TextColor: 0x000000,
+  BackgroundColor: 0xFFFFFF,
+  PromptBackgroundColor: 0xAAAAAA,
+  BoldTextColor: 0x000000,
   McpServersJson: '[]'
 };
 
@@ -167,7 +171,11 @@ function syncWatchSettings(settings) {
     FontSize: settings.FontSize,
     BuzzStrength: settings.BuzzStrength,
     ScrollLines: settings.ScrollLines,
-    StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0
+    StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0,
+    TextColor: settings.TextColor,
+    BackgroundColor: settings.BackgroundColor,
+    PromptBackgroundColor: settings.PromptBackgroundColor,
+    BoldTextColor: settings.BoldTextColor
   });
 }
 

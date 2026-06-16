@@ -34,5 +34,6 @@
 - Request IDs prevent stale responses: C ignores incoming messages whose `RequestId` differs from current `s_request_id`; preserve this when changing response flow.
 - Dictation is behind `#if defined(PBL_MICROPHONE)`; keep non-microphone platforms building and showing unsupported text.
 - For new watch/phone messages, add keys in `package.json` `pebble.messageKeys`, then rebuild so generated `MESSAGE_KEY_*` and JS wrappers update.
+- Color settings (`TextColor`, `BackgroundColor`, `PromptBackgroundColor`, `BoldTextColor`) are stored as hex integers, synced from phone to watch, and persisted watch-side. On black-and-white platforms any non-`0x000000` value renders as white.
 - API requests use Responses format by default; if `Endpoint` contains `/chat/completions`, `src/pkjs/index.js` switches to Chat Completions payload shape.
 - MCP tools are phone-side only: settings store servers in `McpServersJson`; `src/pkjs/index.js` initializes remote MCP, exposes tools as `server__tool`, asks model for JSON tool calls, then sends final text to watch.
