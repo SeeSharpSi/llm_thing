@@ -52,6 +52,7 @@ var s_send_queue = [];
 var s_send_busy = false;
 var s_chat_history = [];
 var s_latest_request_id = 0;
+var s_active_xhrs = {};
 var s_progress = {
   requestId: 0,
   active: false,
@@ -66,6 +67,111 @@ function logDebug(message) {
   console.log('[llm_thing] ' + message);
 }
 
+function requestKey(requestId) {
+  return String(requestId || 0);
+}
+
+function dictHasRequestId(dict) {
+  return dict && dict.RequestId !== undefined && dict.RequestId !== null;
+}
+
+function isCurrentRequest(requestId) {
+  return Number(requestId) === Number(s_latest_request_id);
+}
+
+function isCurrentMessage(dict) {
+  return !dictHasRequestId(dict) || isCurrentRequest(dict.RequestId);
+}
+
+function abortXhrsForKey(key) {
+  var requests = s_active_xhrs[key] || [];
+  var i;
+
+  for (i = 0; i < requests.length; i += 1) {
+    try {
+      requests[i].abort();
+    } catch (e) {}
+  }
+
+  delete s_active_xhrs[key];
+}
+
+function dropStaleQueuedMessages(requestId) {
+  var kept = [];
+  var dropped = 0;
+  var i;
+  var item;
+
+  for (i = 0; i < s_send_queue.length; i += 1) {
+    item = s_send_queue[i];
+    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) !== Number(requestId)) {
+      dropped += 1;
+    } else {
+      kept.push(item);
+    }
+  }
+
+  if (dropped) {
+    logDebug('dropped stale queued messages count=' + dropped);
+  }
+
+  s_send_queue = kept;
+}
+
+function beginRequestLifecycle(requestId) {
+  var key;
+
+  s_latest_request_id = requestId;
+  for (key in s_active_xhrs) {
+    if (s_active_xhrs.hasOwnProperty(key) && key !== requestKey(requestId)) {
+      logDebug('aborting stale request id=' + key);
+      abortXhrsForKey(key);
+    }
+  }
+  dropStaleQueuedMessages(requestId);
+  if (!s_active_xhrs[requestKey(requestId)]) {
+    s_active_xhrs[requestKey(requestId)] = [];
+  }
+}
+
+function finishRequestLifecycle(requestId) {
+  delete s_active_xhrs[requestKey(requestId)];
+}
+
+function trackXhr(requestId, request) {
+  var key = requestKey(requestId);
+
+  if (!isCurrentRequest(requestId)) {
+    try {
+      request.abort();
+    } catch (e) {}
+    return false;
+  }
+
+  if (!s_active_xhrs[key]) {
+    s_active_xhrs[key] = [];
+  }
+  s_active_xhrs[key].push(request);
+  return true;
+}
+
+function untrackXhr(requestId, request) {
+  var key = requestKey(requestId);
+  var requests = s_active_xhrs[key];
+  var i;
+
+  if (!requests) {
+    return;
+  }
+
+  for (i = requests.length - 1; i >= 0; i -= 1) {
+    if (requests[i] === request) {
+      requests.splice(i, 1);
+      break;
+    }
+  }
+}
+
 function processSendQueue() {
   var item;
 
@@ -74,6 +180,14 @@ function processSendQueue() {
   }
 
   item = s_send_queue.shift();
+  while (item && !isCurrentMessage(item.dict)) {
+    logDebug('skipping stale message request=' + item.dict.RequestId);
+    if (!s_send_queue.length) {
+      return;
+    }
+    item = s_send_queue.shift();
+  }
+
   s_send_busy = true;
   Pebble.sendAppMessage(item.dict, function() {
     s_send_busy = false;
@@ -210,6 +324,11 @@ function syncWatchSettings(settings) {
 }
 
 function sendMessage(dict, onSuccess, onFailure) {
+  if (!isCurrentMessage(dict)) {
+    logDebug('dropping stale message request=' + dict.RequestId);
+    return;
+  }
+
   s_send_queue.push({
     dict: dict,
     onSuccess: onSuccess,
@@ -796,7 +915,7 @@ function applyMcpCustomHeaders(request, server, authorization) {
   }
 }
 
-function mcpJsonRpc(server, method, params, expectBody, callback) {
+function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
   var request = new XMLHttpRequest();
   var payload = {
     jsonrpc: '2.0',
@@ -825,11 +944,20 @@ function mcpJsonRpc(server, method, params, expectBody, callback) {
   applyMcpCustomHeaders(request, server, authorization);
   request.timeout = 30000;
 
+  if (!trackXhr(requestId, request)) {
+    return;
+  }
+
   logDebug('mcp request server=' + server.label + ' method=' + method + ' id=' + (payload.id || 'notification'));
 
   request.onload = function() {
     var json;
     var sessionId;
+
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
 
     logDebug('mcp response server=' + server.label + ' method=' + method + ' status=' + request.status + ' bytes=' + String(request.responseText || '').length);
 
@@ -866,19 +994,31 @@ function mcpJsonRpc(server, method, params, expectBody, callback) {
   };
 
   request.onerror = function() {
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     logDebug('mcp network error server=' + server.label + ' method=' + method);
     callback('MCP network error');
   };
 
   request.ontimeout = function() {
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     logDebug('mcp timeout server=' + server.label + ' method=' + method);
     callback('MCP request timed out');
+  };
+
+  request.onabort = function() {
+    untrackXhr(requestId, request);
   };
 
   request.send(JSON.stringify(payload));
 }
 
-function initializeMcpServer(server, callback) {
+function initializeMcpServer(server, requestId, callback) {
   mcpJsonRpc(server, 'initialize', {
     protocolVersion: MCP_PROTOCOL_VERSION,
     capabilities: {},
@@ -886,13 +1026,13 @@ function initializeMcpServer(server, callback) {
       name: MCP_CLIENT_NAME,
       version: MCP_CLIENT_VERSION
     }
-  }, true, function(error) {
+  }, true, requestId, function(error) {
     if (error) {
       callback(error);
       return;
     }
 
-    mcpJsonRpc(server, 'notifications/initialized', {}, false, function() {
+    mcpJsonRpc(server, 'notifications/initialized', {}, false, requestId, function() {
       callback(null);
     });
   });
@@ -975,7 +1115,7 @@ function formatMcpToolResult(result) {
   return safeJson(result || {});
 }
 
-function discoverMcpTools(settings, callback) {
+function discoverMcpTools(settings, requestId, callback) {
   var servers = parseMcpServers(settings);
   var tools = [];
   var toolMap = {};
@@ -1034,7 +1174,10 @@ function discoverMcpTools(settings, callback) {
   }
 
   servers.forEach(function(server) {
-    initializeMcpServer(server, function(initError) {
+    initializeMcpServer(server, requestId, function(initError) {
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       if (initError) {
         logDebug('mcp initialize failed server=' + server.label + ' error=' + initError);
         finishOne();
@@ -1043,7 +1186,10 @@ function discoverMcpTools(settings, callback) {
 
       logDebug('mcp initialized server=' + server.label);
 
-      mcpJsonRpc(server, 'tools/list', {}, true, function(listError, result) {
+      mcpJsonRpc(server, 'tools/list', {}, true, requestId, function(listError, result) {
+        if (!isCurrentRequest(requestId)) {
+          return;
+        }
         if (listError) {
           logDebug('mcp tools/list failed server=' + server.label + ' error=' + listError);
         } else {
@@ -1094,10 +1240,13 @@ function parseObjectArg(value) {
   return value;
 }
 
-function callGeolocationBuiltin(args, callback) {
+function callGeolocationBuiltin(args, requestId, callback) {
   var options;
 
   args = args || {};
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
   if (typeof navigator === 'undefined' || !navigator.geolocation || !navigator.geolocation.getCurrentPosition) {
     callback('Geolocation unavailable');
     return;
@@ -1131,8 +1280,13 @@ function callGeolocationBuiltin(args, callback) {
       result.speedMetersPerSecond = coords.speed;
     }
 
-    callback(null, safeJson(result));
+    if (isCurrentRequest(requestId)) {
+      callback(null, safeJson(result));
+    }
   }, function(error) {
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error && error.message) {
       callback('Geolocation error: ' + error.message);
       return;
@@ -1189,10 +1343,13 @@ function validateTimelinePin(pin) {
   return '';
 }
 
-function timelinePinRequest(method, id, pin, callback) {
+function timelinePinRequest(method, id, pin, requestId, callback) {
   getTimelineToken(function(tokenError, token) {
     var request;
 
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (tokenError) {
       callback(tokenError);
       return;
@@ -1206,8 +1363,17 @@ function timelinePinRequest(method, id, pin, callback) {
     }
     request.timeout = 30000;
 
+    if (!trackXhr(requestId, request)) {
+      return;
+    }
+
     request.onload = function() {
       var responseText = String(request.responseText || '');
+
+      untrackXhr(requestId, request);
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
 
       if (request.status < 200 || request.status >= 300) {
         callback('Timeline HTTP ' + request.status + ': ' + responseText.substring(0, 180));
@@ -1223,11 +1389,23 @@ function timelinePinRequest(method, id, pin, callback) {
     };
 
     request.onerror = function() {
+      untrackXhr(requestId, request);
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       callback('Timeline network error');
     };
 
     request.ontimeout = function() {
+      untrackXhr(requestId, request);
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       callback('Timeline request timed out');
+    };
+
+    request.onabort = function() {
+      untrackXhr(requestId, request);
     };
 
     request.send(pin ? JSON.stringify(pin) : null);
@@ -1261,7 +1439,7 @@ function extractTimelinePinId(args) {
   return '';
 }
 
-function callTimelineUpsertBuiltin(args, callback) {
+function callTimelineUpsertBuiltin(args, requestId, callback) {
   var pin = extractTimelinePin(args);
   var validationError = validateTimelinePin(pin);
 
@@ -1270,10 +1448,10 @@ function callTimelineUpsertBuiltin(args, callback) {
     return;
   }
 
-  timelinePinRequest('PUT', pin.id, pin, callback);
+  timelinePinRequest('PUT', pin.id, pin, requestId, callback);
 }
 
-function callTimelineDeleteBuiltin(args, callback) {
+function callTimelineDeleteBuiltin(args, requestId, callback) {
   var id = extractTimelinePinId(args);
 
   if (!id) {
@@ -1285,7 +1463,7 @@ function callTimelineDeleteBuiltin(args, callback) {
     return;
   }
 
-  timelinePinRequest('DELETE', id, null, callback);
+  timelinePinRequest('DELETE', id, null, requestId, callback);
 }
 
 function addBuiltinTool(tools, toolMap, definition) {
@@ -1360,8 +1538,11 @@ function addBuiltinTools(settings, tools, toolMap) {
   }
 }
 
-function discoverPhoneTools(settings, callback) {
-  discoverMcpTools(settings, function(error, tools, toolMap) {
+function discoverPhoneTools(settings, requestId, callback) {
+  discoverMcpTools(settings, requestId, function(error, tools, toolMap) {
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       callback(error);
       return;
@@ -1372,12 +1553,15 @@ function discoverPhoneTools(settings, callback) {
   });
 }
 
-function callMcpTool(toolInfo, args, callback) {
+function callMcpTool(toolInfo, args, requestId, callback) {
   logDebug('mcp tool call server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' args=' + safeJson(args).substring(0, 240));
   mcpJsonRpc(toolInfo.server, 'tools/call', {
     name: toolInfo.toolName,
     arguments: args || {}
-  }, true, function(error, result) {
+  }, true, requestId, function(error, result) {
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       logDebug('mcp tool error server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' error=' + error);
       callback(error);
@@ -1389,9 +1573,12 @@ function callMcpTool(toolInfo, args, callback) {
   });
 }
 
-function callBuiltinTool(toolInfo, args, callback) {
+function callBuiltinTool(toolInfo, args, requestId, callback) {
   logDebug('builtin tool call name=' + toolInfo.name + ' args=' + safeJson(args).substring(0, 240));
-  toolInfo.call(args, function(error, resultText) {
+  toolInfo.call(args, requestId, function(error, resultText) {
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       logDebug('builtin tool error name=' + toolInfo.name + ' error=' + error);
       callback(error);
@@ -1412,6 +1599,10 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     var name;
     var args;
     var toolInfo;
+
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
 
     if (index >= toolCalls.length) {
       callback(results);
@@ -1443,6 +1634,9 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     }
 
     function finishToolCall(error, resultText) {
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       if (error) {
         progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + truncate(error, 90));
         results.push({
@@ -1463,9 +1657,9 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
 
     progressToolStart(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
     if (toolInfo.kind === 'builtin') {
-      callBuiltinTool(toolInfo, args, finishToolCall);
+      callBuiltinTool(toolInfo, args, requestId, finishToolCall);
     } else {
-      callMcpTool(toolInfo, args, finishToolCall);
+      callMcpTool(toolInfo, args, requestId, finishToolCall);
     }
   }
 
@@ -1579,7 +1773,7 @@ function buildBody(settings, conversation) {
   };
 }
 
-function requestModel(settings, conversation, callback) {
+function requestModel(settings, conversation, requestId, callback) {
   var request = new XMLHttpRequest();
   var body = JSON.stringify(buildBody(settings, conversation));
 
@@ -1590,8 +1784,17 @@ function requestModel(settings, conversation, callback) {
   request.setRequestHeader('Authorization', 'Bearer ' + settings.ApiKey);
   request.timeout = 60000;
 
+  if (!trackXhr(requestId, request)) {
+    return;
+  }
+
   request.onload = function() {
     var json;
+
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
 
     logDebug('llm response status=' + request.status + ' bytes=' + String(request.responseText || '').length);
 
@@ -1611,13 +1814,25 @@ function requestModel(settings, conversation, callback) {
   };
 
   request.onerror = function() {
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     logDebug('llm network error');
     callback('Network error');
   };
 
   request.ontimeout = function() {
+    untrackXhr(requestId, request);
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     logDebug('llm timeout');
     callback('Request timed out');
+  };
+
+  request.onabort = function() {
+    untrackXhr(requestId, request);
   };
 
   request.send(body);
@@ -1768,8 +1983,11 @@ function appendToolResults(conversation, assistantText, results, noMoreTools, sk
 }
 function requestFinalAfterToolCap(requestId, settings, conversation, callback) {
   progressSet(requestId, 'thinking', 'tool call limit reached');
-  requestModel(settings, conversation, function(error, json) {
+  requestModel(settings, conversation, requestId, function(error, json) {
     var assistantText;
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       callback(error);
       return;
@@ -1786,13 +2004,16 @@ function requestFinalAfterToolCap(requestId, settings, conversation, callback) {
 function completeWithTools(requestId, settings, conversation, toolMap, round, usedToolCalls, callback) {
   logDebug('tool loop round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
   progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
-  requestModel(settings, conversation, function(error, json) {
+  requestModel(settings, conversation, requestId, function(error, json) {
     var assistantText;
     var toolCalls;
     var remainingToolCalls;
     var noMoreTools;
     var skippedCount;
 
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       callback(error);
       return;
@@ -1829,6 +2050,9 @@ function completeWithTools(requestId, settings, conversation, toolMap, round, us
       toolCalls = toolCalls.slice(0, remainingToolCalls);
     }
     runToolCalls(requestId, toolCalls, toolMap, function(results) {
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       logDebug('tool loop results=' + results.length);
       appendToolResults(conversation, assistantText, results, noMoreTools, skippedCount);
       if (noMoreTools) {
@@ -1845,17 +2069,19 @@ function requestCompletion(requestId, userText) {
   var conversation;
 
   logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' history=' + s_chat_history.length);
-  s_latest_request_id = requestId;
+  beginRequestLifecycle(requestId);
   syncWatchSettings(settings);
   progressStart(requestId, 'thinking', '');
 
   if (!settings.Endpoint) {
     sendError(requestId, 'Endpoint missing. Open settings on phone.');
+    finishRequestLifecycle(requestId);
     return;
   }
 
   if (!settings.ApiKey) {
     sendError(requestId, 'API key missing. Open settings on phone.');
+    finishRequestLifecycle(requestId);
     return;
   }
 
@@ -1863,8 +2089,12 @@ function requestCompletion(requestId, userText) {
     logDebug('tools disabled maxToolCalls=0');
     conversation = buildConversation(settings, userText, '');
     completeWithTools(requestId, settings, conversation, {}, 0, 0, function(completionError, text) {
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       if (completionError) {
         sendError(requestId, completionError);
+        finishRequestLifecycle(requestId);
         return;
       }
 
@@ -1872,15 +2102,20 @@ function requestCompletion(requestId, userText) {
         if (requestId === s_latest_request_id) {
           rememberChatTurn(userText, text);
         }
+        finishRequestLifecycle(requestId);
       });
     });
     return;
   }
 
   progressSet(requestId, 'Loading tools', 'discovering phone tools');
-  discoverPhoneTools(settings, function(error, tools, toolMap) {
+  discoverPhoneTools(settings, requestId, function(error, tools, toolMap) {
+    if (!isCurrentRequest(requestId)) {
+      return;
+    }
     if (error) {
       sendError(requestId, error);
+      finishRequestLifecycle(requestId);
       return;
     }
 
@@ -1888,8 +2123,12 @@ function requestCompletion(requestId, userText) {
     logDebug('tools discover done tools=' + tools.length);
     progressDone(requestId, 'Tools loaded', tools.length + ' tools');
     completeWithTools(requestId, settings, conversation, toolMap, 0, 0, function(completionError, text) {
+      if (!isCurrentRequest(requestId)) {
+        return;
+      }
       if (completionError) {
         sendError(requestId, completionError);
+        finishRequestLifecycle(requestId);
         return;
       }
 
@@ -1897,6 +2136,7 @@ function requestCompletion(requestId, userText) {
         if (requestId === s_latest_request_id) {
           rememberChatTurn(userText, text);
         }
+        finishRequestLifecycle(requestId);
       });
     });
   });

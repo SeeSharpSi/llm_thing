@@ -27,6 +27,10 @@
 #define TEXT_MEASURE_HEIGHT 32000
 #define TEXT_MEASURE_WIDTH 32000
 #define TEXT_RUN_BUFFER_SIZE 256
+#define TEXT_LAYOUT_CHECKPOINT_STRIDE 8
+#define TEXT_LAYOUT_CHECKPOINT_COUNT 256
+#define TEXT_LAYOUT_FLAG_BOLD 0x01
+#define TEXT_LAYOUT_FLAG_PROMPT 0x02
 // Phone-side Markdown parsing sends these non-NUL markers inside ResponseChunk.
 #define TEXT_BOLD_ON '\x01'
 #define TEXT_BOLD_OFF '\x02'
@@ -50,6 +54,13 @@
 #define HOME_CARD_RADIUS 8
 #define HOME_BUTTON_WIDTH 82
 #define HOME_BUTTON_HEIGHT 24
+#define APP_MESSAGE_INBOX_SIZE 1024
+#define APP_MESSAGE_OUTBOX_SIZE 512
+
+typedef struct {
+  uint16_t offset;
+  uint8_t flags;
+} TextLayoutCheckpoint;
 
 static Window *s_window;
 static ScrollLayer *s_scroll_layer;
@@ -70,6 +81,7 @@ static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
+static TextLayoutCheckpoint s_text_layout_checkpoints[TEXT_LAYOUT_CHECKPOINT_COUNT];
 static int16_t s_text_width;
 static int16_t s_text_layer_width;
 static int16_t s_min_text_height;
@@ -78,6 +90,7 @@ static int16_t s_progress_height;
 static int32_t s_scroll_content_height;
 static int32_t s_scroll_text_height;
 static int32_t s_latest_prompt_y;
+static uint16_t s_text_layout_checkpoint_count;
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static int s_scroll_lines = SCROLL_LINES_DEFAULT;
@@ -112,6 +125,12 @@ static void prv_progress_loading_timer_callback(void *context);
 static void prv_set_status(const char *text) {
   (void)text;
 }
+
+#if defined(PBL_MICROPHONE)
+static bool prv_ui_loaded(void) {
+  return s_scroll_layer && s_text_layer;
+}
+#endif
 
 static int prv_normalize_font_size(int size) {
   switch (size) {
@@ -407,20 +426,69 @@ static size_t prv_fit_chunk_length(const char *text, size_t length, GFont font) 
   return chunk_length;
 }
 
+static uint8_t prv_text_layout_flags(bool bold, bool prompt) {
+  uint8_t flags = 0;
+
+  if (bold) {
+    flags |= TEXT_LAYOUT_FLAG_BOLD;
+  }
+  if (prompt) {
+    flags |= TEXT_LAYOUT_FLAG_PROMPT;
+  }
+
+  return flags;
+}
+
+static void prv_record_text_layout_checkpoint(const char *line_start, bool bold, bool prompt,
+                                              int16_t y, int16_t line_height) {
+  int32_t line_index;
+  uint16_t checkpoint_index;
+
+  if (!line_start || line_height <= 0 || y < 0) {
+    return;
+  }
+
+  line_index = y / line_height;
+  if (line_index % TEXT_LAYOUT_CHECKPOINT_STRIDE != 0) {
+    return;
+  }
+
+  checkpoint_index = (uint16_t)(line_index / TEXT_LAYOUT_CHECKPOINT_STRIDE);
+  if (checkpoint_index >= TEXT_LAYOUT_CHECKPOINT_COUNT) {
+    return;
+  }
+
+  s_text_layout_checkpoints[checkpoint_index].offset = (uint16_t)(line_start - s_response);
+  s_text_layout_checkpoints[checkpoint_index].flags = prv_text_layout_flags(bold, prompt);
+  if (s_text_layout_checkpoint_count <= checkpoint_index) {
+    s_text_layout_checkpoint_count = checkpoint_index + 1;
+  }
+}
+
+static bool prv_line_visible(int16_t y, int16_t height, int32_t visible_top, int32_t visible_bottom) {
+  return (int32_t)y + height >= visible_top && y <= visible_bottom;
+}
+
 static void prv_fill_prompt_line(GContext *ctx, bool should_draw, bool prompt,
-                                 int16_t y, int16_t line_height, int16_t *filled_y) {
-  if (!should_draw || !ctx || !prompt || *filled_y == y) {
+                                 int16_t y, int16_t line_height, int16_t *filled_y,
+                                 int32_t visible_top, int32_t visible_bottom) {
+  if (!prompt || *filled_y == y) {
+    return;
+  }
+
+  *filled_y = y;
+  if (!should_draw || !ctx || !prv_line_visible(y, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING, visible_top, visible_bottom)) {
     return;
   }
 
   graphics_context_set_fill_color(ctx, s_prompt_background_color);
   graphics_fill_rect(ctx, GRect(0, y, s_text_layer_width, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING), 0, GCornerNone);
-  *filled_y = y;
 }
 
 static void prv_layout_word(const char *text, size_t length, bool bold, bool prompt, GContext *ctx,
                             bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
-                            int16_t *prompt_filled_y) {
+                            int16_t *prompt_filled_y, bool record_checkpoints,
+                            int32_t visible_top, int32_t visible_bottom) {
   GFont font = prv_response_font(bold || prompt);
 
   while (length > 0) {
@@ -437,16 +505,19 @@ static void prv_layout_word(const char *text, size_t length, bool bold, bool pro
     if (*x > 0 && *x + width > s_text_width) {
       *x = 0;
       *y += line_height;
+      if (record_checkpoints) {
+        prv_record_text_layout_checkpoint(text, bold, prompt, *y, line_height);
+      }
     }
 
-    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
+    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
 
     draw_width = width;
     if (draw_width > s_text_width - *x) {
       draw_width = s_text_width - *x;
     }
 
-    if (should_draw && ctx && draw_width > 0) {
+    if (should_draw && ctx && draw_width > 0 && prv_line_visible(*y, line_height, visible_top, visible_bottom)) {
       graphics_context_set_text_color(ctx, bold ? s_bold_text_color : s_text_color);
       graphics_draw_text(ctx, s_text_run, font, GRect(*x + TEXT_SIDE_PADDING, *y, draw_width + 2, line_height),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
@@ -464,7 +535,8 @@ static void prv_layout_word(const char *text, size_t length, bool bold, bool pro
 
 static void prv_layout_spaces(const char *text, size_t length, bool bold, bool prompt, GContext *ctx,
                               bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
-                              int16_t *prompt_filled_y) {
+                              int16_t *prompt_filled_y, bool record_checkpoints,
+                              int32_t visible_top, int32_t visible_bottom) {
   GFont font = prv_response_font(bold || prompt);
   int16_t space_width = prv_space_width(font);
   int32_t width = 0;
@@ -474,7 +546,7 @@ static void prv_layout_spaces(const char *text, size_t length, bool bold, bool p
     return;
   }
 
-  prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
+  prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
 
   for (i = 0; i < length; i += 1) {
     width += text[i] == '\t' ? space_width * 2 : space_width;
@@ -483,24 +555,36 @@ static void prv_layout_spaces(const char *text, size_t length, bool bold, bool p
   if ((int32_t)*x + width > s_text_width) {
     *x = 0;
     *y += line_height;
-    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y);
+    if (record_checkpoints) {
+      prv_record_text_layout_checkpoint(text + length, bold, prompt, *y, line_height);
+    }
+    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
     return;
   }
 
   *x += (int16_t)width;
 }
 
-static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t *latest_prompt_y) {
-  const char *cursor = s_response;
+static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t *latest_prompt_y,
+                                        uint16_t start_offset, int16_t start_y,
+                                        bool start_bold, bool start_prompt,
+                                        bool record_checkpoints,
+                                        int32_t visible_top, int32_t visible_bottom) {
+  const char *cursor = s_response + start_offset;
   int16_t x = 0;
-  int16_t y = 0;
+  int16_t y = start_y;
   int16_t line_height = prv_line_height();
   int16_t prompt_filled_y = -1;
-  bool bold = false;
-  bool prompt = false;
+  bool bold = start_bold;
+  bool prompt = start_prompt;
 
   if (latest_prompt_y) {
     *latest_prompt_y = 0;
+  }
+
+  if (record_checkpoints) {
+    s_text_layout_checkpoint_count = 0;
+    prv_record_text_layout_checkpoint(cursor, bold, prompt, y, line_height);
   }
 
   if (should_draw && ctx) {
@@ -508,6 +592,10 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t
   }
 
   while (*cursor != '\0' && y < TEXT_MEASURE_HEIGHT - line_height) {
+    if (should_draw && y > visible_bottom) {
+      break;
+    }
+
     if (*cursor == TEXT_BOLD_ON) {
       bold = true;
       cursor += 1;
@@ -524,16 +612,20 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t
       prompt = false;
       cursor += 1;
     } else if (*cursor == '\n') {
-      prv_fill_prompt_line(ctx, should_draw, prompt, y, line_height, &prompt_filled_y);
+      prv_fill_prompt_line(ctx, should_draw, prompt, y, line_height, &prompt_filled_y, visible_top, visible_bottom);
       x = 0;
       y += line_height;
       cursor += 1;
+      if (record_checkpoints) {
+        prv_record_text_layout_checkpoint(cursor, bold, prompt, y, line_height);
+      }
     } else if (*cursor == ' ' || *cursor == '\t') {
       const char *start = cursor;
       while (*cursor == ' ' || *cursor == '\t') {
         cursor += 1;
       }
-      prv_layout_spaces(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y);
+      prv_layout_spaces(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y,
+          record_checkpoints, visible_top, visible_bottom);
     } else {
       const char *start = cursor;
       while (*cursor != '\0' && *cursor != TEXT_BOLD_ON && *cursor != TEXT_BOLD_OFF &&
@@ -541,7 +633,8 @@ static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t
              *cursor != '\n' && *cursor != ' ' && *cursor != '\t') {
         cursor += 1;
       }
-      prv_layout_word(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y);
+      prv_layout_word(start, cursor - start, bold, prompt, ctx, should_draw, &x, &y, line_height, &prompt_filled_y,
+          record_checkpoints, visible_top, visible_bottom);
     }
   }
 
@@ -554,7 +647,8 @@ static void prv_update_scroll_text(void) {
   }
 
   int32_t latest_prompt_y = 0;
-  int32_t measured_height = prv_layout_response_text(NULL, false, &latest_prompt_y);
+  int32_t measured_height = prv_layout_response_text(NULL, false, &latest_prompt_y,
+      0, 0, false, false, true, 0, TEXT_MEASURE_HEIGHT);
   int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
   int32_t scroll_height;
 
@@ -748,6 +842,40 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
       GRect(card.origin.x + 8, y, card.size.w - 16, 20));
 }
 
+static void prv_draw_response_text(GContext *ctx) {
+  int16_t line_height = prv_line_height();
+  int32_t visible_top = 0;
+  int32_t visible_bottom;
+  uint16_t start_offset = 0;
+  int16_t start_y = 0;
+  bool bold = false;
+  bool prompt = false;
+
+  if (s_scroll_layer) {
+    visible_top = -scroll_layer_get_content_offset(s_scroll_layer).y;
+    if (visible_top < 0) {
+      visible_top = 0;
+    }
+  }
+
+  visible_bottom = visible_top + s_min_text_height + line_height;
+
+  if (line_height > 0 && s_text_layout_checkpoint_count > 0) {
+    uint16_t checkpoint_index = (uint16_t)((visible_top / line_height) / TEXT_LAYOUT_CHECKPOINT_STRIDE);
+
+    if (checkpoint_index < s_text_layout_checkpoint_count) {
+      TextLayoutCheckpoint *checkpoint = &s_text_layout_checkpoints[checkpoint_index];
+      start_offset = checkpoint->offset;
+      start_y = (int16_t)(checkpoint_index * TEXT_LAYOUT_CHECKPOINT_STRIDE * line_height);
+      bold = (checkpoint->flags & TEXT_LAYOUT_FLAG_BOLD) != 0;
+      prompt = (checkpoint->flags & TEXT_LAYOUT_FLAG_PROMPT) != 0;
+    }
+  }
+
+  prv_layout_response_text(ctx, true, NULL, start_offset, start_y, bold, prompt, false,
+      visible_top - line_height, visible_bottom);
+}
+
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
@@ -759,7 +887,7 @@ static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
     return;
   }
 
-  prv_layout_response_text(ctx, true, NULL);
+  prv_draw_response_text(ctx);
 }
 
 static void prv_schedule_progress_loading_timer(void) {
@@ -1173,7 +1301,10 @@ static bool prv_ensure_dictation_session(void) {
 
   s_dictation_session = dictation_session_create(DICTATION_BUFFER_SIZE, prv_dictation_callback, NULL);
   if (!s_dictation_session) {
-    prv_preserve_chat_or_set_response("Voice dictation unavailable. Check phone connection.");
+    APP_LOG(APP_LOG_LEVEL_ERROR, "dictation session create failed");
+    if (prv_ui_loaded()) {
+      prv_preserve_chat_or_set_response("Voice dictation unavailable. Check phone connection.");
+    }
     return false;
   }
 
@@ -1517,12 +1648,8 @@ static void prv_init(void) {
   app_message_register_inbox_received(prv_inbox_received_handler);
   app_message_register_inbox_dropped(prv_inbox_dropped_handler);
   app_message_register_outbox_failed(prv_outbox_failed_handler);
-  app_message_open(app_message_inbox_size_maximum(), app_message_outbox_size_maximum());
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "appmessage opened inbox=%lu outbox=%lu", (unsigned long)app_message_inbox_size_maximum(), (unsigned long)app_message_outbox_size_maximum());
-
-#if defined(PBL_MICROPHONE)
-  prv_ensure_dictation_session();
-#endif
+  app_message_open(APP_MESSAGE_INBOX_SIZE, APP_MESSAGE_OUTBOX_SIZE);
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "appmessage opened inbox=%lu outbox=%lu", (unsigned long)APP_MESSAGE_INBOX_SIZE, (unsigned long)APP_MESSAGE_OUTBOX_SIZE);
 
   window_stack_push(s_window, true);
   prv_maybe_schedule_quick_launch_dictation();
@@ -1537,6 +1664,7 @@ static void prv_deinit(void) {
 #if defined(PBL_MICROPHONE)
   if (s_dictation_session) {
     dictation_session_destroy(s_dictation_session);
+    s_dictation_session = NULL;
   }
 #endif
 
