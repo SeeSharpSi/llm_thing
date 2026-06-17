@@ -16,7 +16,8 @@
     "enableMultiJS": true,
     "capabilities": [
       "configurable",
-      "location"
+      "location",
+      "health"
     ],
     "targetPlatforms": [
       "aplite",
@@ -60,7 +61,14 @@
       "TextColor",
       "BackgroundColor",
       "PromptBackgroundColor",
-      "BoldTextColor"
+      "BoldTextColor",
+      "HealthToolEnabled",
+      "HealthSummaryRequest",
+      "HealthSummaryJson",
+      "HealthSummaryError",
+      "HealthStartUnix",
+      "HealthEndUnix",
+      "HealthIncludeHeartRate"
     ],
     "resources": {
       "media": []

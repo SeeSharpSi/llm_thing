@@ -47,12 +47,16 @@ var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
 var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
+var HEALTH_SUMMARY_TIMEOUT_MS = 8000;
+var MAX_HEALTH_RANGE_SECONDS = 7 * 24 * 60 * 60;
 var s_mcp_request_id = 1;
+var s_health_summary_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
 var s_chat_history = [];
 var s_latest_request_id = 0;
 var s_active_xhrs = {};
+var s_pending_health_summaries = {};
 var s_progress = {
   requestId: 0,
   active: false,
@@ -96,6 +100,34 @@ function abortXhrsForKey(key) {
   delete s_active_xhrs[key];
 }
 
+function clearPendingHealthSummary(key) {
+  var pending = s_pending_health_summaries[key];
+
+  if (!pending) {
+    return null;
+  }
+
+  if (pending.timeout) {
+    clearTimeout(pending.timeout);
+  }
+  delete s_pending_health_summaries[key];
+  return pending;
+}
+
+function abortStaleHealthSummaries(requestId) {
+  var key;
+  var pending;
+
+  for (key in s_pending_health_summaries) {
+    if (s_pending_health_summaries.hasOwnProperty(key)) {
+      pending = s_pending_health_summaries[key];
+      if (Number(pending.requestId) !== Number(requestId)) {
+        clearPendingHealthSummary(key);
+      }
+    }
+  }
+}
+
 function dropStaleQueuedMessages(requestId) {
   var kept = [];
   var dropped = 0;
@@ -129,6 +161,7 @@ function beginRequestLifecycle(requestId) {
     }
   }
   dropStaleQueuedMessages(requestId);
+  abortStaleHealthSummaries(requestId);
   if (!s_active_xhrs[requestKey(requestId)]) {
     s_active_xhrs[requestKey(requestId)] = [];
   }
@@ -214,6 +247,7 @@ var DEFAULT_SETTINGS = {
   WebSearchEnabled: false,
   GeolocationToolEnabled: false,
   TimelineToolEnabled: false,
+  HealthToolEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   FontSize: 18,
   BuzzStrength: 1,
@@ -287,6 +321,7 @@ function extend(base, extra) {
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
   result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
+  result.HealthToolEnabled = result.HealthToolEnabled === true || result.HealthToolEnabled === 1 || result.HealthToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
@@ -1466,6 +1501,178 @@ function callTimelineDeleteBuiltin(args, requestId, callback) {
   timelinePinRequest('DELETE', id, null, requestId, callback);
 }
 
+function parseUnixTimeArg(value) {
+  var number;
+  var parsed;
+  var text;
+
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  if (typeof value === 'number') {
+    return Math.floor(value > 100000000000 ? value / 1000 : value);
+  }
+
+  text = trim(value);
+  if (!text) {
+    return null;
+  }
+
+  if (/^[0-9]+$/.test(text)) {
+    number = parseInt(text, 10);
+    return Math.floor(number > 100000000000 ? number / 1000 : number);
+  }
+
+  parsed = Date.parse(text);
+  if (isNaN(parsed)) {
+    return null;
+  }
+
+  return Math.floor(parsed / 1000);
+}
+
+function localDayStartUnix(offsetDays) {
+  var now = new Date();
+  var date = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offsetDays);
+
+  return Math.floor(date.getTime() / 1000);
+}
+
+function buildHealthSummaryWindow(args) {
+  var now = Math.floor(new Date().getTime() / 1000);
+  var range;
+  var startUnix;
+  var endUnix;
+
+  args = args || {};
+  range = trim(args.range || args.timeRange || 'today').toLowerCase().replace(/[-\s]+/g, '_');
+
+  if (range === 'custom' || args.startTime !== undefined || args.startUnix !== undefined || args.endTime !== undefined || args.endUnix !== undefined) {
+    startUnix = parseUnixTimeArg(args.startUnix !== undefined ? args.startUnix : args.startTime);
+    endUnix = parseUnixTimeArg(args.endUnix !== undefined ? args.endUnix : args.endTime);
+    if (startUnix === null) {
+      return { error: 'startTime or startUnix is required for custom health ranges' };
+    }
+    if (endUnix === null) {
+      endUnix = now;
+    }
+  } else if (range === 'today') {
+    startUnix = localDayStartUnix(0);
+    endUnix = now;
+  } else if (range === 'yesterday') {
+    startUnix = localDayStartUnix(-1);
+    endUnix = localDayStartUnix(0);
+  } else if (range === 'last_24h' || range === 'last_24_hours') {
+    startUnix = now - 24 * 60 * 60;
+    endUnix = now;
+  } else if (range === 'last_7d' || range === 'last_7_days' || range === 'week') {
+    startUnix = now - MAX_HEALTH_RANGE_SECONDS;
+    endUnix = now;
+  } else {
+    return { error: 'Unsupported health range: ' + range };
+  }
+
+  if (endUnix > now) {
+    endUnix = now;
+  }
+  if (endUnix <= 0 || startUnix < 0 || startUnix >= endUnix) {
+    return { error: 'Invalid health time range' };
+  }
+  if (endUnix - startUnix > MAX_HEALTH_RANGE_SECONDS) {
+    startUnix = endUnix - MAX_HEALTH_RANGE_SECONDS;
+  }
+
+  return {
+    startUnix: startUnix,
+    endUnix: endUnix,
+    includeHeartRate: boolArg(args.includeHeartRate, false)
+  };
+}
+
+function handleHealthSummaryResponse(dict) {
+  var key = String(dict.HealthSummaryRequest || 0);
+  var pending = clearPendingHealthSummary(key);
+  var callback;
+
+  if (!pending) {
+    logDebug('unexpected health summary response token=' + key);
+    return;
+  }
+
+  callback = pending.callback;
+  if (dictHasRequestId(dict) && Number(dict.RequestId) !== Number(pending.requestId)) {
+    return;
+  }
+  if (!isCurrentRequest(pending.requestId)) {
+    return;
+  }
+
+  if (dict.HealthSummaryError !== undefined && dict.HealthSummaryError !== null && String(dict.HealthSummaryError)) {
+    callback(String(dict.HealthSummaryError));
+    return;
+  }
+  if (dict.HealthSummaryJson !== undefined && dict.HealthSummaryJson !== null) {
+    callback(null, String(dict.HealthSummaryJson));
+    return;
+  }
+
+  callback('Health summary response missing data');
+}
+
+function callHealthSummaryBuiltin(args, requestId, callback) {
+  var range = buildHealthSummaryWindow(args);
+  var healthRequestId;
+  var key;
+  var dict;
+
+  if (range.error) {
+    callback(range.error);
+    return;
+  }
+  if (!Pebble.sendAppMessage) {
+    callback('Health summary requires AppMessage');
+    return;
+  }
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
+
+  healthRequestId = s_health_summary_request_id;
+  s_health_summary_request_id += 1;
+  if (s_health_summary_request_id > 2147480000) {
+    s_health_summary_request_id = 1;
+  }
+
+  key = String(healthRequestId);
+  s_pending_health_summaries[key] = {
+    requestId: requestId,
+    callback: callback,
+    timeout: setTimeout(function() {
+      var pending = clearPendingHealthSummary(key);
+      if (pending && isCurrentRequest(pending.requestId)) {
+        pending.callback('Health summary request timed out');
+      }
+    }, HEALTH_SUMMARY_TIMEOUT_MS)
+  };
+
+  dict = {
+    RequestId: requestId,
+    HealthSummaryRequest: healthRequestId,
+    HealthStartUnix: range.startUnix,
+    HealthEndUnix: range.endUnix,
+    HealthIncludeHeartRate: range.includeHeartRate ? 1 : 0
+  };
+
+  logDebug('health summary request token=' + healthRequestId + ' start=' + range.startUnix + ' end=' + range.endUnix + ' hr=' + (range.includeHeartRate ? 1 : 0));
+  sendMessage(dict, null, function(e) {
+    var pending = clearPendingHealthSummary(key);
+    if (pending && isCurrentRequest(pending.requestId)) {
+      pending.callback('Health summary send failed: ' + ((e && (e.error || e.message)) || 'AppMessage failed'));
+    }
+  });
+}
+
 function addBuiltinTool(tools, toolMap, definition) {
   var baseName = definition.name;
   var exposedName = baseName;
@@ -1534,6 +1741,24 @@ function addBuiltinTools(settings, tools, toolMap) {
         required: ['id']
       },
       call: callTimelineDeleteBuiltin
+    });
+  }
+
+  if (settings.HealthToolEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_get_health_summary',
+      label: 'Health',
+      description: 'Get a compact Pebble Health summary from the watch. Use only when the user asks about steps, activity, distance, sleep, calories, workouts, or heart rate. Heart rate is only included when includeHeartRate is true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          range: { type: 'string', enum: ['today', 'yesterday', 'last_24h', 'last_7d', 'custom'], description: 'Health time range. Default today.' },
+          startTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range start.' },
+          endTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range end. Default now.' },
+          includeHeartRate: { type: 'boolean', description: 'Include current heart rate when relevant. Default false.' }
+        }
+      },
+      call: callHealthSummaryBuiltin
     });
   }
 }
@@ -2068,7 +2293,7 @@ function requestCompletion(requestId, userText) {
   var settings = loadSettings();
   var conversation;
 
-  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' history=' + s_chat_history.length);
+  logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + s_chat_history.length);
   beginRequestLifecycle(requestId);
   syncWatchSettings(settings);
   progressStart(requestId, 'thinking', '');
@@ -2169,6 +2394,11 @@ Pebble.addEventListener('webviewclosed', function(e) {
 Pebble.addEventListener('appmessage', function(e) {
   var dict = e.payload || {};
   var requestId = dict.RequestId || 0;
+
+  if (dict.HealthSummaryRequest && (dict.HealthSummaryJson !== undefined || dict.HealthSummaryError !== undefined)) {
+    handleHealthSummaryResponse(dict);
+    return;
+  }
 
   if (dict.ChatReset) {
     logDebug('appmessage chat reset');

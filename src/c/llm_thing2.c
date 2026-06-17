@@ -39,6 +39,9 @@
 #define PROGRESS_TITLE_BUFFER_SIZE 96
 #define PROGRESS_DETAIL_BUFFER_SIZE 192
 #define PROGRESS_HISTORY_BUFFER_SIZE 256
+#define HEALTH_SUMMARY_JSON_SIZE 384
+#define HEALTH_SUMMARY_UNAVAILABLE_SIZE 160
+#define HEALTH_SUMMARY_ACTIVITIES_SIZE 64
 #define PROGRESS_LOADING_HEIGHT 28
 #define PROGRESS_LOADING_MARGIN 16
 #define PROGRESS_LOADING_TIMER_MS 80
@@ -81,6 +84,11 @@ static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
+#if defined(PBL_HEALTH)
+static char s_health_summary_json[HEALTH_SUMMARY_JSON_SIZE];
+static char s_health_summary_unavailable[HEALTH_SUMMARY_UNAVAILABLE_SIZE];
+static char s_health_summary_activities[HEALTH_SUMMARY_ACTIVITIES_SIZE];
+#endif
 static TextLayoutCheckpoint s_text_layout_checkpoints[TEXT_LAYOUT_CHECKPOINT_COUNT];
 static int16_t s_text_width;
 static int16_t s_text_layer_width;
@@ -198,6 +206,21 @@ static int prv_int_from_tuple(Tuple *tuple, int fallback) {
   }
   if (tuple->type == TUPLE_INT) {
     return tuple->value->int32;
+  }
+
+  return tuple->value->uint32;
+}
+
+static uint32_t prv_uint32_from_tuple(Tuple *tuple, uint32_t fallback) {
+  if (!tuple) {
+    return fallback;
+  }
+
+  if (tuple->type == TUPLE_CSTRING) {
+    return (uint32_t)atol(tuple->value->cstring);
+  }
+  if (tuple->type == TUPLE_INT) {
+    return (uint32_t)tuple->value->int32;
   }
 
   return tuple->value->uint32;
@@ -1169,6 +1192,206 @@ static void prv_append_notice(const char *text) {
   prv_scroll_to_latest_prompt(false);
 }
 
+static void prv_send_health_summary_response(uint32_t request_id, uint32_t health_request_id,
+                                             const char *json, const char *error) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+
+  if (result != APP_MSG_OK || !iter) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "health response outbox begin failed result=%d", result);
+    return;
+  }
+
+  dict_write_uint32(iter, MESSAGE_KEY_RequestId, request_id);
+  dict_write_uint32(iter, MESSAGE_KEY_HealthSummaryRequest, health_request_id);
+  if (error && error[0] != '\0') {
+    dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryError, error);
+  } else {
+    dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryJson, json ? json : "{}");
+  }
+  dict_write_end(iter);
+
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "health response outbox send failed result=%d", result);
+  }
+}
+
+#if defined(PBL_HEALTH)
+static void prv_append_text(char *buffer, size_t size, const char *text) {
+  size_t used = strlen(buffer);
+
+  if (used >= size - 1) {
+    return;
+  }
+
+  snprintf(buffer + used, size - used, "%s", text ? text : "");
+}
+
+static void prv_append_csv_value(char *buffer, size_t size, const char *value) {
+  if (!value || value[0] == '\0') {
+    return;
+  }
+
+  if (buffer[0] != '\0') {
+    prv_append_text(buffer, size, ",");
+  }
+  prv_append_text(buffer, size, value);
+}
+
+static void prv_append_json_comma(char *json, size_t size, bool *needs_comma) {
+  if (*needs_comma) {
+    prv_append_text(json, size, ",");
+  }
+  *needs_comma = true;
+}
+
+static void prv_append_json_int_field(char *json, size_t size, bool *needs_comma,
+                                      const char *name, int32_t value) {
+  size_t used;
+
+  prv_append_json_comma(json, size, needs_comma);
+  used = strlen(json);
+  if (used >= size - 1) {
+    return;
+  }
+  snprintf(json + used, size - used, "\"%s\":%ld", name, (long)value);
+}
+
+static void prv_append_json_string_field(char *json, size_t size, bool *needs_comma,
+                                         const char *name, const char *value) {
+  size_t used;
+
+  prv_append_json_comma(json, size, needs_comma);
+  used = strlen(json);
+  if (used >= size - 1) {
+    return;
+  }
+  snprintf(json + used, size - used, "\"%s\":\"%s\"", name, value ? value : "");
+}
+
+static void prv_health_append_sum_metric(char *json, size_t json_size, bool *needs_comma,
+                                         const char *name, HealthMetric metric,
+                                         time_t start, time_t end, char *unavailable,
+                                         size_t unavailable_size) {
+  HealthServiceAccessibilityMask accessible = health_service_metric_accessible(metric, start, end);
+
+  if (accessible & HealthServiceAccessibilityMaskAvailable) {
+    prv_append_json_int_field(json, json_size, needs_comma, name, health_service_sum(metric, start, end));
+  } else {
+    prv_append_csv_value(unavailable, unavailable_size, name);
+  }
+}
+
+static void prv_health_append_heart_rate(char *json, size_t json_size, bool *needs_comma,
+                                         char *unavailable, size_t unavailable_size) {
+  time_t now = time(NULL);
+  HealthServiceAccessibilityMask accessible = health_service_metric_aggregate_averaged_accessible(
+      HealthMetricHeartRateBPM, now, now, HealthAggregationAvg, HealthServiceTimeScopeOnce);
+
+  if (accessible & HealthServiceAccessibilityMaskAvailable) {
+    HealthValue value = health_service_peek_current_value(HealthMetricHeartRateBPM);
+    if (value > 0) {
+      prv_append_json_int_field(json, json_size, needs_comma, "heartRateBPM", value);
+      return;
+    }
+  }
+
+  prv_append_csv_value(unavailable, unavailable_size, "heartRateBPM");
+}
+
+static void prv_health_append_current_activities(char *activities, size_t size) {
+  HealthActivityMask mask = health_service_peek_current_activities();
+
+  activities[0] = '\0';
+  if (mask & HealthActivitySleep) {
+    prv_append_csv_value(activities, size, "sleep");
+  }
+  if (mask & HealthActivityRestfulSleep) {
+    prv_append_csv_value(activities, size, "restful_sleep");
+  }
+  if (mask & HealthActivityWalk) {
+    prv_append_csv_value(activities, size, "walk");
+  }
+  if (mask & HealthActivityRun) {
+    prv_append_csv_value(activities, size, "run");
+  }
+  if (mask & HealthActivityOpenWorkout) {
+    prv_append_csv_value(activities, size, "open_workout");
+  }
+}
+#endif
+
+static void prv_handle_health_summary_request(uint32_t request_id, Tuple *health_request_t,
+                                              Tuple *start_t, Tuple *end_t, Tuple *include_heart_rate_t) {
+  uint32_t health_request_id = prv_uint32_from_tuple(health_request_t, 0);
+  time_t start = (time_t)prv_uint32_from_tuple(start_t, 0);
+  time_t end = (time_t)prv_uint32_from_tuple(end_t, 0);
+
+  if (health_request_id == 0) {
+    return;
+  }
+  if (start <= 0 || end <= start) {
+    prv_send_health_summary_response(request_id, health_request_id, NULL, "Invalid health time range");
+    return;
+  }
+
+#if defined(PBL_HEALTH)
+  bool needs_comma = false;
+  bool include_heart_rate = prv_int_from_tuple(include_heart_rate_t, 0) != 0;
+  s_health_summary_json[0] = '\0';
+  s_health_summary_unavailable[0] = '\0';
+  s_health_summary_activities[0] = '\0';
+
+  prv_append_text(s_health_summary_json, sizeof(s_health_summary_json), "{");
+  prv_append_json_int_field(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "startUnix", start);
+  prv_append_json_int_field(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "endUnix", end);
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "stepCount", HealthMetricStepCount, start, end, s_health_summary_unavailable,
+      sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "activeSeconds", HealthMetricActiveSeconds, start, end, s_health_summary_unavailable,
+      sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "walkedDistanceMeters", HealthMetricWalkedDistanceMeters, start, end,
+      s_health_summary_unavailable, sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "sleepSeconds", HealthMetricSleepSeconds, start, end, s_health_summary_unavailable,
+      sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "sleepRestfulSeconds", HealthMetricSleepRestfulSeconds, start, end,
+      s_health_summary_unavailable, sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "restingKCalories", HealthMetricRestingKCalories, start, end, s_health_summary_unavailable,
+      sizeof(s_health_summary_unavailable));
+  prv_health_append_sum_metric(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "activeKCalories", HealthMetricActiveKCalories, start, end, s_health_summary_unavailable,
+      sizeof(s_health_summary_unavailable));
+
+  if (include_heart_rate) {
+    prv_health_append_heart_rate(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+        s_health_summary_unavailable, sizeof(s_health_summary_unavailable));
+  }
+
+  prv_health_append_current_activities(s_health_summary_activities, sizeof(s_health_summary_activities));
+  prv_append_json_string_field(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+      "currentActivities", s_health_summary_activities);
+  if (s_health_summary_unavailable[0] != '\0') {
+    prv_append_json_string_field(s_health_summary_json, sizeof(s_health_summary_json), &needs_comma,
+        "unavailable", s_health_summary_unavailable);
+  }
+  prv_append_text(s_health_summary_json, sizeof(s_health_summary_json), "}");
+
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "health summary response token=%lu chars=%u",
+      (unsigned long)health_request_id, (unsigned int)strlen(s_health_summary_json));
+  prv_send_health_summary_response(request_id, health_request_id, s_health_summary_json, NULL);
+#else
+  prv_send_health_summary_response(request_id, health_request_id, NULL, "Pebble Health unavailable on this watch");
+#endif
+}
+
 static void prv_progress_reset(void) {
   s_progress_mode = true;
   snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
@@ -1447,6 +1670,17 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_apply_bold_text_color(prv_int_from_tuple(bold_text_color_t, BOLD_TEXT_COLOR_DEFAULT), true);
   }
 
+  Tuple *health_summary_t = dict_find(iter, MESSAGE_KEY_HealthSummaryRequest);
+  if (health_summary_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "health summary request token=%lu", (unsigned long)prv_uint32_from_tuple(health_summary_t, 0));
+    prv_handle_health_summary_request(request_id_t ? request_id_t->value->uint32 : s_request_id,
+        health_summary_t,
+        dict_find(iter, MESSAGE_KEY_HealthStartUnix),
+        dict_find(iter, MESSAGE_KEY_HealthEndUnix),
+        dict_find(iter, MESSAGE_KEY_HealthIncludeHeartRate));
+    return;
+  }
+
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
@@ -1528,6 +1762,9 @@ static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
 
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
+  if (iter && dict_find(iter, MESSAGE_KEY_HealthSummaryRequest)) {
+    return;
+  }
   if (iter && dict_find(iter, MESSAGE_KEY_ChatReset)) {
     s_chat_reset_pending = true;
   }

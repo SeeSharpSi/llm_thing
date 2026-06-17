@@ -91,6 +91,13 @@ module.exports = [
         "defaultValue": false
       },
       {
+        "type": "toggle",
+        "messageKey": "HealthToolEnabled",
+        "label": "Health Summary Tool",
+        "description": "Allow the model to request a summary of Pebble Health activity from the watch.",
+        "defaultValue": false
+      },
+      {
         "type": "input",
         "messageKey": "MaxToolCalls",
         "label": "Max Tool Calls",
