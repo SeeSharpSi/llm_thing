@@ -17,6 +17,7 @@ var DEFAULT_SETTINGS = {
   FontSize: 18,
   BuzzStrength: 1,
   ScrollLines: 3,
+  TouchScrollEnabled: true,
   StartDictationQuickLaunch: false,
   TextColor: 0x000000,
   BackgroundColor: 0xFFFFFF,
@@ -92,6 +93,7 @@ function extend(base, extra) {
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
   result.HealthToolEnabled = result.HealthToolEnabled === true || result.HealthToolEnabled === 1 || result.HealthToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
+  result.TouchScrollEnabled = result.TouchScrollEnabled === true || result.TouchScrollEnabled === 1 || result.TouchScrollEnabled === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {

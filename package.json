@@ -68,7 +68,8 @@
       "HealthSummaryError",
       "HealthStartUnix",
       "HealthEndUnix",
-      "HealthIncludeHeartRate"
+      "HealthIncludeHeartRate",
+      "TouchScrollEnabled"
     ],
     "resources": {
       "media": []

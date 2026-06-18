@@ -11,6 +11,7 @@ function clayCustomFn() {
     'FontSize',
     'BuzzStrength',
     'ScrollLines',
+    'TouchScrollEnabled',
     'TextColor',
     'BackgroundColor',
     'PromptBackgroundColor',

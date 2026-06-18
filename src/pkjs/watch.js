@@ -209,6 +209,7 @@ function syncWatchSettings(settings) {
     FontSize: settings.FontSize,
     BuzzStrength: settings.BuzzStrength,
     ScrollLines: settings.ScrollLines,
+    TouchScrollEnabled: settings.TouchScrollEnabled ? 1 : 0,
     StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0,
     TextColor: settings.TextColor,
     BackgroundColor: settings.BackgroundColor,

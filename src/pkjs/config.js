@@ -180,6 +180,13 @@ module.exports = [
         }
       },
       {
+        "type": "toggle",
+        "messageKey": "TouchScrollEnabled",
+        "label": "Touch Scroll",
+        "description": "Enable drag and momentum scrolling on touchscreen watches.",
+        "defaultValue": true
+      },
+      {
         "type": "color",
         "messageKey": "TextColor",
         "label": "Text Color",

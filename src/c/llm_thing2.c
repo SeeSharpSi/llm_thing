@@ -10,6 +10,7 @@
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
 #define PERSIST_KEY_SCROLL_LINES 4
+#define PERSIST_KEY_TOUCH_SCROLL_ENABLED 5
 #define PERSIST_KEY_TEXT_COLOR 10
 #define PERSIST_KEY_BACKGROUND_COLOR 11
 #define PERSIST_KEY_PROMPT_BACKGROUND_COLOR 12
@@ -21,6 +22,11 @@
 #define QUICK_LAUNCH_DICTATION_DELAY_MS 250
 #define SCROLL_REPEAT_INTERVAL_MS 100
 #define TOUCH_DRAG_THRESHOLD 8
+#define TOUCH_MOMENTUM_TIMER_MS 30
+#define TOUCH_MOMENTUM_MIN_VELOCITY 1
+#define TOUCH_MOMENTUM_MAX_VELOCITY 40
+#define TOUCH_MOMENTUM_DECAY_NUMERATOR 85
+#define TOUCH_MOMENTUM_DECAY_DENOMINATOR 100
 #define TEXT_BOTTOM_PADDING 16
 #define TEXT_SIDE_PADDING 4
 #define PROMPT_BACKGROUND_BOTTOM_PADDING 6
@@ -118,10 +124,13 @@ static bool s_chat_reset_pending = true;
 static bool s_home_screen_visible;
 
 #if defined(PBL_TOUCH)
+static AppTimer *s_touch_momentum_timer;
 static bool s_touch_active;
+static bool s_touch_scroll_enabled = true;
 static bool s_touch_threshold_met;
 static int16_t s_touch_start_y;
 static int32_t s_touch_start_offset_y;
+static int32_t s_touch_velocity_y;
 #endif
 
 static void prv_update_scroll_text(void);
@@ -129,6 +138,10 @@ static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
 static void prv_set_response(const char *text);
 
 static void prv_progress_loading_timer_callback(void *context);
+#if defined(PBL_TOUCH)
+static void prv_touch_momentum_timer_callback(void *context);
+static void prv_stop_touch_momentum(void);
+#endif
 
 static void prv_set_status(const char *text) {
   (void)text;
@@ -254,6 +267,22 @@ static void prv_apply_start_dictation_quick_launch(int enabled, bool should_pers
     persist_write_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH, s_start_dictation_quick_launch ? 1 : 0);
   }
 }
+
+#if defined(PBL_TOUCH)
+static void prv_apply_touch_scroll_enabled(int enabled, bool should_persist) {
+  s_touch_scroll_enabled = enabled != 0;
+
+  if (!s_touch_scroll_enabled) {
+    prv_stop_touch_momentum();
+    s_touch_active = false;
+    s_touch_threshold_met = false;
+  }
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED, s_touch_scroll_enabled ? 1 : 0);
+  }
+}
+#endif
 
 static GColor prv_color_from_hex(uint32_t hex) {
 #if defined(PBL_COLOR)
@@ -710,16 +739,8 @@ static int32_t prv_min_scroll_offset_y(void) {
   return min_y;
 }
 
-static void prv_scroll_to_latest_prompt(bool animated) {
-  int32_t offset_y;
-  int32_t min_y;
-
-  if (!s_scroll_layer) {
-    return;
-  }
-
-  min_y = prv_min_scroll_offset_y();
-  offset_y = -s_latest_prompt_y;
+static int32_t prv_clamp_scroll_offset_y(int32_t offset_y) {
+  int32_t min_y = prv_min_scroll_offset_y();
 
   if (offset_y < min_y) {
     offset_y = min_y;
@@ -728,12 +749,27 @@ static void prv_scroll_to_latest_prompt(bool animated) {
     offset_y = 0;
   }
 
+  return offset_y;
+}
+
+static void prv_scroll_to_latest_prompt(bool animated) {
+  int32_t offset_y;
+
+  if (!s_scroll_layer) {
+    return;
+  }
+
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+
+  offset_y = prv_clamp_scroll_offset_y(-s_latest_prompt_y);
+
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)offset_y), animated);
 }
 
 static void prv_scroll_by_lines(int lines, bool animated) {
   int32_t line_height;
-  int32_t min_y;
   int32_t next_y;
   GPoint offset;
 
@@ -741,26 +777,83 @@ static void prv_scroll_by_lines(int lines, bool animated) {
     return;
   }
 
-  line_height = prv_line_height();
-  min_y = prv_min_scroll_offset_y();
-  offset = scroll_layer_get_content_offset(s_scroll_layer);
-  next_y = offset.y - ((int32_t)lines * line_height);
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
 
-  if (next_y < min_y) {
-    next_y = min_y;
-  }
-  if (next_y > 0) {
-    next_y = 0;
-  }
+  line_height = prv_line_height();
+  offset = scroll_layer_get_content_offset(s_scroll_layer);
+  next_y = prv_clamp_scroll_offset_y(offset.y - ((int32_t)lines * line_height));
 
   scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), animated);
 }
 
 #if defined(PBL_TOUCH)
+static int32_t prv_abs32(int32_t value) {
+  return value < 0 ? -value : value;
+}
+
+static void prv_stop_touch_momentum(void) {
+  if (s_touch_momentum_timer) {
+    app_timer_cancel(s_touch_momentum_timer);
+    s_touch_momentum_timer = NULL;
+  }
+
+  s_touch_velocity_y = 0;
+}
+
+static void prv_schedule_touch_momentum(void) {
+  if (!s_touch_momentum_timer) {
+    s_touch_momentum_timer = app_timer_register(TOUCH_MOMENTUM_TIMER_MS,
+        prv_touch_momentum_timer_callback, NULL);
+  }
+}
+
+static void prv_start_touch_momentum(void) {
+  if (!s_scroll_layer || s_progress_mode || s_home_screen_visible ||
+      s_scroll_text_height <= s_min_text_height ||
+      prv_abs32(s_touch_velocity_y) <= TOUCH_MOMENTUM_MIN_VELOCITY) {
+    s_touch_velocity_y = 0;
+    return;
+  }
+
+  prv_schedule_touch_momentum();
+}
+
+static void prv_touch_momentum_timer_callback(void *context) {
+  (void)context;
+  s_touch_momentum_timer = NULL;
+
+  if (!s_scroll_layer || s_touch_active || s_progress_mode || s_home_screen_visible ||
+      s_scroll_text_height <= s_min_text_height ||
+      prv_abs32(s_touch_velocity_y) <= TOUCH_MOMENTUM_MIN_VELOCITY) {
+    s_touch_velocity_y = 0;
+    return;
+  }
+
+  GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
+  int32_t next_y = prv_clamp_scroll_offset_y(offset.y + s_touch_velocity_y);
+
+  if (next_y == offset.y) {
+    s_touch_velocity_y = 0;
+    return;
+  }
+
+  scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), false);
+
+  s_touch_velocity_y = (s_touch_velocity_y * TOUCH_MOMENTUM_DECAY_NUMERATOR) /
+      TOUCH_MOMENTUM_DECAY_DENOMINATOR;
+  if (prv_abs32(s_touch_velocity_y) > TOUCH_MOMENTUM_MIN_VELOCITY) {
+    prv_schedule_touch_momentum();
+  } else {
+    s_touch_velocity_y = 0;
+  }
+}
+
 static void prv_touch_handler(const TouchEvent *event, void *context) {
   (void)context;
 
-  if (!s_scroll_layer || s_progress_mode || s_home_screen_visible) {
+  if (!s_scroll_layer || !s_touch_scroll_enabled || s_progress_mode || s_home_screen_visible) {
     return;
   }
 
@@ -770,6 +863,7 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
 
   switch (event->type) {
     case TouchEvent_Touchdown:
+      prv_stop_touch_momentum();
       s_touch_active = false;
       s_touch_threshold_met = false;
       s_touch_start_y = event->y;
@@ -787,20 +881,24 @@ static void prv_touch_handler(const TouchEvent *event, void *context) {
         }
       }
 
-      int32_t min_y = prv_min_scroll_offset_y();
-      int32_t next_y = s_touch_start_offset_y + delta;
-
-      if (next_y < min_y) {
-        next_y = min_y;
-      }
-      if (next_y > 0) {
-        next_y = 0;
+      GPoint offset = scroll_layer_get_content_offset(s_scroll_layer);
+      int32_t next_y = prv_clamp_scroll_offset_y(s_touch_start_offset_y + delta);
+      s_touch_velocity_y = next_y - offset.y;
+      if (s_touch_velocity_y > TOUCH_MOMENTUM_MAX_VELOCITY) {
+        s_touch_velocity_y = TOUCH_MOMENTUM_MAX_VELOCITY;
+      } else if (s_touch_velocity_y < -TOUCH_MOMENTUM_MAX_VELOCITY) {
+        s_touch_velocity_y = -TOUCH_MOMENTUM_MAX_VELOCITY;
       }
 
       scroll_layer_set_content_offset(s_scroll_layer, GPoint(0, (int16_t)next_y), false);
       break;
     }
     case TouchEvent_Liftoff:
+      if (s_touch_threshold_met) {
+        prv_start_touch_momentum();
+      } else {
+        s_touch_velocity_y = 0;
+      }
       s_touch_active = false;
       s_touch_threshold_met = false;
       break;
@@ -1393,6 +1491,10 @@ static void prv_handle_health_summary_request(uint32_t request_id, Tuple *health
 }
 
 static void prv_progress_reset(void) {
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+
   s_progress_mode = true;
   snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
   s_progress_detail[0] = '\0';
@@ -1412,6 +1514,10 @@ static void prv_progress_append(const char *text) {
 }
 
 static void prv_set_response(const char *text) {
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+
   prv_show_response_view();
   s_home_screen_visible = false;
   snprintf(s_response, sizeof(s_response), "%s", text);
@@ -1421,6 +1527,10 @@ static void prv_set_response(const char *text) {
 }
 
 static void prv_show_home_screen(void) {
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+
   prv_show_response_view();
   s_home_screen_visible = true;
   s_response[0] = '\0';
@@ -1638,6 +1748,15 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_apply_scroll_lines(prv_int_from_tuple(scroll_lines_t, s_scroll_lines), true);
   }
 
+#if defined(PBL_TOUCH)
+  Tuple *touch_scroll_enabled_t = dict_find(iter, MESSAGE_KEY_TouchScrollEnabled);
+  if (touch_scroll_enabled_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "touch scroll setting update");
+    prv_apply_touch_scroll_enabled(prv_int_from_tuple(touch_scroll_enabled_t,
+        s_touch_scroll_enabled ? 1 : 0), true);
+  }
+#endif
+
   Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
   if (start_dictation_quick_launch_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation setting update");
@@ -1838,6 +1957,7 @@ static void prv_window_load(Window *window) {
 
 static void prv_window_unload(Window *window) {
 #if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
   touch_service_unsubscribe();
 #endif
 
@@ -1865,6 +1985,11 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH)) {
     s_start_dictation_quick_launch = persist_read_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH) != 0;
   }
+#if defined(PBL_TOUCH)
+  if (persist_exists(PERSIST_KEY_TOUCH_SCROLL_ENABLED)) {
+    s_touch_scroll_enabled = persist_read_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED) != 0;
+  }
+#endif
 
   prv_apply_text_color(persist_exists(PERSIST_KEY_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_TEXT_COLOR) : TEXT_COLOR_DEFAULT, false);
   prv_apply_background_color(persist_exists(PERSIST_KEY_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_BACKGROUND_COLOR) : BACKGROUND_COLOR_DEFAULT, false);
