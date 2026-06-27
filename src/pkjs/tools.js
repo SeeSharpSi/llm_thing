@@ -8,6 +8,29 @@ var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
 var TIMELINE_DEFAULT_PIN_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_REMINDER_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_NOTIFICATION_ICON = 'NOTIFICATION_GENERIC';
+var TIMELINE_UPSERT_ALLOWED_ARGS = {
+  id: true,
+  title: true,
+  time: true,
+  durationMinutes: true,
+  pinType: true,
+  subtitle: true,
+  body: true,
+  locationName: true,
+  icon: true,
+  reminderTime: true,
+  remindMinutesBefore: true,
+  reminderTitle: true,
+  reminderIcon: true
+};
+var TIMELINE_RAW_PIN_ARG_KEYS = {
+  pin: true,
+  layout: true,
+  reminders: true,
+  createNotification: true,
+  updateNotification: true,
+  actions: true
+};
 var MAX_HEALTH_RANGE_SECONDS = 7 * 24 * 60 * 60;
 
 var s_mcp_request_id = 1;
@@ -686,6 +709,23 @@ function firstTimelineValue(args, keys) {
   return undefined;
 }
 
+function validateTimelineArgShape(args, allowedArgs) {
+  var key;
+
+  for (key in args) {
+    if (args.hasOwnProperty(key)) {
+      if (TIMELINE_RAW_PIN_ARG_KEYS[key]) {
+        return 'Use structured timeline arguments, not raw Pebble pin JSON';
+      }
+      if (allowedArgs && !allowedArgs[key]) {
+        return 'Unsupported timeline argument: ' + key;
+      }
+    }
+  }
+
+  return '';
+}
+
 function addTimelineStringField(target, key, value, maxLength) {
   value = common.trim(value);
   if (!value) {
@@ -821,8 +861,8 @@ function generateTimelinePinId(title) {
 
 function buildTimelinePinLayout(args, errors) {
   var layout = {};
-  var layoutType = normalizeTimelineLayoutType(firstTimelineValue(args, ['layoutType', 'type']));
-  var tinyIcon = firstTimelineValue(args, ['tinyIcon', 'pinIcon', 'icon']);
+  var layoutType = normalizeTimelineLayoutType(firstTimelineValue(args, ['pinType', 'layoutType', 'type']));
+  var tinyIcon = firstTimelineValue(args, ['icon', 'tinyIcon', 'pinIcon']);
   var headings;
   var paragraphs;
   var fields = [
@@ -1107,9 +1147,22 @@ function buildTimelinePin(args, options) {
   var actions;
   var createNotification;
   var updateNotification;
+  var validationError;
 
-  args = parseObjectArg(args) || {};
   options = options || {};
+  args = parseObjectArg(args) || {};
+
+  if (typeof args !== 'object' || isTimelineArray(args)) {
+    return {
+      error: 'Timeline arguments must be an object'
+    };
+  }
+  validationError = validateTimelineArgShape(args, options.allowedArgs);
+  if (validationError) {
+    return {
+      error: validationError
+    };
+  }
 
   pin = {
     id: common.trim(args.id || args.pinId) || generateTimelinePinId(args.title || args.reminderTitle),
@@ -1262,12 +1315,7 @@ function timelinePinRequest(method, id, pin, requestId, callback) {
         return;
       }
 
-      callback(null, common.safeJson({
-        ok: true,
-        action: method === 'DELETE' ? 'deleted' : 'created_or_updated',
-        id: id,
-        note: 'Timeline pins may take up to 15 minutes to appear on the watch.'
-      }));
+      callback(null, method === 'DELETE' ? 'Timeline pin deleted successfully.' : 'Timeline pin saved successfully.');
     };
 
     request.onerror = function() {
@@ -1313,7 +1361,10 @@ function extractTimelinePinId(args) {
 }
 
 function callTimelineUpsertBuiltin(args, requestId, callback) {
-  var built = buildTimelinePin(args, { forceReminder: false });
+  var built = buildTimelinePin(args, {
+    forceReminder: false,
+    allowedArgs: TIMELINE_UPSERT_ALLOWED_ARGS
+  });
   var pin;
   var validationError;
 
@@ -1515,7 +1566,7 @@ function addBuiltinTools(settings, tools, toolMap) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_create_reminder',
       label: 'Timeline',
-      description: 'Create a Pebble timeline pin with a scheduled reminder. Use this for user requests like "remind me". Provide structured fields only; the phone builds the Pebble reminders array with layout.type genericReminder and icon system://images/NOTIFICATION_REMINDER.',
+      description: 'Create a Pebble timeline pin with a scheduled reminder alert. Use this for reminder, alarm, alert, and "remind me" requests. Do not use this for general calendar events or timeline pins that do not need a reminder alert. Provide structured fields only; the phone builds the Pebble reminders array with layout.type genericReminder and icon system://images/NOTIFICATION_REMINDER.',
       parameters: {
         type: 'object',
         properties: {
@@ -1539,87 +1590,24 @@ function addBuiltinTools(settings, tools, toolMap) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_create_or_update_pin',
       label: 'Timeline',
-      description: 'Create or update one of this app\'s Pebble timeline pins from structured fields. Do not provide raw Pebble pin JSON. Updating uses the same id. Deleted pin ids should not be reused. Scheduled reminders must use reminders, reminderTime, or remindMinutesBefore; createNotification is only shown when the pin is delivered.',
+      description: 'Create or update one of this app\'s non-reminder Pebble timeline, calendar, sports, or weather pins from simple arguments. Do not use this for simple "remind me" requests; use pebble_timeline_create_reminder instead. Do not provide raw Pebble pin JSON, layout objects, reminders arrays, action objects, or Pebble Timeline API payloads; the phone builds the final pin JSON. Updating uses the same id. Deleted pin ids should not be reused. Use reminderTime or remindMinutesBefore only when the user asks for an alert attached to this non-reminder pin.',
       parameters: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           id: { type: 'string', maxLength: 64, description: 'Optional pin id. Required when updating an existing pin. Generated when omitted for new pins.' },
           time: { type: 'string', description: 'Pin event start time as ISO date-time with timezone, parseable date-time, or Unix seconds.' },
           durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes.' },
-          layoutType: { type: 'string', enum: ['genericPin', 'calendarPin', 'sportsPin', 'weatherPin'], description: 'Pin layout type. Default genericPin.' },
-          title: { type: 'string', description: 'Pin title. Required by supported layouts.' },
+          pinType: { type: 'string', enum: ['generic', 'calendar', 'sports', 'weather'], description: 'Kind of timeline pin. Default generic.' },
+          title: { type: 'string', description: 'Pin title shown on the watch.' },
           subtitle: { type: 'string', description: 'Optional subtitle.' },
-          shortTitle: { type: 'string', description: 'Optional short timeline title for weather pins.' },
-          shortSubtitle: { type: 'string', description: 'Optional short timeline subtitle for weather pins.' },
           body: { type: 'string', maxLength: 512, description: 'Optional pin body text.' },
           locationName: { type: 'string', description: 'Optional location. Required for weatherPin and useful for reminders/calendar pins.' },
-          tinyIcon: { type: 'string', description: 'Optional Pebble icon name or URI. Default NOTIFICATION_REMINDER except calendarPin. Example: NOTIFICATION_REMINDER, NOTIFICATION_FLAG, ALARM_CLOCK, TIMELINE_CALENDAR.' },
-          smallIcon: { type: 'string', description: 'Optional Pebble small icon name or URI.' },
-          largeIcon: { type: 'string', description: 'Optional Pebble large icon name or URI.' },
-          primaryColor: { type: 'string', description: 'Optional six-digit color hex or Pebble color constant.' },
-          secondaryColor: { type: 'string', description: 'Optional six-digit color hex or Pebble color constant.' },
-          backgroundColor: { type: 'string', description: 'Optional six-digit color hex or Pebble color constant.' },
-          headings: { type: 'array', items: { type: 'string' }, description: 'Optional detail headings. Must have same item count as paragraphs.' },
-          paragraphs: { type: 'array', items: { type: 'string' }, description: 'Optional detail paragraphs. Must have same item count as headings.' },
-          lastUpdated: { type: 'string', description: 'Optional ISO date-time when pin data was last updated.' },
-          displayTime: { type: 'string', enum: ['pin', 'none'], description: 'Optional weatherPin display time mode.' },
-          rankAway: { type: 'string', description: 'Optional sportsPin away team rank.' },
-          rankHome: { type: 'string', description: 'Optional sportsPin home team rank.' },
-          nameAway: { type: 'string', description: 'Optional sportsPin away team short name.' },
-          nameHome: { type: 'string', description: 'Optional sportsPin home team short name.' },
-          recordAway: { type: 'string', description: 'Optional sportsPin away team record.' },
-          recordHome: { type: 'string', description: 'Optional sportsPin home team record.' },
-          scoreAway: { type: 'string', description: 'Optional sportsPin away team score.' },
-          scoreHome: { type: 'string', description: 'Optional sportsPin home team score.' },
-          sportsGameState: { type: 'string', enum: ['pre-game', 'in-game'], description: 'Optional sportsPin game state.' },
+          icon: { type: 'string', description: 'Optional Pebble icon name or URI. Default NOTIFICATION_REMINDER except calendar pins. Example: NOTIFICATION_REMINDER, NOTIFICATION_FLAG, ALARM_CLOCK, TIMELINE_CALENDAR.' },
           reminderTime: { type: 'string', description: 'Optional single scheduled reminder time. Creates reminders[0].' },
           remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before pin time for a single scheduled reminder.' },
           reminderTitle: { type: 'string', description: 'Optional title for the single scheduled reminder. Defaults to title.' },
-          reminderIcon: { type: 'string', description: 'Optional icon for scheduled reminders. Default NOTIFICATION_REMINDER.' },
-          reminders: {
-            type: 'array',
-            maxItems: 3,
-            description: 'Optional scheduled reminders. Each item is converted to a Pebble Reminder object with layout.type genericReminder. Do not use createNotification for scheduled reminders.',
-            items: {
-              type: 'object',
-              properties: {
-                time: { type: 'string', description: 'Reminder alert time as ISO date-time, parseable date-time, or Unix seconds.' },
-                minutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Alternative to time: minutes before pin time.' },
-                title: { type: 'string', description: 'Reminder title.' },
-                locationName: { type: 'string', description: 'Optional reminder location.' },
-                icon: { type: 'string', description: 'Optional Pebble icon name or URI. Default NOTIFICATION_REMINDER.' }
-              }
-            }
-          },
-          createNotificationTitle: { type: 'string', description: 'Optional notification title shown when pin is first delivered. This is not a scheduled reminder.' },
-          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional notification body shown when pin is first delivered.' },
-          createNotificationIcon: { type: 'string', description: 'Optional icon for create notification. Default NOTIFICATION_GENERIC.' },
-          updateNotificationTime: { type: 'string', description: 'Optional update notification timestamp. Defaults to now when update notification fields are used.' },
-          updateNotificationTitle: { type: 'string', description: 'Optional notification title shown when an existing pin is updated.' },
-          updateNotificationBody: { type: 'string', maxLength: 512, description: 'Optional notification body shown when an existing pin is updated.' },
-          updateNotificationIcon: { type: 'string', description: 'Optional icon for update notification. Default NOTIFICATION_GENERIC.' },
-          actions: {
-            type: 'array',
-            description: 'Optional pin actions. Use openWatchApp with launchCode or http with url/method/body fields.',
-            items: {
-              type: 'object',
-              properties: {
-                title: { type: 'string', description: 'Action title shown on the watch.' },
-                type: { type: 'string', enum: ['openWatchApp', 'http'], description: 'Action type.' },
-                launchCode: { type: 'integer', minimum: 0, description: 'Required for openWatchApp actions.' },
-                url: { type: 'string', description: 'Required for http actions.' },
-                method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'HTTP method. Default POST.' },
-                headers: { type: 'object', description: 'Optional HTTP headers object.' },
-                bodyText: { type: 'string', description: 'Optional HTTP body text. Do not use with GET/DELETE or bodyJSON.' },
-                bodyJSON: { type: 'object', description: 'Optional HTTP JSON body. Do not use with GET/DELETE or bodyText.' },
-                successText: { type: 'string', description: 'Optional HTTP action success text.' },
-                successIcon: { type: 'string', description: 'Optional HTTP action success icon. Default GENERIC_CONFIRMATION.' },
-                failureText: { type: 'string', description: 'Optional HTTP action failure text.' },
-                failureIcon: { type: 'string', description: 'Optional HTTP action failure icon. Default RESULT_FAILED.' }
-              },
-              required: ['title', 'type']
-            }
-          }
+          reminderIcon: { type: 'string', description: 'Optional icon for scheduled reminder. Default NOTIFICATION_REMINDER.' }
         },
         required: ['title', 'time']
       },
@@ -1732,8 +1720,13 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
 
     call = toolCalls[index] || {};
     index += 1;
-    name = call.name || call.tool || call.function;
-    args = call.arguments || call.args || {};
+    if (call.function && typeof call.function === 'object') {
+      name = call.function.name || call.name || call.tool;
+      args = call.function.arguments || call.arguments || call.args || {};
+    } else {
+      name = call.name || call.tool || call.function;
+      args = call.arguments || call.args || {};
+    }
     if (typeof args === 'string') {
       try {
         args = JSON.parse(args);
@@ -1746,7 +1739,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     if (!toolInfo) {
       watch.progressDone(requestId, String(name || 'unknown'), 'unknown tool');
       results.push({
-        id: call.id || name || String(index),
+        id: call.id || call.call_id || name || String(index),
         name: name || 'unknown',
         error: 'Unknown or unavailable tool'
       });
@@ -1761,13 +1754,13 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       if (error) {
         watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + common.truncate(error, 90));
         results.push({
-          id: call.id || name,
+          id: call.id || call.call_id || name,
           name: name,
           error: error
         });
       } else {
         results.push({
-          id: call.id || name,
+          id: call.id || call.call_id || name,
           name: name,
           result: resultText
         });

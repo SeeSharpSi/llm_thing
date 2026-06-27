@@ -31,17 +31,35 @@ function expandSystemPromptVariables(prompt) {
 function buildToolInstructions(tools, maxToolCalls) {
   var text;
   var i;
+  var hasTimelineTools = false;
 
   if (!tools.length || maxToolCalls <= 0) {
     return '';
+  }
+
+  for (i = 0; i < tools.length; i += 1) {
+    if (String(tools[i].name || '').indexOf('pebble_timeline_') === 0) {
+      hasTimelineTools = true;
+      break;
+    }
   }
 
   text = '\n\nPhone-side tools are available. If a tool is needed, respond with only JSON in this exact shape:' +
     '\n{"tool_calls":[{"id":"call_1","name":"tool_name","arguments":{}}]}' +
     '\nDo not include markdown, explanation, or final answer with tool call JSON. After tool results are provided, answer the user normally or request more tools with the same JSON shape.' +
     '\nOnly tools listed here are enabled in app settings.' +
-    '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.' +
-    '\nAvailable tools:';
+    '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.';
+
+  if (hasTimelineTools) {
+    text += '\nTimeline tool rules:' +
+      '\n- For reminder requests, alarms, alerts, or phrases like "remind me", call pebble_timeline_create_reminder.' +
+      '\n- For non-reminder calendar events, schedule items, or timeline pins, call pebble_timeline_create_or_update_pin.' +
+      '\n- Do not say a reminder, event, or pin was created, updated, or deleted unless the timeline tool result succeeded.' +
+      '\n- After a successful timeline tool result, include the title/time when known and the returned pin id.' +
+      '\n- If title, time, or target pin is ambiguous, ask one concise clarification instead of calling a tool.';
+  }
+
+  text += '\nAvailable tools:';
 
   for (i = 0; i < tools.length; i += 1) {
     text += '\n- ' + tools[i].name + ': ' + tools[i].description + '\n  Parameters JSON Schema: ' + common.safeJson(tools[i].parameters);
@@ -313,6 +331,10 @@ function parseToolCalls(text) {
   }
 
   if (parsed && parsed.name) {
+    return [parsed];
+  }
+
+  if (parsed && parsed.function && parsed.function.name) {
     return [parsed];
   }
 
