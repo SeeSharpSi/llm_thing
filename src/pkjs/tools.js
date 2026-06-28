@@ -515,7 +515,8 @@ function discoverMcpTools(settings, requestId, callback) {
       toolMap[exposedName] = {
         kind: 'mcp',
         server: server,
-        toolName: tool.name
+        toolName: tool.name,
+        parameters: tool.inputSchema || { type: 'object', properties: {} }
       };
       common.logDebug('mcp tool exposed=' + exposedName + ' original=' + tool.name + ' server=' + server.label);
     }
@@ -1539,6 +1540,7 @@ function addBuiltinTool(tools, toolMap, definition) {
     kind: 'builtin',
     name: exposedName,
     label: definition.label,
+    parameters: definition.parameters,
     call: definition.call
   };
   common.logDebug('builtin tool exposed=' + exposedName);
@@ -1658,6 +1660,15 @@ function discoverPhoneTools(settings, requestId, callback) {
     }
 
     addBuiltinTools(settings, tools, toolMap);
+    tools.sort(function(a, b) {
+      if (a.name < b.name) {
+        return -1;
+      }
+      if (a.name > b.name) {
+        return 1;
+      }
+      return 0;
+    });
     callback(null, tools, toolMap);
   });
 }
@@ -1699,6 +1710,72 @@ function callBuiltinTool(toolInfo, args, requestId, callback) {
   });
 }
 
+function isArrayValue(value) {
+  return Object.prototype.toString.call(value) === '[object Array]';
+}
+
+function isObjectValue(value) {
+  return value && typeof value === 'object' && !isArrayValue(value);
+}
+
+function parseToolArgsValue(value) {
+  var text;
+
+  if (value === undefined || value === null || value === '') {
+    return { args: {} };
+  }
+
+  if (typeof value === 'string') {
+    text = common.trim(value);
+    if (!text) {
+      return { args: {} };
+    }
+    try {
+      value = JSON.parse(text);
+    } catch (e) {
+      return { error: 'Malformed tool arguments JSON' };
+    }
+  }
+
+  if (!isObjectValue(value)) {
+    return { error: 'Tool arguments must be a JSON object' };
+  }
+
+  return { args: value };
+}
+
+function validateToolArgs(args, schema) {
+  var required;
+  var properties;
+  var i;
+  var key;
+
+  schema = schema || {};
+  required = isArrayValue(schema.required) ? schema.required : [];
+  properties = schema.properties || {};
+
+  if ((schema.type === 'object' || required.length || schema.properties) && !isObjectValue(args)) {
+    return 'Tool arguments must be a JSON object';
+  }
+
+  for (i = 0; i < required.length; i += 1) {
+    key = required[i];
+    if (!hasToolArgValue(args[key])) {
+      return 'Missing required tool argument: ' + key;
+    }
+  }
+
+  if (schema.additionalProperties === false) {
+    for (key in args) {
+      if (args.hasOwnProperty(key) && !properties.hasOwnProperty(key)) {
+        return 'Unsupported tool argument: ' + key;
+      }
+    }
+  }
+
+  return '';
+}
+
 function runToolCalls(requestId, toolCalls, toolMap, callback) {
   var results = [];
   var index = 0;
@@ -1707,7 +1784,10 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     var call;
     var name;
     var args;
+    var parsedArgs;
     var toolInfo;
+    var validationError;
+    var callId;
 
     if (!watch.isCurrentRequest(requestId)) {
       return;
@@ -1727,21 +1807,45 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       name = call.name || call.tool || call.function;
       args = call.arguments || call.args || {};
     }
-    if (typeof args === 'string') {
-      try {
-        args = JSON.parse(args);
-      } catch (e) {
-        args = {};
-      }
-    }
+    callId = call.call_id || call.id || name || String(index);
 
     toolInfo = toolMap[name];
     if (!toolInfo) {
       watch.progressDone(requestId, String(name || 'unknown'), 'unknown tool');
       results.push({
-        id: call.id || call.call_id || name || String(index),
+        id: callId,
+        call_id: callId,
         name: name || 'unknown',
         error: 'Unknown or unavailable tool'
+      });
+      next();
+      return;
+    }
+
+    parsedArgs = parseToolArgsValue(args);
+    if (parsedArgs.error) {
+      watch.progressToolStart(requestId, formatToolLabel(toolInfo), 'invalid arguments');
+      watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + parsedArgs.error);
+      results.push({
+        id: callId,
+        call_id: callId,
+        name: name,
+        error: parsedArgs.error
+      });
+      next();
+      return;
+    }
+    args = parsedArgs.args;
+
+    validationError = validateToolArgs(args, toolInfo.parameters);
+    if (validationError) {
+      watch.progressToolStart(requestId, formatToolLabel(toolInfo), 'invalid arguments');
+      watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + validationError);
+      results.push({
+        id: callId,
+        call_id: callId,
+        name: name,
+        error: validationError
       });
       next();
       return;
@@ -1754,13 +1858,15 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       if (error) {
         watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + common.truncate(error, 90));
         results.push({
-          id: call.id || call.call_id || name,
+          id: callId,
+          call_id: callId,
           name: name,
           error: error
         });
       } else {
         results.push({
-          id: call.id || call.call_id || name,
+          id: callId,
+          call_id: callId,
           name: name,
           result: resultText
         });
