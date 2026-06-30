@@ -85,6 +85,27 @@ module.exports = [
       },
       {
         "type": "toggle",
+        "messageKey": "PreserveChats",
+        "label": "Preserve Chats",
+        "description": "Save chats on the phone. When enabled, press DOWN on the app home screen to resume or delete saved chats.",
+        "defaultValue": false
+      },
+      {
+        "type": "button",
+        "id": "DeleteAllPastChats",
+        "defaultValue": "Delete All Past Chats",
+        "description": "Deletes saved chats from the phone. Turning Preserve Chats off does not delete saved chats."
+      },
+      {
+        "type": "input",
+        "messageKey": "DeleteAllPastChats",
+        "defaultValue": "0",
+        "attributes": {
+          "type": "hidden"
+        }
+      },
+      {
+        "type": "toggle",
         "messageKey": "WebSearchEnabled",
         "label": "Web Search",
         "description": "Ask models with web access to search when useful.",

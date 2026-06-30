@@ -13,6 +13,7 @@
 #define PERSIST_KEY_TOUCH_SCROLL_ENABLED 5
 #define PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE 6
 #define PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE 7
+#define PERSIST_KEY_PRESERVE_CHATS 8
 #define PERSIST_KEY_TEXT_COLOR 10
 #define PERSIST_KEY_BACKGROUND_COLOR 11
 #define PERSIST_KEY_PROMPT_BACKGROUND_COLOR 12
@@ -73,6 +74,17 @@
 #define HOME_BUTTON_HEIGHT 24
 #define APP_MESSAGE_INBOX_SIZE 1024
 #define APP_MESSAGE_OUTBOX_SIZE 512
+#define PAST_CHAT_MAX_ITEMS 20
+#define PAST_CHAT_ID_SIZE 49
+#define PAST_CHAT_TITLE_SIZE 81
+#define PAST_CHATS_STATUS_SIZE 96
+
+#if defined(PBL_MICROPHONE)
+typedef struct {
+  char id[PAST_CHAT_ID_SIZE];
+  char title[PAST_CHAT_TITLE_SIZE];
+} PastChatItem;
+#endif
 
 typedef struct {
   uint16_t offset;
@@ -80,7 +92,13 @@ typedef struct {
 } TextLayoutCheckpoint;
 
 static Window *s_window;
+#if defined(PBL_MICROPHONE)
+static Window *s_past_chats_window;
+#endif
 static ScrollLayer *s_scroll_layer;
+#if defined(PBL_MICROPHONE)
+static MenuLayer *s_past_chats_menu_layer;
+#endif
 static Layer *s_text_layer;
 static Layer *s_progress_layer;
 static TextLayer *s_progress_history_layer;
@@ -102,12 +120,19 @@ static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
 static char s_progress_input_context[PROGRESS_CONTEXT_BUFFER_SIZE];
 static char s_progress_output_context[PROGRESS_CONTEXT_BUFFER_SIZE];
+#if defined(PBL_MICROPHONE)
+static char s_past_chats_status[PAST_CHATS_STATUS_SIZE];
+static char s_delete_chat_id[PAST_CHAT_ID_SIZE];
+#endif
 #if defined(PBL_HEALTH)
 static char s_health_summary_json[HEALTH_SUMMARY_JSON_SIZE];
 static char s_health_summary_unavailable[HEALTH_SUMMARY_UNAVAILABLE_SIZE];
 static char s_health_summary_activities[HEALTH_SUMMARY_ACTIVITIES_SIZE];
 #endif
 static TextLayoutCheckpoint s_text_layout_checkpoints[TEXT_LAYOUT_CHECKPOINT_COUNT];
+#if defined(PBL_MICROPHONE)
+static PastChatItem s_past_chats[PAST_CHAT_MAX_ITEMS];
+#endif
 static int16_t s_text_width;
 static int16_t s_text_layer_width;
 static int16_t s_min_text_height;
@@ -117,6 +142,9 @@ static int32_t s_scroll_content_height;
 static int32_t s_scroll_text_height;
 static int32_t s_latest_prompt_y;
 static uint16_t s_text_layout_checkpoint_count;
+#if defined(PBL_MICROPHONE)
+static uint16_t s_past_chat_count;
+#endif
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
 static int s_scroll_lines = SCROLL_LINES_DEFAULT;
@@ -133,9 +161,13 @@ static bool s_response_truncated;
 static bool s_progress_mode;
 static bool s_show_input_context_size;
 static bool s_show_output_context_size;
+static bool s_preserve_chats;
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
 static bool s_home_screen_visible;
+#if defined(PBL_MICROPHONE)
+static bool s_past_chats_loading;
+#endif
 
 #if defined(PBL_TOUCH)
 static AppTimer *s_touch_momentum_timer;
@@ -150,6 +182,10 @@ static int32_t s_touch_velocity_y;
 static void prv_update_scroll_text(void);
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
 static void prv_set_response(const char *text);
+#if defined(PBL_MICROPHONE)
+static void prv_show_past_chats_menu(void);
+static void prv_request_past_chats(void);
+#endif
 
 static void prv_progress_loading_timer_callback(void *context);
 #if defined(PBL_TOUCH)
@@ -328,6 +364,18 @@ static void prv_apply_start_dictation_quick_launch(int enabled, bool should_pers
   }
 }
 
+static void prv_apply_preserve_chats(int enabled, bool should_persist) {
+  s_preserve_chats = enabled != 0;
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_PRESERVE_CHATS, s_preserve_chats ? 1 : 0);
+  }
+
+  if (s_home_screen_visible && s_text_layer) {
+    layer_mark_dirty(s_text_layer);
+  }
+}
+
 #if defined(PBL_TOUCH)
 static void prv_apply_touch_scroll_enabled(int enabled, bool should_persist) {
   s_touch_scroll_enabled = enabled != 0;
@@ -374,6 +422,13 @@ static void prv_apply_text_color(uint32_t hex, bool should_persist) {
   if (s_progress_output_context_layer) {
     text_layer_set_text_color(s_progress_output_context_layer, s_text_color);
   }
+#if defined(PBL_MICROPHONE)
+  if (s_past_chats_menu_layer) {
+    menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
+    menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
+    layer_mark_dirty(menu_layer_get_layer(s_past_chats_menu_layer));
+  }
+#endif
   if (s_text_layer) {
     layer_mark_dirty(s_text_layer);
   }
@@ -389,6 +444,16 @@ static void prv_apply_background_color(uint32_t hex, bool should_persist) {
   if (s_window) {
     window_set_background_color(s_window, s_background_color);
   }
+#if defined(PBL_MICROPHONE)
+  if (s_past_chats_window) {
+    window_set_background_color(s_past_chats_window, s_background_color);
+  }
+  if (s_past_chats_menu_layer) {
+    menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
+    menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
+    layer_mark_dirty(menu_layer_get_layer(s_past_chats_menu_layer));
+  }
+#endif
   if (s_text_layer) {
     layer_mark_dirty(s_text_layer);
   }
@@ -1012,9 +1077,13 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
   GRect card;
   int16_t center_x;
   int16_t y;
+  bool past_chats_available = false;
 
 #if defined(PBL_ROUND)
   margin = 18;
+#endif
+#if defined(PBL_MICROPHONE)
+  past_chats_available = s_preserve_chats;
 #endif
 
   card_width = bounds.size.w - (margin * 2);
@@ -1041,10 +1110,10 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
       GRect(card.origin.x + 8, y, card.size.w - 16, 20));
   y += 40;
 
-  prv_draw_home_button(ctx, "UP/DOWN", GRect(center_x - (HOME_BUTTON_WIDTH / 2), y,
+  prv_draw_home_button(ctx, past_chats_available ? "DOWN" : "UP/DOWN", GRect(center_x - (HOME_BUTTON_WIDTH / 2), y,
       HOME_BUTTON_WIDTH, HOME_BUTTON_HEIGHT));
   y += HOME_BUTTON_HEIGHT + 2;
-  prv_draw_home_centered_text(ctx, "Scroll responses", fonts_get_system_font(FONT_KEY_GOTHIC_18),
+  prv_draw_home_centered_text(ctx, past_chats_available ? "Past chats" : "Scroll responses", fonts_get_system_font(FONT_KEY_GOTHIC_18),
       GRect(card.origin.x + 8, y, card.size.w - 16, 20));
 }
 
@@ -1798,6 +1867,248 @@ static void prv_maybe_schedule_quick_launch_dictation(void) {
       prv_quick_launch_dictation_timer_callback, NULL);
 }
 
+#if defined(PBL_MICROPHONE)
+static void prv_reload_past_chats_menu(void) {
+  if (s_past_chats_menu_layer) {
+    menu_layer_reload_data(s_past_chats_menu_layer);
+  }
+}
+
+static void prv_set_past_chats_status(const char *text, bool loading) {
+  snprintf(s_past_chats_status, sizeof(s_past_chats_status), "%s", text ? text : "");
+  s_past_chats_loading = loading;
+  prv_reload_past_chats_menu();
+}
+
+static bool prv_send_past_chats_request_message(void) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+
+  if (result != APP_MSG_OK || !iter) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chats outbox begin failed result=%d", result);
+    return false;
+  }
+
+  dict_write_uint8(iter, MESSAGE_KEY_PastChatsRequest, 1);
+  dict_write_end(iter);
+
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chats request send failed result=%d", result);
+    return false;
+  }
+
+  return true;
+}
+
+static bool prv_send_past_chat_id_message(uint32_t key, const char *id) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+
+  if (result != APP_MSG_OK || !iter) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chat id outbox begin failed result=%d", result);
+    return false;
+  }
+
+  dict_write_cstring(iter, key, id ? id : "");
+  dict_write_end(iter);
+
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chat id send failed result=%d", result);
+    return false;
+  }
+
+  return true;
+}
+
+static void prv_request_past_chats(void) {
+  s_past_chat_count = 0;
+  prv_set_past_chats_status("Loading...", true);
+
+  if (!prv_send_past_chats_request_message()) {
+    prv_set_past_chats_status("Phone unavailable", false);
+  }
+}
+
+static void prv_send_past_chat_load(const char *id) {
+  if (!prv_send_past_chat_id_message(MESSAGE_KEY_PastChatLoad, id)) {
+    prv_set_response("Could not load saved chat.");
+  }
+}
+
+static void prv_send_past_chat_delete(const char *id) {
+  prv_set_past_chats_status("Deleting...", true);
+  if (!prv_send_past_chat_id_message(MESSAGE_KEY_PastChatDelete, id)) {
+    prv_set_past_chats_status("Delete failed", false);
+  }
+}
+
+static uint16_t prv_past_chats_get_num_rows(MenuLayer *menu_layer, uint16_t section_index,
+                                            void *callback_context) {
+  (void)menu_layer;
+  (void)section_index;
+  (void)callback_context;
+
+  return s_past_chat_count > 0 ? s_past_chat_count : 1;
+}
+
+static void prv_past_chats_draw_row(GContext *ctx, const Layer *cell_layer,
+                                    MenuIndex *cell_index, void *callback_context) {
+  (void)callback_context;
+
+  if (s_past_chat_count == 0) {
+    menu_cell_basic_draw(ctx, cell_layer,
+        s_past_chats_status[0] ? s_past_chats_status : "No saved chats",
+        s_past_chats_loading ? "Please wait" : NULL, NULL);
+    return;
+  }
+
+  if (cell_index->row >= s_past_chat_count) {
+    return;
+  }
+
+  menu_cell_basic_draw(ctx, cell_layer, s_past_chats[cell_index->row].title,
+      "Select resume", NULL);
+}
+
+static void prv_past_chat_delete_action_cb(ActionMenu *action_menu,
+                                           const ActionMenuItem *action,
+                                           void *context) {
+  (void)action_menu;
+  (void)action;
+  (void)context;
+
+  prv_send_past_chat_delete(s_delete_chat_id);
+}
+
+static void prv_past_chat_cancel_action_cb(ActionMenu *action_menu,
+                                           const ActionMenuItem *action,
+                                           void *context) {
+  (void)action_menu;
+  (void)action;
+  (void)context;
+}
+
+static void prv_past_chat_action_menu_did_close(ActionMenu *menu,
+                                                const ActionMenuItem *performed_action,
+                                                void *context) {
+  (void)menu;
+  (void)performed_action;
+
+  if (context) {
+    action_menu_hierarchy_destroy((ActionMenuLevel *)context, NULL, NULL);
+  }
+}
+
+static void prv_show_delete_chat_confirmation(const char *id) {
+  ActionMenuLevel *root_level;
+  ActionMenuConfig config;
+
+  snprintf(s_delete_chat_id, sizeof(s_delete_chat_id), "%s", id ? id : "");
+  if (s_delete_chat_id[0] == '\0') {
+    return;
+  }
+
+  root_level = action_menu_level_create(2);
+  if (!root_level) {
+    prv_set_past_chats_status("Delete unavailable", false);
+    return;
+  }
+
+  action_menu_level_add_action(root_level, "Delete", prv_past_chat_delete_action_cb, NULL);
+  action_menu_level_add_action(root_level, "Cancel", prv_past_chat_cancel_action_cb, NULL);
+
+  config = (ActionMenuConfig) {
+    .root_level = root_level,
+    .context = root_level,
+    .colors = {
+      .background = s_background_color,
+      .foreground = s_text_color,
+    },
+    .did_close = prv_past_chat_action_menu_did_close,
+    .align = ActionMenuAlignCenter,
+  };
+
+  if (!action_menu_open(&config)) {
+    action_menu_hierarchy_destroy(root_level, NULL, NULL);
+    prv_set_past_chats_status("Delete unavailable", false);
+  }
+}
+
+static void prv_past_chats_select_click(MenuLayer *menu_layer, MenuIndex *cell_index,
+                                        void *callback_context) {
+  char id[PAST_CHAT_ID_SIZE];
+  (void)menu_layer;
+  (void)callback_context;
+
+  if (s_past_chat_count == 0 || cell_index->row >= s_past_chat_count) {
+    return;
+  }
+
+  snprintf(id, sizeof(id), "%s", s_past_chats[cell_index->row].id);
+  window_stack_pop(true);
+  prv_send_past_chat_load(id);
+}
+
+static void prv_past_chats_select_long_click(MenuLayer *menu_layer, MenuIndex *cell_index,
+                                             void *callback_context) {
+  (void)menu_layer;
+  (void)callback_context;
+
+  if (s_past_chat_count == 0 || cell_index->row >= s_past_chat_count) {
+    return;
+  }
+
+  prv_show_delete_chat_confirmation(s_past_chats[cell_index->row].id);
+}
+
+static void prv_past_chats_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(window_layer);
+
+  s_past_chats_menu_layer = menu_layer_create(bounds);
+  menu_layer_set_callbacks(s_past_chats_menu_layer, NULL, (MenuLayerCallbacks) {
+    .get_num_rows = prv_past_chats_get_num_rows,
+    .draw_row = prv_past_chats_draw_row,
+    .select_click = prv_past_chats_select_click,
+    .select_long_click = prv_past_chats_select_long_click,
+  });
+  menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
+  menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
+  menu_layer_set_click_config_onto_window(s_past_chats_menu_layer, window);
+  layer_add_child(window_layer, menu_layer_get_layer(s_past_chats_menu_layer));
+}
+
+static void prv_past_chats_window_unload(Window *window) {
+  (void)window;
+
+  menu_layer_destroy(s_past_chats_menu_layer);
+  s_past_chats_menu_layer = NULL;
+}
+
+static void prv_show_past_chats_menu(void) {
+  if (!s_preserve_chats) {
+    return;
+  }
+
+  if (!s_past_chats_window) {
+    s_past_chats_window = window_create();
+    window_set_background_color(s_past_chats_window, s_background_color);
+    window_set_window_handlers(s_past_chats_window, (WindowHandlers) {
+      .load = prv_past_chats_window_load,
+      .unload = prv_past_chats_window_unload,
+    });
+  }
+
+  if (!window_stack_contains_window(s_past_chats_window)) {
+    window_stack_push(s_past_chats_window, true);
+  }
+
+  prv_request_past_chats();
+}
+#endif
+
 static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
@@ -1814,6 +2125,14 @@ static void prv_up_click_handler(ClickRecognizerRef recognizer, void *context) {
 static void prv_down_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
+
+#if defined(PBL_MICROPHONE)
+  if (s_home_screen_visible && s_preserve_chats) {
+    prv_show_past_chats_menu();
+    return;
+  }
+#endif
+
   prv_scroll_by_lines(s_scroll_lines, true);
 }
 
@@ -1872,6 +2191,13 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
         s_show_output_context_size ? 1 : 0), true);
   }
 
+  Tuple *preserve_chats_t = dict_find(iter, MESSAGE_KEY_PreserveChats);
+  if (preserve_chats_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "preserve chats setting update");
+    prv_apply_preserve_chats(prv_int_from_tuple(preserve_chats_t,
+        s_preserve_chats ? 1 : 0), true);
+  }
+
   Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
   if (start_dictation_quick_launch_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation setting update");
@@ -1914,6 +2240,89 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
         dict_find(iter, MESSAGE_KEY_HealthIncludeHeartRate));
     return;
   }
+
+#if defined(PBL_MICROPHONE)
+  Tuple *past_chats_reset_t = dict_find(iter, MESSAGE_KEY_PastChatsReset);
+  if (past_chats_reset_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chats reset");
+    s_past_chat_count = 0;
+    prv_set_past_chats_status("Loading...", true);
+  }
+
+  Tuple *past_chat_item_id_t = dict_find(iter, MESSAGE_KEY_PastChatsItemId);
+  Tuple *past_chat_item_title_t = dict_find(iter, MESSAGE_KEY_PastChatsItemTitle);
+  if (past_chat_item_id_t && past_chat_item_title_t && s_past_chat_count < PAST_CHAT_MAX_ITEMS) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chats item row=%u", s_past_chat_count);
+    snprintf(s_past_chats[s_past_chat_count].id, sizeof(s_past_chats[s_past_chat_count].id),
+        "%s", past_chat_item_id_t->value->cstring);
+    snprintf(s_past_chats[s_past_chat_count].title, sizeof(s_past_chats[s_past_chat_count].title),
+        "%s", past_chat_item_title_t->value->cstring);
+    s_past_chat_count += 1;
+    prv_reload_past_chats_menu();
+  }
+
+  Tuple *past_chats_done_t = dict_find(iter, MESSAGE_KEY_PastChatsDone);
+  if (past_chats_done_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chats done count=%u", s_past_chat_count);
+    prv_set_past_chats_status(s_past_chat_count > 0 ? "" : "No saved chats", false);
+  }
+
+  Tuple *past_chats_error_t = dict_find(iter, MESSAGE_KEY_PastChatsError);
+  if (past_chats_error_t) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chats error: %s", past_chats_error_t->value->cstring);
+    s_past_chat_count = 0;
+    if (s_past_chats_menu_layer) {
+      prv_set_past_chats_status(past_chats_error_t->value->cstring, false);
+    } else {
+      prv_append_notice(past_chats_error_t->value->cstring);
+    }
+  }
+
+  Tuple *past_chat_deleted_t = dict_find(iter, MESSAGE_KEY_PastChatDeleted);
+  if (past_chat_deleted_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chat deleted id=%s", past_chat_deleted_t->value->cstring);
+    prv_set_past_chats_status("Deleted", false);
+  }
+
+  Tuple *past_chat_text_reset_t = dict_find(iter, MESSAGE_KEY_PastChatTextReset);
+  if (past_chat_text_reset_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chat text reset");
+#if defined(PBL_TOUCH)
+    prv_stop_touch_momentum();
+#endif
+    prv_show_response_view();
+    s_home_screen_visible = false;
+    s_chat_started = true;
+    s_chat_reset_pending = false;
+    s_response[0] = '\0';
+    s_response_truncated = false;
+    prv_update_scroll_text();
+    if (s_scroll_layer) {
+      scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
+    }
+  }
+
+  Tuple *past_chat_text_chunk_t = dict_find(iter, MESSAGE_KEY_PastChatTextChunk);
+  if (past_chat_text_chunk_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chat text chunk len=%u", (unsigned int)strlen(past_chat_text_chunk_t->value->cstring));
+    prv_append_response(past_chat_text_chunk_t->value->cstring);
+  }
+
+  Tuple *past_chat_text_done_t = dict_find(iter, MESSAGE_KEY_PastChatTextDone);
+  if (past_chat_text_done_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "past chat text done chars=%u", (unsigned int)strlen(s_response));
+    s_chat_started = true;
+    s_chat_reset_pending = false;
+    if (s_response[0] == '\0') {
+      prv_set_response("Saved chat is empty.");
+      s_chat_started = true;
+      s_chat_reset_pending = false;
+    } else {
+      prv_update_scroll_text();
+      prv_scroll_to_latest_prompt(false);
+    }
+  }
+#endif
 
   Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
   if (reset_t) {
@@ -2017,6 +2426,20 @@ static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult
   if (iter && dict_find(iter, MESSAGE_KEY_HealthSummaryRequest)) {
     return;
   }
+#if defined(PBL_MICROPHONE)
+  if (iter && dict_find(iter, MESSAGE_KEY_PastChatsRequest)) {
+    prv_set_past_chats_status("Phone failed", false);
+    return;
+  }
+  if (iter && dict_find(iter, MESSAGE_KEY_PastChatDelete)) {
+    prv_set_past_chats_status("Delete failed", false);
+    return;
+  }
+  if (iter && dict_find(iter, MESSAGE_KEY_PastChatLoad)) {
+    prv_set_response("Could not load saved chat.");
+    return;
+  }
+#endif
   if (iter && dict_find(iter, MESSAGE_KEY_ChatReset)) {
     s_chat_reset_pending = true;
   }
@@ -2140,6 +2563,9 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH)) {
     s_start_dictation_quick_launch = persist_read_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH) != 0;
   }
+  if (persist_exists(PERSIST_KEY_PRESERVE_CHATS)) {
+    s_preserve_chats = persist_read_int(PERSIST_KEY_PRESERVE_CHATS) != 0;
+  }
 #if defined(PBL_TOUCH)
   if (persist_exists(PERSIST_KEY_TOUCH_SCROLL_ENABLED)) {
     s_touch_scroll_enabled = persist_read_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED) != 0;
@@ -2192,6 +2618,12 @@ static void prv_deinit(void) {
 #endif
 
   app_message_deregister_callbacks();
+#if defined(PBL_MICROPHONE)
+  if (s_past_chats_window) {
+    window_destroy(s_past_chats_window);
+    s_past_chats_window = NULL;
+  }
+#endif
   window_destroy(s_window);
 }
 

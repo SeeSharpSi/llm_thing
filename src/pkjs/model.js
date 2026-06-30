@@ -1,8 +1,11 @@
 var common = require('./settings');
 var watch = require('./watch');
 var tools = require('./tools');
+var chatStore = require('./chat_store');
 
 var s_chat_history = [];
+var s_saved_chat_history = [];
+var s_active_chat_id = null;
 
 function pad2(value) {
   return value < 10 ? '0' + value : String(value);
@@ -130,23 +133,99 @@ function buildConversation(settings, userText, toolInstructions) {
   return conversation;
 }
 
-function rememberChatTurn(userText, assistantText) {
-  s_chat_history.push({
+function appendChatTurn(history, userText, assistantText) {
+  history.push({
     role: 'user',
     content: common.truncate(userText, common.MAX_CHAT_HISTORY_MESSAGE_CHARS)
   });
-  s_chat_history.push({
+  history.push({
     role: 'assistant',
     content: common.truncate(assistantText, common.MAX_CHAT_HISTORY_MESSAGE_CHARS)
   });
 
-  while (s_chat_history.length > common.MAX_CHAT_HISTORY_MESSAGES) {
-    s_chat_history.splice(0, 2);
+  while (history.length > common.MAX_CHAT_HISTORY_MESSAGES) {
+    history.splice(0, 2);
+  }
+}
+
+function copyChatHistory(messages) {
+  var result = [];
+  var i;
+  var message;
+
+  messages = messages || [];
+  for (i = 0; i < messages.length; i += 1) {
+    message = messages[i] || {};
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue;
+    }
+    result.push({
+      role: message.role,
+      content: common.truncate(message.content || '', common.MAX_CHAT_HISTORY_MESSAGE_CHARS)
+    });
+  }
+
+  while (result.length > common.MAX_CHAT_HISTORY_MESSAGES) {
+    result.splice(0, 2);
+  }
+
+  return result;
+}
+
+function rememberChatTurn(settings, userText, assistantText) {
+  var saved;
+
+  appendChatTurn(s_chat_history, userText, assistantText);
+
+  if (!settings.PreserveChats) {
+    return;
+  }
+
+  appendChatTurn(s_saved_chat_history, userText, stripThinkingWrapper(assistantText));
+  saved = chatStore.saveChatHistory(s_active_chat_id, s_saved_chat_history);
+  if (saved) {
+    s_active_chat_id = saved.id;
   }
 }
 
 function resetChatHistory() {
   s_chat_history = [];
+  s_saved_chat_history = [];
+  s_active_chat_id = null;
+}
+
+function listSavedChats() {
+  return chatStore.listChats();
+}
+
+function loadSavedChat(chatId) {
+  var chat = chatStore.getChat(chatId);
+
+  if (!chat) {
+    return null;
+  }
+
+  s_chat_history = copyChatHistory(chat.messages);
+  s_saved_chat_history = copyChatHistory(chat.messages);
+  s_active_chat_id = chat.id;
+  return chat;
+}
+
+function deleteSavedChat(chatId) {
+  var deleted = chatStore.deleteChat(chatId);
+
+  if (deleted && s_active_chat_id === String(chatId || '')) {
+    s_active_chat_id = null;
+    s_saved_chat_history = [];
+  }
+
+  return deleted;
+}
+
+function deleteAllSavedChats() {
+  chatStore.deleteAllChats();
+  s_active_chat_id = null;
+  s_saved_chat_history = [];
 }
 
 function normalizeToolParameters(parameters) {
@@ -524,7 +603,19 @@ function extractResponseText(json) {
 }
 
 function stripThinking(text) {
-  return String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^\s+/, '');
+  return String(text || '').replace(/<\/think>[\s\S]*?<\/think>/gi, '').replace(/^\s+/, '');
+}
+
+function stripThinkingWrapper(text) {
+  var value = stripThinking(text);
+  var marker = '\n\nAnswer:\n';
+  var index = value.indexOf(marker);
+
+  if (value.substring(0, 'Thinking:\n'.length) === 'Thinking:\n' && index !== -1) {
+    return value.substring(index + marker.length);
+  }
+
+  return value;
 }
 
 function formatToolCallTrace(toolCalls, toolMap) {
@@ -1037,7 +1128,7 @@ function requestCompletion(requestId, userText) {
   var settings = common.loadSettings();
   var conversation;
 
-  common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + s_chat_history.length);
+  common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + s_chat_history.length);
   watch.beginRequestLifecycle(requestId);
   watch.syncWatchSettings(settings);
   watch.progressStart(requestId, 'thinking', '');
@@ -1069,7 +1160,7 @@ function requestCompletion(requestId, userText) {
 
       watch.sendResponse(requestId, settings, text, function() {
         if (watch.isCurrentRequest(requestId)) {
-          rememberChatTurn(userText, text);
+          rememberChatTurn(settings, userText, text);
         }
         watch.finishRequestLifecycle(requestId);
       });
@@ -1104,7 +1195,7 @@ function requestCompletion(requestId, userText) {
 
       watch.sendResponse(requestId, settings, text, function() {
         if (watch.isCurrentRequest(requestId)) {
-          rememberChatTurn(userText, text);
+          rememberChatTurn(settings, userText, text);
         }
         watch.finishRequestLifecycle(requestId);
       });
@@ -1129,5 +1220,9 @@ function requestCompletion(requestId, userText) {
 
 module.exports = {
   resetChatHistory: resetChatHistory,
+  listSavedChats: listSavedChats,
+  loadSavedChat: loadSavedChat,
+  deleteSavedChat: deleteSavedChat,
+  deleteAllSavedChats: deleteAllSavedChats,
   requestCompletion: requestCompletion
 };

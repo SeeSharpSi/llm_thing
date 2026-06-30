@@ -5,6 +5,8 @@ var MAX_RESPONSE_CHARS = 6000;
 // Non-NUL style markers are stripped from display and drive watch-side fonts.
 var WATCH_BOLD_ON = '\u0001';
 var WATCH_BOLD_OFF = '\u0002';
+var WATCH_PROMPT_ON = '\u0003';
+var WATCH_PROMPT_OFF = '\u0004';
 var WATCH_SMALL_ON = '\u0005';
 var WATCH_SMALL_OFF = '\u0006';
 var HEALTH_SUMMARY_TIMEOUT_MS = 8000;
@@ -216,6 +218,7 @@ function syncWatchSettings(settings) {
     TouchScrollEnabled: settings.TouchScrollEnabled ? 1 : 0,
     ShowInputContextSize: settings.ShowInputContextSize ? 1 : 0,
     ShowOutputContextSize: settings.ShowOutputContextSize ? 1 : 0,
+    PreserveChats: settings.PreserveChats ? 1 : 0,
     StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0,
     TextColor: settings.TextColor,
     BackgroundColor: settings.BackgroundColor,
@@ -256,6 +259,148 @@ function sendWatchText(requestId, text, includeDone, onDone) {
   }
 
   sendReset(requestId, sendNext);
+}
+
+function sendPastChats(chats, onDone) {
+  var i = 0;
+
+  chats = chats || [];
+  sendMessage({ PastChatsReset: 1 }, function sendNext() {
+    var chat;
+
+    if (i >= chats.length) {
+      sendMessage({ PastChatsDone: chats.length }, onDone);
+      return;
+    }
+
+    chat = chats[i] || {};
+    sendMessage({
+      PastChatsItemId: common.truncate(chat.id || '', 48),
+      PastChatsItemTitle: common.truncate(chat.title || 'Untitled chat', 80)
+    }, function() {
+      i += 1;
+      sendNext();
+    });
+  });
+}
+
+function sendPastChatsError(message) {
+  sendMessage({ PastChatsError: common.truncate(message || 'Saved chats unavailable', CHUNK_SIZE) });
+}
+
+function sendPastChatDeleted(chatId) {
+  sendMessage({ PastChatDeleted: common.truncate(chatId || '', 48) });
+}
+
+function stripWatchMarkers(text) {
+  return String(text || '').replace(/[\u0001-\u0006]/g, '');
+}
+
+function appendTruncatedNotice(text, limit) {
+  var suffix = '\n\n[Truncated]';
+  var value = String(text || '');
+
+  if (value.length + suffix.length <= limit) {
+    return value + suffix;
+  }
+  if (limit <= suffix.length) {
+    return value.substring(0, limit);
+  }
+
+  return value.substring(0, limit - suffix.length) + suffix;
+}
+
+function formatSavedPromptContent(content, maxLength) {
+  if (maxLength <= 2) {
+    return '';
+  }
+
+  return WATCH_PROMPT_ON + formatMarkdownBoldForWatch(content, maxLength - 2) + WATCH_PROMPT_OFF;
+}
+
+function formatSavedAssistantContent(content, maxLength) {
+  if (maxLength <= 0) {
+    return '';
+  }
+
+  return wrapThinkingSmallForWatch(formatMarkdownBoldForWatch(content, maxLength));
+}
+
+function formatSavedChatTranscript(chat, settings) {
+  var messages = chat && chat.messages ? chat.messages : [];
+  var text = '';
+  var i;
+  var message;
+  var content;
+  var segment;
+  var limit = maxResponseCharsForFontSize(settings);
+  var available;
+  var separator;
+  var truncated = false;
+
+  if (limit > MAX_RESPONSE_CHARS) {
+    limit = MAX_RESPONSE_CHARS;
+  }
+
+  for (i = 0; i < messages.length; i += 1) {
+    message = messages[i] || {};
+    content = stripWatchMarkers(message.content || '');
+    if (!content) {
+      continue;
+    }
+
+    separator = text ? '\n\n' : '';
+    available = limit - text.length - separator.length;
+    if (available <= 0) {
+      truncated = true;
+      break;
+    }
+
+    if (message.role === 'user') {
+      segment = formatSavedPromptContent(content, available);
+    } else if (message.role === 'assistant') {
+      segment = formatSavedAssistantContent(content, available);
+    } else {
+      continue;
+    }
+
+    if (segment.length > available) {
+      segment = segment.substring(0, available);
+      truncated = true;
+    }
+
+    if (!segment) {
+      truncated = true;
+      break;
+    }
+
+    text += separator + segment;
+  }
+
+  if (truncated || i < messages.length) {
+    return appendTruncatedNotice(text, limit);
+  }
+
+  return text;
+}
+
+function sendPastChatTranscript(chat, settings, onDone) {
+  var text = formatSavedChatTranscript(chat, settings);
+  var i = 0;
+
+  sendMessage({ PastChatTextReset: 1 }, function sendNext() {
+    if (i >= text.length) {
+      sendMessage({ PastChatTextDone: 1 }, onDone);
+      return;
+    }
+
+    sendMessage({
+      PastChatTextChunk: text.substring(i, i + CHUNK_SIZE)
+    }, function() {
+      i += CHUNK_SIZE;
+      sendNext();
+    });
+  });
 }
 
 function maxResponseCharsForFontSize(settings) {
@@ -614,6 +759,10 @@ module.exports = {
   progressStop: progressStop,
   sendError: sendError,
   sendResponse: sendResponse,
+  sendPastChats: sendPastChats,
+  sendPastChatsError: sendPastChatsError,
+  sendPastChatDeleted: sendPastChatDeleted,
+  sendPastChatTranscript: sendPastChatTranscript,
   requestHealthSummary: requestHealthSummary,
   handleHealthSummaryResponse: handleHealthSummaryResponse
 };
