@@ -39,111 +39,72 @@ function hasToolArgValue(value) {
   return value !== undefined && value !== null && value !== '';
 }
 
-function summarizeToolArgValue(value, maxLength) {
+function formatToolParamValue(value, maxLength) {
+  if (value === null) {
+    return 'null';
+  }
+
+  if (typeof value === 'string') {
+    return common.truncate(value.replace(/\s+/g, ' '), maxLength);
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+
+  return common.truncate(common.safeJson(value), maxLength);
+}
+
+function stripToolNamePrefix(toolName, prefix) {
+  toolName = String(toolName || '');
+  prefix = common.trim(prefix);
+
+  if (!prefix || toolName.substring(0, prefix.length).toLowerCase() !== prefix.toLowerCase()) {
+    return toolName;
+  }
+
+  return toolName.substring(prefix.length).replace(/^[_\-\s:]+/, '');
+}
+
+function formatDisplayToolName(toolName, toolInfo) {
+  var name = String(toolName || 'unknown');
+  var serverLabel;
+
+  if (toolInfo && toolInfo.kind === 'mcp' && toolInfo.server) {
+    serverLabel = toolInfo.server.displayLabel || toolInfo.server.label || '';
+    name = stripToolNamePrefix(name, serverLabel);
+    name = stripToolNamePrefix(name, slugify(serverLabel));
+    name = stripToolNamePrefix(name, toolInfo.server.label);
+  }
+
+  name = common.trim(name.replace(/_+/g, ' ').replace(/\s+/g, ' '));
+  return name || 'unknown';
+}
+
+function formatToolCallDetail(toolName, args, toolInfo) {
   var parts = [];
-  var i;
-
-  if (!hasToolArgValue(value)) {
-    return '';
-  }
-
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-    return common.truncate(value, maxLength);
-  }
-
-  if (Object.prototype.toString.call(value) === '[object Array]') {
-    for (i = 0; i < value.length; i += 1) {
-      if (hasToolArgValue(value[i])) {
-        parts.push(summarizeToolArgValue(value[i], 40));
-      }
-    }
-    return common.truncate(parts.join(', '), maxLength);
-  }
-
-  if (typeof value === 'object') {
-    if (hasToolArgValue(value.query)) {
-      return summarizeToolArgValue(value.query, maxLength);
-    }
-    if (hasToolArgValue(value.text)) {
-      return summarizeToolArgValue(value.text, maxLength);
-    }
-    if (hasToolArgValue(value.input)) {
-      return summarizeToolArgValue(value.input, maxLength);
-    }
-    return common.truncate(common.safeJson(value), maxLength);
-  }
-
-  return common.truncate(String(value), maxLength);
-}
-
-function firstToolArg(args, keys) {
-  var i;
   var key;
-
-  for (i = 0; i < keys.length; i += 1) {
-    key = keys[i];
-    if (hasToolArgValue(args[key])) {
-      return {
-        key: key,
-        value: args[key]
-      };
-    }
-  }
-
-  return null;
-}
-
-function hasOwnToolArgs(args) {
-  var key;
-
-  for (key in args) {
-    if (args.hasOwnProperty(key)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function summarizeToolArgs(args) {
-  var parts = [];
-  var searchArg;
-  var primaryArg;
-  var keys = ['id', 'url', 'time', 'max_results', 'time_range', 'search_depth'];
-  var i;
-  var key;
+  var text;
+  var displayToolName = formatDisplayToolName(toolName, toolInfo);
 
   args = args || {};
   if (typeof args !== 'object') {
-    return summarizeToolArgValue(args, 120);
+    return common.truncate(displayToolName + ': { value:' + formatToolParamValue(args, 100) + ' }', 160);
   }
 
-  if (args.pin && hasToolArgValue(args.pin.id)) {
-    return 'pin: ' + summarizeToolArgValue(args.pin.id, 120);
-  }
-
-  searchArg = firstToolArg(args, ['query', 'q', 'search_query', 'searchQuery', 'search', 'terms', 'keywords', 'prompt', 'text', 'input']);
-  if (searchArg) {
-    return 'query: ' + summarizeToolArgValue(searchArg.value, 120);
-  }
-
-  primaryArg = firstToolArg(args, ['id', 'url']);
-  if (primaryArg) {
-    return primaryArg.key + ': ' + summarizeToolArgValue(primaryArg.value, 120);
-  }
-
-  for (i = 0; i < keys.length; i += 1) {
-    key = keys[i];
-    if (hasToolArgValue(args[key])) {
-      parts.push(key + ': ' + summarizeToolArgValue(args[key], 80));
+  for (key in args) {
+    if (args.hasOwnProperty(key) && args[key] !== undefined) {
+      parts.push(key + ':' + formatToolParamValue(args[key], 80));
     }
   }
 
-  if (!parts.length) {
-    return hasOwnToolArgs(args) ? common.truncate(common.safeJson(args), 100) : 'no arguments';
+  text = displayToolName + ': { ';
+  if (parts.length) {
+    text += parts.join(', ') + ' ';
   }
+  text += '}';
 
-  return parts.join(', ');
+  return common.truncate(text, 160);
 }
 
 function formatToolWords(value) {
@@ -1875,7 +1836,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       next();
     }
 
-    watch.progressToolStart(requestId, formatToolLabel(toolInfo), summarizeToolArgs(args));
+    watch.progressToolStart(requestId, formatToolLabel(toolInfo), formatToolCallDetail(name, args, toolInfo));
     if (toolInfo.kind === 'builtin') {
       callBuiltinTool(toolInfo, args, requestId, finishToolCall);
     } else {
