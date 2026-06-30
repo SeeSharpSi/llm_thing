@@ -527,7 +527,32 @@ function stripThinking(text) {
   return String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/^\s+/, '');
 }
 
-function parseResponse(json, showThinking) {
+function formatToolCallTrace(toolCalls, toolMap) {
+  var lines = [];
+  var i;
+
+  for (i = 0; i < toolCalls.length; i += 1) {
+    lines.push('> ' + tools.formatToolCallLabel(toolCalls[i], toolMap));
+  }
+
+  return lines.join('\n');
+}
+
+function extractResponseThinkingText(json) {
+  var answer = extractResponseText(json);
+  var thinking = extractResponseThinking(json);
+  var blocks = extractThinkingBlocks(answer);
+
+  return appendThinkingText(thinking, blocks.thinking);
+}
+
+function appendToolRoundTrace(base, json, toolCalls, toolMap) {
+  var trace = appendThinkingText(base, extractResponseThinkingText(json));
+
+  return appendThinkingText(trace, formatToolCallTrace(toolCalls, toolMap));
+}
+
+function parseResponse(json, showThinking, extraThinking) {
   var answer = extractResponseText(json);
   var fallback = 'No response text. ' + summarizeResponseShape(json);
   var thinking = extractResponseThinking(json);
@@ -541,6 +566,7 @@ function parseResponse(json, showThinking) {
 
   blocks = extractThinkingBlocks(answer);
   thinking = appendThinkingText(thinking, blocks.thinking);
+  thinking = appendThinkingText(common.trim(extraThinking), thinking);
   answer = blocks.answer;
 
   if (!thinking) {
@@ -902,7 +928,7 @@ function isNativeToolRequestError(error) {
   return /^HTTP (400|404|422)/.test(String(error || ''));
 }
 
-function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, callback) {
+function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
 
   watch.progressSet(requestId, 'thinking', 'tool call limit reached');
@@ -923,12 +949,14 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
       callback(null, 'I am out of tool calls, and the model requested another tool instead of producing a final answer. I can only answer from information already gathered.');
       return;
     }
-    callback(null, parseResponse(json, settings.ShowThinking));
+    callback(null, parseResponse(json, settings.ShowThinking, thinkingTrace));
   });
 }
 
-function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, callback) {
+function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, thinkingTrace, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
+
+  thinkingTrace = thinkingTrace || '';
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
   watch.progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
@@ -956,7 +984,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     updateProgressContextSizes(requestId, settings, json);
     assistantText = extractResponseText(json);
     if (Object.keys(toolMap).length <= 0) {
-      callback(null, parseResponse(json, settings.ShowThinking));
+      callback(null, parseResponse(json, settings.ShowThinking, thinkingTrace));
       return;
     }
     batch = extractToolCallBatch(json, mode, toolMap);
@@ -965,16 +993,18 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     common.logDebug('tool loop source=' + (batch.source || 'none') + ' model textChars=' + assistantText.length + ' toolCalls=' + toolCalls.length);
 
     if (!toolCalls.length) {
-      callback(null, parseResponse(json, settings.ShowThinking));
+      callback(null, parseResponse(json, settings.ShowThinking, thinkingTrace));
       return;
     }
+
+    thinkingTrace = appendToolRoundTrace(thinkingTrace, json, toolCalls, toolMap);
 
     remainingToolCalls = settings.MaxToolCalls - usedToolCalls;
     originalToolCalls = toolCalls;
     if (remainingToolCalls <= 0) {
       skippedResults = buildSkippedToolResults(originalToolCalls);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, skippedResults, true, originalToolCalls.length);
-      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, callback);
+      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
       return;
     }
     noMoreTools = originalToolCalls.length >= remainingToolCalls;
@@ -995,10 +1025,10 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       common.logDebug('tool loop results=' + results.length + ' skipped=' + skippedCount);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
-        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, callback);
+        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
         return;
       }
-      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, callback);
+      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, thinkingTrace, callback);
     });
   });
 }
@@ -1027,7 +1057,7 @@ function requestCompletion(requestId, userText) {
   if (settings.MaxToolCalls <= 0) {
     common.logDebug('tools disabled maxToolCalls=0');
     conversation = buildConversation(settings, userText, '');
-    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, function(completionError, text) {
+    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, '', function(completionError, text) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -1080,7 +1110,7 @@ function requestCompletion(requestId, userText) {
       });
     }
 
-    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'native', 0, 0, function(completionError, text, meta) {
+    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'native', 0, 0, '', function(completionError, text, meta) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -1088,7 +1118,7 @@ function requestCompletion(requestId, userText) {
       if (completionError && meta && meta.nativeUnsupported) {
         common.logDebug('native tool request rejected; retrying text tool fallback');
         conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, false));
-        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, finishCompletion);
+        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, '', finishCompletion);
         return;
       }
 

@@ -131,6 +131,26 @@ function formatToolLabel(toolInfo) {
   return toolInfo.server.displayLabel || toolInfo.server.label;
 }
 
+function formatToolCallLabel(call, toolMap) {
+  var name = String((call && (call.name || call.tool || call.function)) || '');
+  var toolInfo = toolMap && toolMap[name];
+  var serverLabel;
+  var toolLabel;
+
+  if (toolInfo && toolInfo.kind === 'mcp') {
+    serverLabel = common.trim(toolInfo.server.displayLabel) || formatToolWords(toolInfo.server.label || 'MCP');
+    toolLabel = formatToolWords(formatDisplayToolName(toolInfo.toolName || name, toolInfo));
+    return serverLabel + ': ' + (toolLabel || 'Tool');
+  }
+
+  if (toolInfo && toolInfo.kind === 'builtin') {
+    toolLabel = formatToolWords(stripToolNamePrefix(name || toolInfo.name, 'pebble'));
+    return 'Pebble: ' + (toolLabel || formatToolLabel(toolInfo));
+  }
+
+  return formatToolWords(name) || 'Unknown Tool';
+}
+
 function parseJsonOrSse(text) {
   var value = common.trim(text);
   var lines;
@@ -1850,5 +1870,6 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
 module.exports = {
   discoverPhoneTools: discoverPhoneTools,
   runToolCalls: runToolCalls,
+  formatToolCallLabel: formatToolCallLabel,
   formatToolWords: formatToolWords
 };

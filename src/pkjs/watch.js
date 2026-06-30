@@ -5,6 +5,8 @@ var MAX_RESPONSE_CHARS = 6000;
 // Non-NUL style markers are stripped from display and drive watch-side fonts.
 var WATCH_BOLD_ON = '\u0001';
 var WATCH_BOLD_OFF = '\u0002';
+var WATCH_SMALL_ON = '\u0005';
+var WATCH_SMALL_OFF = '\u0006';
 var HEALTH_SUMMARY_TIMEOUT_MS = 8000;
 
 var s_health_summary_request_id = 1;
@@ -294,7 +296,8 @@ function formatMarkdownBoldForWatch(text, maxLength) {
     if (output.length >= maxLength) {
       return false;
     }
-    if (value !== WATCH_BOLD_ON && value !== WATCH_BOLD_OFF) {
+    if (value !== WATCH_BOLD_ON && value !== WATCH_BOLD_OFF &&
+        value !== WATCH_SMALL_ON && value !== WATCH_SMALL_OFF) {
       output += value;
     }
     return true;
@@ -326,6 +329,36 @@ function formatMarkdownBoldForWatch(text, maxLength) {
   }
 
   return output;
+}
+
+function wrapThinkingSmallForWatch(text) {
+  var value = String(text || '');
+  var thinkingPrefix = 'Thinking:\n';
+  var answerMarker = '\n\nAnswer:\n';
+  var answerIndex;
+
+  if (value.substring(0, thinkingPrefix.length) !== thinkingPrefix) {
+    return value;
+  }
+
+  answerIndex = value.indexOf(answerMarker, thinkingPrefix.length);
+  if (answerIndex === -1) {
+    return WATCH_SMALL_ON + value + WATCH_SMALL_OFF;
+  }
+
+  return WATCH_SMALL_ON + value.substring(0, answerIndex) + WATCH_SMALL_OFF + value.substring(answerIndex);
+}
+
+function formatResponseForWatch(text, maxLength) {
+  var value = formatMarkdownBoldForWatch(text, maxLength);
+  var wrapped = wrapThinkingSmallForWatch(value);
+
+  if (wrapped.length <= maxLength) {
+    return wrapped;
+  }
+
+  value = formatMarkdownBoldForWatch(text, maxLength - 2);
+  return wrapThinkingSmallForWatch(value);
 }
 
 function formatProgressHistory(items) {
@@ -479,7 +512,7 @@ function sendError(requestId, message) {
 
 function sendResponse(requestId, settings, text, onDone) {
   var limit = maxResponseCharsForFontSize(settings);
-  var value = formatMarkdownBoldForWatch(truncateResponseForWatch(text, limit), MAX_RESPONSE_CHARS);
+  var value = formatResponseForWatch(truncateResponseForWatch(text, limit), MAX_RESPONSE_CHARS);
 
   progressStop(requestId);
   common.logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + limit);
