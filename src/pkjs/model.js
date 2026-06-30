@@ -98,6 +98,24 @@ function isChatEndpoint(settings) {
   return String(settings.Endpoint || '').toLowerCase().indexOf('/chat/completions') !== -1;
 }
 
+function shouldRequestReasoningSummary(settings, options) {
+  return !!(settings.ShowThinking && !isChatEndpoint(settings) && !(options && options.skipReasoningSummary));
+}
+
+function copyRequestOptions(options) {
+  var result = {};
+  var key;
+
+  options = options || {};
+  for (key in options) {
+    if (options.hasOwnProperty(key)) {
+      result[key] = options[key];
+    }
+  }
+
+  return result;
+}
+
 function buildConversation(settings, userText, toolInstructions) {
   var conversation = [
     { role: 'system', content: buildSystemPrompt(settings, toolInstructions) }
@@ -200,6 +218,10 @@ function buildBody(settings, conversation, options) {
     input: conversation
   };
 
+  if (shouldRequestReasoningSummary(settings, options)) {
+    body.reasoning = { summary: 'auto' };
+  }
+
   if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
     body.tools = buildNativeTools(options.toolDefinitions, false);
   }
@@ -208,75 +230,91 @@ function buildBody(settings, conversation, options) {
 }
 
 function requestModel(settings, conversation, requestId, options, callback) {
-  var request = new XMLHttpRequest();
-  var body;
-
   if (typeof options === 'function') {
     callback = options;
     options = {};
   }
   options = options || {};
-  body = JSON.stringify(buildBody(settings, conversation, options));
 
-  common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (options.nativeTools ? '1' : '0') + ' tools=' + ((options.toolDefinitions && options.toolDefinitions.length) || 0) + ' messages=' + conversation.length + ' bytes=' + body.length);
+  function sendAttempt(skipReasoningSummary) {
+    var request = new XMLHttpRequest();
+    var requestOptions = copyRequestOptions(options);
+    var includeReasoningSummary;
+    var body;
 
-  request.open('POST', settings.Endpoint, true);
-  request.setRequestHeader('Content-Type', 'application/json');
-  request.setRequestHeader('Authorization', 'Bearer ' + settings.ApiKey);
-  request.timeout = 60000;
+    if (skipReasoningSummary) {
+      requestOptions.skipReasoningSummary = true;
+    }
+    includeReasoningSummary = shouldRequestReasoningSummary(settings, requestOptions);
+    body = JSON.stringify(buildBody(settings, conversation, requestOptions));
 
-  if (!watch.trackXhr(requestId, request)) {
-    return;
+    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length);
+
+    request.open('POST', settings.Endpoint, true);
+    request.setRequestHeader('Content-Type', 'application/json');
+    request.setRequestHeader('Authorization', 'Bearer ' + settings.ApiKey);
+    request.timeout = 60000;
+
+    if (!watch.trackXhr(requestId, request)) {
+      return;
+    }
+
+    request.onload = function() {
+      var json;
+
+      watch.untrackXhr(requestId, request);
+      if (!watch.isCurrentRequest(requestId)) {
+        return;
+      }
+
+      common.logDebug('llm response status=' + request.status + ' bytes=' + String(request.responseText || '').length);
+
+      if (request.status < 200 || request.status >= 300) {
+        if (includeReasoningSummary && (request.status === 400 || request.status === 422)) {
+          common.logDebug('reasoning summary rejected; retrying without summary');
+          sendAttempt(true);
+          return;
+        }
+        callback('HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 250), null, { status: request.status });
+        return;
+      }
+
+      try {
+        json = JSON.parse(request.responseText);
+      } catch (e) {
+        callback('Bad JSON response');
+        return;
+      }
+
+      callback(null, json, { status: request.status });
+    };
+
+    request.onerror = function() {
+      watch.untrackXhr(requestId, request);
+      if (!watch.isCurrentRequest(requestId)) {
+        return;
+      }
+      common.logDebug('llm network error');
+      callback('Network error');
+    };
+
+    request.ontimeout = function() {
+      watch.untrackXhr(requestId, request);
+      if (!watch.isCurrentRequest(requestId)) {
+        return;
+      }
+      common.logDebug('llm timeout');
+      callback('Request timed out');
+    };
+
+    request.onabort = function() {
+      watch.untrackXhr(requestId, request);
+    };
+
+    request.send(body);
   }
 
-  request.onload = function() {
-    var json;
-
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-
-    common.logDebug('llm response status=' + request.status + ' bytes=' + String(request.responseText || '').length);
-
-    if (request.status < 200 || request.status >= 300) {
-      callback('HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 250), null, { status: request.status });
-      return;
-    }
-
-    try {
-      json = JSON.parse(request.responseText);
-    } catch (e) {
-      callback('Bad JSON response');
-      return;
-    }
-
-    callback(null, json, { status: request.status });
-  };
-
-  request.onerror = function() {
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-    common.logDebug('llm network error');
-    callback('Network error');
-  };
-
-  request.ontimeout = function() {
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-    common.logDebug('llm timeout');
-    callback('Request timed out');
-  };
-
-  request.onabort = function() {
-    watch.untrackXhr(requestId, request);
-  };
-
-  request.send(body);
+  sendAttempt(false);
 }
 
 function getUsageToken(usage, primaryName, fallbackName) {
@@ -340,12 +378,110 @@ function getFinishReason(json) {
   return '';
 }
 
+function appendThinkingText(base, value) {
+  value = common.trim(value);
+  if (!value) {
+    return base;
+  }
+
+  return base + (base ? '\n\n' : '') + value;
+}
+
+function collectThinkingText(content) {
+  var text = common.collectTextFromContent(content);
+  var i;
+
+  if (text || !content) {
+    return text;
+  }
+
+  if (content.summary) {
+    return collectThinkingText(content.summary);
+  }
+  if (content.reasoning) {
+    return collectThinkingText(content.reasoning);
+  }
+  if (content.reasoning_content) {
+    return collectThinkingText(content.reasoning_content);
+  }
+  if (content.reasoning_details) {
+    return collectThinkingText(content.reasoning_details);
+  }
+  if (content.thinking) {
+    return collectThinkingText(content.thinking);
+  }
+  if (content.thinking_content) {
+    return collectThinkingText(content.thinking_content);
+  }
+
+  if (content.length) {
+    for (i = 0; i < content.length; i += 1) {
+      text += collectThinkingText(content[i]);
+    }
+  }
+
+  return text;
+}
+
+function appendThinkingContent(base, content) {
+  return appendThinkingText(base, collectThinkingText(content));
+}
+
+function extractMessageThinking(message) {
+  var thinking = '';
+
+  if (!message) {
+    return '';
+  }
+
+  thinking = appendThinkingContent(thinking, message.reasoning_content);
+  thinking = appendThinkingContent(thinking, message.reasoning);
+  thinking = appendThinkingContent(thinking, message.reasoning_details);
+  thinking = appendThinkingContent(thinking, message.thinking);
+  thinking = appendThinkingContent(thinking, message.thinking_content);
+
+  return thinking;
+}
+
+function extractResponseThinking(json) {
+  var thinking = extractMessageThinking(getChoiceMessage(json));
+  var i;
+  var item;
+
+  if (json.output && json.output.length) {
+    for (i = 0; i < json.output.length; i += 1) {
+      item = json.output[i];
+      if (item.type === 'reasoning' || item.reasoning) {
+        thinking = appendThinkingContent(thinking, item.summary || item.content || item.reasoning || item);
+      }
+    }
+  }
+
+  return thinking;
+}
+
+function extractThinkingBlocks(text) {
+  var thinking = '';
+  var source = String(text || '');
+  var pattern = /<think>([\s\S]*?)<\/think>/gi;
+  var match;
+
+  while ((match = pattern.exec(source)) !== null) {
+    thinking = appendThinkingText(thinking, match[1]);
+  }
+
+  return {
+    thinking: thinking,
+    answer: stripThinking(source)
+  };
+}
+
 function summarizeResponseShape(json) {
   var message = getChoiceMessage(json);
   var content = message ? message.content : null;
   var contentType = content === null ? 'null' : typeof content;
   var contentLength = typeof content === 'string' ? content.length : (content && content.length ? content.length : 0);
-  var reasoningLength = message && message.reasoning_content ? String(message.reasoning_content).length : 0;
+  var reasoningLength = extractMessageThinking(message).length;
 
   return 'finish=' + getFinishReason(json) + ' contentType=' + contentType + ' contentLen=' + contentLength + ' reasoningLen=' + reasoningLength;
 }
@@ -368,7 +504,6 @@ function extractResponseText(json) {
     answer = answer || common.collectTextFromContent(message.content);
     answer = answer || common.collectTextFromContent(message.output_text);
     answer = answer || common.collectTextFromContent(message.text);
-    answer = answer || common.collectTextFromContent(message.reasoning_content);
   }
 
   if (json.output && json.output.length) {
@@ -394,28 +529,19 @@ function stripThinking(text) {
 
 function parseResponse(json, showThinking) {
   var answer = extractResponseText(json);
-  var thinking = '';
-  var i;
-  var item;
+  var fallback = 'No response text. ' + summarizeResponseShape(json);
+  var thinking = extractResponseThinking(json);
+  var blocks;
 
-  if (getChoiceMessage(json)) {
-    thinking = thinking || getChoiceMessage(json).reasoning_content || getChoiceMessage(json).reasoning || '';
-  }
-
-  if (json.output && json.output.length) {
-    for (i = 0; i < json.output.length; i += 1) {
-      item = json.output[i];
-      if (item.type === 'reasoning' || item.reasoning) {
-        thinking += common.collectTextFromContent(item.summary || item.content || item.reasoning);
-      }
-    }
-  }
-
-  answer = answer || ('No response text. ' + summarizeResponseShape(json));
+  answer = answer || fallback;
 
   if (!showThinking) {
     return stripThinking(answer);
   }
+
+  blocks = extractThinkingBlocks(answer);
+  thinking = appendThinkingText(thinking, blocks.thinking);
+  answer = blocks.answer;
 
   if (!thinking) {
     return answer;

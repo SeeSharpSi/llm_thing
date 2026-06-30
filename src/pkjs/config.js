@@ -66,7 +66,7 @@ module.exports = [
         "type": "toggle",
         "messageKey": "ShowThinking",
         "label": "Show Thinking",
-        "description": "Only shown if the endpoint returns visible reasoning or <think> blocks.",
+        "description": "Responses API requests reasoning summaries. Chat completions show provider-visible reasoning fields or <think> blocks only.",
         "defaultValue": false
       },
       {
