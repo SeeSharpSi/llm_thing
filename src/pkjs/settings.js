@@ -9,6 +9,8 @@ var DEFAULT_SETTINGS = {
   Model: 'gpt-4.1-mini',
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
   ShowThinking: false,
+  ShowInputContextSize: false,
+  ShowOutputContextSize: false,
   WebSearchEnabled: false,
   GeolocationToolEnabled: false,
   TimelineToolEnabled: false,
@@ -88,6 +90,8 @@ function extend(base, extra) {
   }
 
   result.ShowThinking = result.ShowThinking === true || result.ShowThinking === 1 || result.ShowThinking === '1';
+  result.ShowInputContextSize = result.ShowInputContextSize === true || result.ShowInputContextSize === 1 || result.ShowInputContextSize === '1';
+  result.ShowOutputContextSize = result.ShowOutputContextSize === true || result.ShowOutputContextSize === 1 || result.ShowOutputContextSize === '1';
   result.WebSearchEnabled = result.WebSearchEnabled === true || result.WebSearchEnabled === 1 || result.WebSearchEnabled === '1';
   result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';

@@ -279,6 +279,51 @@ function requestModel(settings, conversation, requestId, options, callback) {
   request.send(body);
 }
 
+function getUsageToken(usage, primaryName, fallbackName) {
+  var value;
+  var number;
+
+  if (!usage) {
+    return null;
+  }
+
+  value = usage[primaryName];
+  if (value === undefined || value === null) {
+    value = usage[fallbackName];
+  }
+
+  number = parseInt(value, 10);
+  if (isNaN(number) || number < 0) {
+    return null;
+  }
+
+  return number;
+}
+
+function updateProgressContextSizes(requestId, settings, json) {
+  var usage = json && json.usage;
+  var inputTokens;
+  var outputTokens;
+  var inputText = '';
+  var outputText = '';
+
+  if (!settings.ShowInputContextSize && !settings.ShowOutputContextSize) {
+    return;
+  }
+
+  inputTokens = getUsageToken(usage, 'input_tokens', 'prompt_tokens');
+  outputTokens = getUsageToken(usage, 'output_tokens', 'completion_tokens');
+
+  if (settings.ShowInputContextSize && inputTokens !== null) {
+    inputText = String(inputTokens);
+  }
+  if (settings.ShowOutputContextSize && outputTokens !== null) {
+    outputText = String(outputTokens);
+  }
+
+  watch.progressSetContextSizes(requestId, inputText, outputText);
+}
+
 function getChoiceMessage(json) {
   if (json.choices && json.choices.length && json.choices[0].message) {
     return json.choices[0].message;
@@ -745,6 +790,7 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
       callback(error);
       return;
     }
+    updateProgressContextSizes(requestId, settings, json);
     assistantText = extractResponseText(json);
     batch = extractToolCallBatch(json, mode, toolMap);
     if (batch.calls.length) {
@@ -781,6 +827,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       return;
     }
 
+    updateProgressContextSizes(requestId, settings, json);
     assistantText = extractResponseText(json);
     if (Object.keys(toolMap).length <= 0) {
       callback(null, parseResponse(json, settings.ShowThinking));

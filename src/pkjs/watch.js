@@ -20,7 +20,9 @@ var s_progress = {
   detail: '',
   toolHistory: [],
   currentTool: '',
-  currentToolRemembered: false
+  currentToolRemembered: false,
+  inputContextSize: '',
+  outputContextSize: ''
 };
 
 function requestKey(requestId) {
@@ -210,6 +212,8 @@ function syncWatchSettings(settings) {
     BuzzStrength: settings.BuzzStrength,
     ScrollLines: settings.ScrollLines,
     TouchScrollEnabled: settings.TouchScrollEnabled ? 1 : 0,
+    ShowInputContextSize: settings.ShowInputContextSize ? 1 : 0,
+    ShowOutputContextSize: settings.ShowOutputContextSize ? 1 : 0,
     StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0,
     TextColor: settings.TextColor,
     BackgroundColor: settings.BackgroundColor,
@@ -366,7 +370,9 @@ function sendProgressState(requestId, current, detail, reset, onDone) {
     RequestId: requestId,
     ProgressText: common.truncate(current || 'thinking', 80),
     ProgressDetail: common.truncate(detail || '', 160),
-    ProgressHistory: formatProgressHistory(s_progress.toolHistory)
+    ProgressHistory: formatProgressHistory(s_progress.toolHistory),
+    ProgressInputContextSize: common.truncate(s_progress.inputContextSize || '', 24),
+    ProgressOutputContextSize: common.truncate(s_progress.outputContextSize || '', 24)
   };
 
   if (reset) {
@@ -384,6 +390,8 @@ function progressStart(requestId, current, detail) {
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
   s_progress.currentToolRemembered = false;
+  s_progress.inputContextSize = '';
+  s_progress.outputContextSize = '';
   sendProgressState(requestId, s_progress.current, s_progress.detail, true);
 }
 
@@ -415,6 +423,23 @@ function progressSet(requestId, current, detail) {
   sendProgressState(requestId, s_progress.current, s_progress.detail, false);
 }
 
+function progressSetContextSizes(requestId, inputText, outputText) {
+  inputText = inputText || '';
+  outputText = outputText || '';
+
+  if (!s_progress.active || s_progress.requestId !== requestId) {
+    return;
+  }
+
+  if (s_progress.inputContextSize === inputText && s_progress.outputContextSize === outputText) {
+    return;
+  }
+
+  s_progress.inputContextSize = inputText;
+  s_progress.outputContextSize = outputText;
+  sendProgressState(requestId, s_progress.current, s_progress.detail, false);
+}
+
 function progressDone(requestId) {
   var toolName;
 
@@ -440,6 +465,8 @@ function progressStop(requestId) {
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
   s_progress.currentToolRemembered = false;
+  s_progress.inputContextSize = '';
+  s_progress.outputContextSize = '';
 }
 
 function sendError(requestId, message) {
@@ -549,6 +576,7 @@ module.exports = {
   progressStart: progressStart,
   progressToolStart: progressToolStart,
   progressSet: progressSet,
+  progressSetContextSizes: progressSetContextSizes,
   progressDone: progressDone,
   progressStop: progressStop,
   sendError: sendError,

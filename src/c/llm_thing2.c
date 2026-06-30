@@ -11,6 +11,8 @@
 #define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
 #define PERSIST_KEY_SCROLL_LINES 4
 #define PERSIST_KEY_TOUCH_SCROLL_ENABLED 5
+#define PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE 6
+#define PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE 7
 #define PERSIST_KEY_TEXT_COLOR 10
 #define PERSIST_KEY_BACKGROUND_COLOR 11
 #define PERSIST_KEY_PROMPT_BACKGROUND_COLOR 12
@@ -52,6 +54,9 @@
 #define PROGRESS_LOADING_MARGIN 16
 #define PROGRESS_LOADING_TIMER_MS 80
 #define PROGRESS_LOADING_STEP 6
+#define PROGRESS_CONTEXT_BUFFER_SIZE 32
+#define PROGRESS_CONTEXT_HEIGHT 18
+#define PROGRESS_CONTEXT_SIDE_PADDING 2
 #define PROGRESS_TEXT_SIDE_PADDING 6
 #define PROGRESS_TEXT_GAP 4
 #define PROGRESS_TITLE_MIN_HEIGHT 32
@@ -78,6 +83,8 @@ static Layer *s_progress_layer;
 static TextLayer *s_progress_history_layer;
 static TextLayer *s_progress_title_layer;
 static TextLayer *s_progress_detail_layer;
+static TextLayer *s_progress_input_context_layer;
+static TextLayer *s_progress_output_context_layer;
 static Layer *s_progress_loading_layer;
 static AppTimer *s_progress_loading_timer;
 static AppTimer *s_quick_launch_dictation_timer;
@@ -90,6 +97,8 @@ static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
 static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
+static char s_progress_input_context[PROGRESS_CONTEXT_BUFFER_SIZE];
+static char s_progress_output_context[PROGRESS_CONTEXT_BUFFER_SIZE];
 #if defined(PBL_HEALTH)
 static char s_health_summary_json[HEALTH_SUMMARY_JSON_SIZE];
 static char s_health_summary_unavailable[HEALTH_SUMMARY_UNAVAILABLE_SIZE];
@@ -119,6 +128,8 @@ static bool s_launched_from_quick_launch;
 static bool s_quick_launch_dictation_started;
 static bool s_response_truncated;
 static bool s_progress_mode;
+static bool s_show_input_context_size;
+static bool s_show_output_context_size;
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
 static bool s_home_screen_visible;
@@ -239,6 +250,39 @@ static uint32_t prv_uint32_from_tuple(Tuple *tuple, uint32_t fallback) {
   return tuple->value->uint32;
 }
 
+static void prv_update_progress_context_layers(void) {
+  if (s_progress_input_context_layer) {
+    text_layer_set_text(s_progress_input_context_layer, s_progress_input_context);
+    layer_set_hidden(text_layer_get_layer(s_progress_input_context_layer),
+        !s_progress_mode || !s_show_input_context_size || s_progress_input_context[0] == '\0');
+  }
+  if (s_progress_output_context_layer) {
+    text_layer_set_text(s_progress_output_context_layer, s_progress_output_context);
+    layer_set_hidden(text_layer_get_layer(s_progress_output_context_layer),
+        !s_progress_mode || !s_show_output_context_size || s_progress_output_context[0] == '\0');
+  }
+}
+
+static void prv_apply_show_input_context_size(int enabled, bool should_persist) {
+  s_show_input_context_size = enabled != 0;
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE, s_show_input_context_size ? 1 : 0);
+  }
+
+  prv_update_progress_context_layers();
+}
+
+static void prv_apply_show_output_context_size(int enabled, bool should_persist) {
+  s_show_output_context_size = enabled != 0;
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE, s_show_output_context_size ? 1 : 0);
+  }
+
+  prv_update_progress_context_layers();
+}
+
 static void prv_apply_buzz_strength(int strength, bool should_persist) {
   s_buzz_strength = prv_normalize_buzz_strength(strength);
 
@@ -307,6 +351,12 @@ static void prv_apply_text_color(uint32_t hex, bool should_persist) {
   }
   if (s_progress_history_layer) {
     text_layer_set_text_color(s_progress_history_layer, s_text_color);
+  }
+  if (s_progress_input_context_layer) {
+    text_layer_set_text_color(s_progress_input_context_layer, s_text_color);
+  }
+  if (s_progress_output_context_layer) {
+    text_layer_set_text_color(s_progress_output_context_layer, s_text_color);
   }
   if (s_text_layer) {
     layer_mark_dirty(s_text_layer);
@@ -1092,6 +1142,7 @@ static void prv_set_progress_visible(bool visible) {
   if (s_progress_layer) {
     layer_set_hidden(s_progress_layer, !visible);
   }
+  prv_update_progress_context_layers();
 
   if (visible) {
     prv_start_progress_loading();
@@ -1196,6 +1247,16 @@ static void prv_set_progress_detail(const char *text) {
 static void prv_set_progress_history(const char *text) {
   snprintf(s_progress_history, sizeof(s_progress_history), "%s", text ? text : "");
   prv_update_progress_text();
+}
+
+static void prv_set_progress_input_context(const char *text) {
+  snprintf(s_progress_input_context, sizeof(s_progress_input_context), "%s", text ? text : "");
+  prv_update_progress_context_layers();
+}
+
+static void prv_set_progress_output_context(const char *text) {
+  snprintf(s_progress_output_context, sizeof(s_progress_output_context), "%s", text ? text : "");
+  prv_update_progress_context_layers();
 }
 
 static bool prv_trim_oldest_turn(void) {
@@ -1499,8 +1560,11 @@ static void prv_progress_reset(void) {
   snprintf(s_progress_title, sizeof(s_progress_title), "thinking");
   s_progress_detail[0] = '\0';
   s_progress_history[0] = '\0';
+  s_progress_input_context[0] = '\0';
+  s_progress_output_context[0] = '\0';
   prv_update_scroll_text();
   prv_update_progress_text();
+  prv_update_progress_context_layers();
   prv_set_progress_visible(true);
   scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
 }
@@ -1757,6 +1821,20 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 #endif
 
+  Tuple *show_input_context_size_t = dict_find(iter, MESSAGE_KEY_ShowInputContextSize);
+  if (show_input_context_size_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "show input context size update");
+    prv_apply_show_input_context_size(prv_int_from_tuple(show_input_context_size_t,
+        s_show_input_context_size ? 1 : 0), true);
+  }
+
+  Tuple *show_output_context_size_t = dict_find(iter, MESSAGE_KEY_ShowOutputContextSize);
+  if (show_output_context_size_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "show output context size update");
+    prv_apply_show_output_context_size(prv_int_from_tuple(show_output_context_size_t,
+        s_show_output_context_size ? 1 : 0), true);
+  }
+
   Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
   if (start_dictation_quick_launch_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation setting update");
@@ -1844,6 +1922,24 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       prv_progress_reset();
     }
     prv_set_progress_history(progress_history_t->value->cstring);
+  }
+
+  Tuple *progress_input_context_t = dict_find(iter, MESSAGE_KEY_ProgressInputContextSize);
+  if (progress_input_context_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress input context len=%u", (unsigned int)strlen(progress_input_context_t->value->cstring));
+    if (!s_progress_mode) {
+      prv_progress_reset();
+    }
+    prv_set_progress_input_context(progress_input_context_t->value->cstring);
+  }
+
+  Tuple *progress_output_context_t = dict_find(iter, MESSAGE_KEY_ProgressOutputContextSize);
+  if (progress_output_context_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress output context len=%u", (unsigned int)strlen(progress_output_context_t->value->cstring));
+    if (!s_progress_mode) {
+      prv_progress_reset();
+    }
+    prv_set_progress_output_context(progress_output_context_t->value->cstring);
   }
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
@@ -1945,6 +2041,26 @@ static void prv_window_load(Window *window) {
   layer_set_update_proc(s_progress_loading_layer, prv_progress_loading_update_proc);
   layer_add_child(s_progress_layer, s_progress_loading_layer);
 
+  s_progress_input_context_layer = text_layer_create(GRect(PROGRESS_CONTEXT_SIDE_PADDING, 0,
+      (bounds.size.w / 2) - PROGRESS_CONTEXT_SIDE_PADDING, PROGRESS_CONTEXT_HEIGHT));
+  text_layer_set_background_color(s_progress_input_context_layer, GColorClear);
+  text_layer_set_text_color(s_progress_input_context_layer, s_text_color);
+  text_layer_set_font(s_progress_input_context_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
+  text_layer_set_overflow_mode(s_progress_input_context_layer, GTextOverflowModeTrailingEllipsis);
+  text_layer_set_text_alignment(s_progress_input_context_layer, GTextAlignmentLeft);
+  layer_set_hidden(text_layer_get_layer(s_progress_input_context_layer), true);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_input_context_layer));
+
+  s_progress_output_context_layer = text_layer_create(GRect(bounds.size.w / 2, 0,
+      (bounds.size.w / 2) - PROGRESS_CONTEXT_SIDE_PADDING, PROGRESS_CONTEXT_HEIGHT));
+  text_layer_set_background_color(s_progress_output_context_layer, GColorClear);
+  text_layer_set_text_color(s_progress_output_context_layer, s_text_color);
+  text_layer_set_font(s_progress_output_context_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
+  text_layer_set_overflow_mode(s_progress_output_context_layer, GTextOverflowModeTrailingEllipsis);
+  text_layer_set_text_alignment(s_progress_output_context_layer, GTextAlignmentRight);
+  layer_set_hidden(text_layer_get_layer(s_progress_output_context_layer), true);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_output_context_layer));
+
   prv_set_status("Ready");
   prv_show_home_screen();
 
@@ -1962,6 +2078,8 @@ static void prv_window_unload(Window *window) {
 #endif
 
   prv_stop_progress_loading();
+  text_layer_destroy(s_progress_output_context_layer);
+  text_layer_destroy(s_progress_input_context_layer);
   layer_destroy(s_progress_loading_layer);
   text_layer_destroy(s_progress_detail_layer);
   text_layer_destroy(s_progress_title_layer);
@@ -1990,6 +2108,12 @@ static void prv_init(void) {
     s_touch_scroll_enabled = persist_read_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED) != 0;
   }
 #endif
+  if (persist_exists(PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE)) {
+    s_show_input_context_size = persist_read_int(PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE) != 0;
+  }
+  if (persist_exists(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE)) {
+    s_show_output_context_size = persist_read_int(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE) != 0;
+  }
 
   prv_apply_text_color(persist_exists(PERSIST_KEY_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_TEXT_COLOR) : TEXT_COLOR_DEFAULT, false);
   prv_apply_background_color(persist_exists(PERSIST_KEY_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_BACKGROUND_COLOR) : BACKGROUND_COLOR_DEFAULT, false);

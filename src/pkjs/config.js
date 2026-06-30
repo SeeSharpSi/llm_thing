@@ -71,6 +71,20 @@ module.exports = [
       },
       {
         "type": "toggle",
+        "messageKey": "ShowInputContextSize",
+        "label": "Show Input Context Size",
+        "description": "Show returned input token count in the thinking screen top-left corner.",
+        "defaultValue": false
+      },
+      {
+        "type": "toggle",
+        "messageKey": "ShowOutputContextSize",
+        "label": "Show Output Context Size",
+        "description": "Show returned output token count in the thinking screen top-right corner.",
+        "defaultValue": false
+      },
+      {
+        "type": "toggle",
         "messageKey": "WebSearchEnabled",
         "label": "Web Search",
         "description": "Ask models with web access to search when useful.",
