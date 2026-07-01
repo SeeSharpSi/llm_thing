@@ -245,11 +245,28 @@ function normalizeMcpHeaders(value) {
   return headers;
 }
 
+function parseOptionalToolCallLimit(value) {
+  var text = String(value === undefined || value === null ? '' : value).replace(/^\s+|\s+$/g, '');
+  var number;
+
+  if (!text) {
+    return null;
+  }
+
+  number = parseInt(text, 10);
+  if (isNaN(number) || number < 0) {
+    return null;
+  }
+
+  return number;
+}
+
 function parseMcpServers(settings) {
   var parsed;
   var servers = [];
   var i;
   var server;
+  var maxToolCalls;
 
   try {
     parsed = JSON.parse(settings.McpServersJson || '[]');
@@ -264,17 +281,20 @@ function parseMcpServers(settings) {
   for (i = 0; i < parsed.length; i += 1) {
     server = parsed[i] || {};
     if (server.enabled === true || server.enabled === 1 || server.enabled === '1') {
+      maxToolCalls = parseOptionalToolCallLimit(server.maxToolCalls);
       server = {
         displayLabel: common.trim(server.label),
         label: slugify(server.label),
+        limitKey: slugify(server.label) + '_' + i,
         url: common.trim(server.url),
         description: common.trim(server.description),
         allowedTools: common.splitCsv(server.allowedTools),
+        maxToolCalls: maxToolCalls,
         authorization: common.trim(server.authorization),
         headers: normalizeMcpHeaders(server.headers),
         sessionId: ''
       };
-      if (server.label && server.url) {
+      if (server.label && server.url && server.maxToolCalls !== 0) {
         servers.push(server);
       }
     }
@@ -490,7 +510,7 @@ function discoverMcpTools(settings, requestId, callback) {
 
       tools.push({
         name: exposedName,
-        description: common.trim(tool.description || server.description || 'MCP tool'),
+        description: common.trim(tool.description || server.description || 'MCP tool') + (server.maxToolCalls !== null ? ' This MCP server may be called at most ' + server.maxToolCalls + ' time(s) this request.' : ''),
         parameters: tool.inputSchema || { type: 'object', properties: {} }
       });
       toolMap[exposedName] = {

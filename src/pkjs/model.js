@@ -890,19 +890,90 @@ function formatToolResultOutput(result) {
   return common.safeJson({ result: result.result });
 }
 
-function buildSkippedToolResults(toolCalls) {
+function buildSkippedToolResult(call, index, error) {
+  call = call || {};
+  return {
+    id: call.id || call.call_id || call.name || String(index + 1),
+    call_id: call.call_id || call.id || call.name || String(index + 1),
+    name: call.name || 'unknown',
+    error: error || 'Tool call budget exhausted'
+  };
+}
+
+function buildSkippedToolResults(toolCalls, error) {
   var results = [];
   var i;
+
+  for (i = 0; i < toolCalls.length; i += 1) {
+    results.push(buildSkippedToolResult(toolCalls[i], i, error));
+  }
+
+  return results;
+}
+
+function planToolCallsByBudget(toolCalls, toolMap, remainingToolCalls, mcpToolCallCounts) {
+  var plan = [];
+  var runnableToolCalls = [];
+  var skippedCount = 0;
+  var consumedGlobal = 0;
+  var i;
   var call;
+  var toolInfo;
+  var server;
+  var limit;
+  var limitKey;
+  var used;
 
   for (i = 0; i < toolCalls.length; i += 1) {
     call = toolCalls[i] || {};
-    results.push({
-      id: call.id || call.call_id || call.name || String(i + 1),
-      call_id: call.call_id || call.id || call.name || String(i + 1),
-      name: call.name || 'unknown',
-      error: 'Tool call budget exhausted'
-    });
+
+    if (consumedGlobal >= remainingToolCalls) {
+      plan.push({ result: buildSkippedToolResult(call, i, 'Tool call budget exhausted') });
+      skippedCount += 1;
+      continue;
+    }
+
+    consumedGlobal += 1;
+    toolInfo = toolMap[call.name];
+    if (toolInfo && toolInfo.kind === 'mcp' && toolInfo.server && toolInfo.server.maxToolCalls !== null && toolInfo.server.maxToolCalls !== undefined) {
+      server = toolInfo.server;
+      limit = server.maxToolCalls;
+      limitKey = server.limitKey || server.label || server.displayLabel || 'mcp';
+      used = mcpToolCallCounts[limitKey] || 0;
+      if (used >= limit) {
+        plan.push({ result: buildSkippedToolResult(call, i, 'MCP server tool call budget exhausted') });
+        skippedCount += 1;
+        continue;
+      }
+      mcpToolCallCounts[limitKey] = used + 1;
+    }
+
+    runnableToolCalls.push(call);
+    plan.push({ run: true, call: call, index: i });
+  }
+
+  return {
+    plan: plan,
+    toolCalls: runnableToolCalls,
+    skippedCount: skippedCount,
+    noMoreTools: remainingToolCalls <= 0 || toolCalls.length >= remainingToolCalls
+  };
+}
+
+function mergePlannedToolResults(plan, runnableResults) {
+  var results = [];
+  var runnableIndex = 0;
+  var i;
+  var item;
+
+  for (i = 0; i < plan.length; i += 1) {
+    item = plan[i] || {};
+    if (item.run) {
+      results.push(runnableResults[runnableIndex] || buildSkippedToolResult(item.call, item.index || i, 'Tool call did not return a result'));
+      runnableIndex += 1;
+    } else {
+      results.push(item.result);
+    }
   }
 
   return results;
@@ -1044,9 +1115,10 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
   });
 }
 
-function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, thinkingTrace, callback) {
+function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, mcpToolCallCounts, thinkingTrace, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
 
+  mcpToolCallCounts = mcpToolCallCounts || {};
   thinkingTrace = thinkingTrace || '';
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
@@ -1056,11 +1128,11 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     var batch;
     var toolCalls;
     var originalToolCalls;
-    var skippedToolCalls;
-    var skippedResults;
     var remainingToolCalls;
     var noMoreTools;
     var skippedCount;
+    var skippedResults;
+    var budgetPlan;
 
     if (!watch.isCurrentRequest(requestId)) {
       return;
@@ -1098,28 +1170,25 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
       return;
     }
-    noMoreTools = originalToolCalls.length >= remainingToolCalls;
-    skippedCount = 0;
-    skippedToolCalls = [];
-    if (originalToolCalls.length > remainingToolCalls) {
-      skippedCount = originalToolCalls.length - remainingToolCalls;
-      common.logDebug('tool loop truncating toolCalls=' + originalToolCalls.length + ' remaining=' + remainingToolCalls);
-      skippedToolCalls = originalToolCalls.slice(remainingToolCalls);
-      toolCalls = originalToolCalls.slice(0, remainingToolCalls);
+    budgetPlan = planToolCallsByBudget(originalToolCalls, toolMap, remainingToolCalls, mcpToolCallCounts);
+    toolCalls = budgetPlan.toolCalls;
+    noMoreTools = budgetPlan.noMoreTools;
+    skippedCount = budgetPlan.skippedCount;
+    if (skippedCount > 0) {
+      common.logDebug('tool loop budget skipped=' + skippedCount + ' runnable=' + toolCalls.length + ' requested=' + originalToolCalls.length + ' remaining=' + remainingToolCalls);
     }
-    skippedResults = buildSkippedToolResults(skippedToolCalls);
     tools.runToolCalls(requestId, toolCalls, toolMap, function(results) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
-      results = results.concat(skippedResults);
+      results = mergePlannedToolResults(budgetPlan.plan, results);
       common.logDebug('tool loop results=' + results.length + ' skipped=' + skippedCount);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
         requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
         return;
       }
-      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, thinkingTrace, callback);
+      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, callback);
     });
   });
 }
@@ -1148,7 +1217,7 @@ function requestCompletion(requestId, userText) {
   if (settings.MaxToolCalls <= 0) {
     common.logDebug('tools disabled maxToolCalls=0');
     conversation = buildConversation(settings, userText, '');
-    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, '', function(completionError, text) {
+    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '', function(completionError, text) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -1201,7 +1270,7 @@ function requestCompletion(requestId, userText) {
       });
     }
 
-    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'native', 0, 0, '', function(completionError, text, meta) {
+    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'native', 0, 0, {}, '', function(completionError, text, meta) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -1209,7 +1278,7 @@ function requestCompletion(requestId, userText) {
       if (completionError && meta && meta.nativeUnsupported) {
         common.logDebug('native tool request rejected; retrying text tool fallback');
         conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, false));
-        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, '', finishCompletion);
+        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, {}, '', finishCompletion);
         return;
       }
 
