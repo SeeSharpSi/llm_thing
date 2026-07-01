@@ -327,12 +327,12 @@ function requestModel(settings, conversation, requestId, options, callback) {
     includeReasoningSummary = shouldRequestReasoningSummary(settings, requestOptions);
     body = JSON.stringify(buildBody(settings, conversation, requestOptions));
 
-    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length);
+    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + settings.RequestTimeoutMs);
 
     request.open('POST', settings.Endpoint, true);
     request.setRequestHeader('Content-Type', 'application/json');
     request.setRequestHeader('Authorization', 'Bearer ' + settings.ApiKey);
-    request.timeout = 60000;
+    request.timeout = settings.RequestTimeoutMs;
 
     if (!watch.trackXhr(requestId, request)) {
       return;

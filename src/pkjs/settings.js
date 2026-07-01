@@ -1,5 +1,6 @@
 var SETTINGS_KEY = 'llm_thing_settings';
 var DEFAULT_MAX_TOOL_CALLS = 4;
+var DEFAULT_REQUEST_TIMEOUT_MS = 60000;
 var MAX_CHAT_HISTORY_MESSAGES = 16;
 var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
 
@@ -7,6 +8,7 @@ var DEFAULT_SETTINGS = {
   Endpoint: 'https://api.openai.com/v1/responses',
   ApiKey: '',
   Model: 'gpt-4.1-mini',
+  RequestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
   ShowThinking: false,
   ShowInputContextSize: false,
@@ -103,6 +105,7 @@ function extend(base, extra) {
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
   result.TouchScrollEnabled = result.TouchScrollEnabled === true || result.TouchScrollEnabled === 1 || result.TouchScrollEnabled === '1';
   result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
+  result.RequestTimeoutMs = minNumber(result.RequestTimeoutMs, 1000, DEFAULT_REQUEST_TIMEOUT_MS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
     result.FontSize = 18;
@@ -205,6 +208,7 @@ function collectTextFromContent(content) {
 module.exports = {
   DEFAULT_SETTINGS: DEFAULT_SETTINGS,
   DEFAULT_MAX_TOOL_CALLS: DEFAULT_MAX_TOOL_CALLS,
+  DEFAULT_REQUEST_TIMEOUT_MS: DEFAULT_REQUEST_TIMEOUT_MS,
   MAX_CHAT_HISTORY_MESSAGES: MAX_CHAT_HISTORY_MESSAGES,
   MAX_CHAT_HISTORY_MESSAGE_CHARS: MAX_CHAT_HISTORY_MESSAGE_CHARS,
   logDebug: logDebug,

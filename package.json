@@ -87,7 +87,8 @@
       "HealthStartUnix",
       "HealthEndUnix",
       "HealthIncludeHeartRate",
-      "TouchScrollEnabled"
+      "TouchScrollEnabled",
+      "RequestTimeoutMs"
     ],
     "resources": {
       "media": []

@@ -42,6 +42,18 @@ module.exports = [
         "attributes": {
           "placeholder": "gpt-4.1-mini"
         }
+      },
+      {
+        "type": "input",
+        "messageKey": "RequestTimeoutMs",
+        "label": "Request Timeout (ms)",
+        "description": "Maximum wait for each model API request. Tool requests use their own timeouts.",
+        "defaultValue": 60000,
+        "attributes": {
+          "type": "number",
+          "min": 1000,
+          "step": 1000
+        }
       }
     ]
   },
