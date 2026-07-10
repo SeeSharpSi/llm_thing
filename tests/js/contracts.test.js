@@ -97,6 +97,7 @@ test('generated message-key artifacts are internally consistent', function() {
 
   assert.deepEqual(Object.keys(appInfo.appKeys).sort(), expected);
   assert.deepEqual(headerKeys.sort(), generatedKeys);
+  assert.deepEqual(generatedKeys, expected);
   generatedKeys.forEach(function(key) {
     assert.ok(expected.indexOf(key) !== -1, key + ' generated but undeclared');
   });
@@ -104,8 +105,6 @@ test('generated message-key artifacts are internally consistent', function() {
     assert.ok(generatedKeys.indexOf(key) !== -1, key + ' used by C but not generated');
   });
 });
-
-test.todo('all manifest message keys appear in generated C and JavaScript maps');
 
 test('watch text protocol marker constants match C renderer', function() {
   var watchSource = fs.readFileSync(path.join(root, 'src/pkjs/watch.js'), 'utf8');

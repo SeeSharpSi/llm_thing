@@ -159,6 +159,71 @@ test('health summary request handles response and timeout', function() {
   }
 });
 
-test.todo('response chunks use UTF-8 byte limits and never split surrogate pairs');
-test.todo('AppMessage failure terminates completion lifecycle exactly once');
-test.todo('mismatched health RequestId leaves matching pending request active');
+test('response chunks use UTF-8 byte limits and never split surrogate pairs', function() {
+  var watch = freshWatch();
+  var text = new Array(301).join('漢') + new Array(151).join('😀');
+  var chunks;
+
+  watch.beginRequestLifecycle(11);
+  watch.sendResponse(11, { FontSize: 18 }, text);
+  chunks = global.Pebble.messages.filter(function(message) {
+    return message.ResponseChunk !== undefined;
+  });
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(function(message) {
+    return Buffer.byteLength(message.ResponseChunk, 'utf8') <= 400 &&
+      !/[\ud800-\udbff]$/.test(message.ResponseChunk) &&
+      !/^[\udc00-\udfff]/.test(message.ResponseChunk);
+  }));
+  assert.deepEqual(chunks.map(function(message) { return message.ResponseChunkIndex; }),
+    chunks.map(function(message, index) { return index; }));
+  assert.equal(chunks.map(function(message) { return message.ResponseChunk; }).join(''), text);
+});
+
+test('AppMessage failure terminates completion lifecycle exactly once', function() {
+  var timers = installFakeTimers();
+  var watch = freshWatch();
+  var completions = [];
+
+  try {
+    global.Pebble.queueSendFailure({ error: 'one' });
+    global.Pebble.queueSendFailure({ error: 'two' });
+    global.Pebble.queueSendFailure({ error: 'three' });
+    watch.beginRequestLifecycle(12);
+    watch.sendResponse(12, { FontSize: 18 }, 'answer', function(error) {
+      completions.push(error);
+    });
+    timers.runAll();
+    timers.runAll();
+
+    assert.equal(completions.length, 1);
+    assert.ok(completions[0]);
+    assert.equal(global.Pebble.messages.some(function(message) { return message.ResponseDone; }), false);
+    assert.equal(global.Pebble.messages.some(function(message) { return message.ResponseError; }), true);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('mismatched health RequestId leaves matching pending request active', function() {
+  var watch = freshWatch();
+  var result;
+
+  watch.beginRequestLifecycle(13);
+  watch.requestHealthSummary({ startUnix: 10, endUnix: 20 }, 13, function(error, json) {
+    result = { error: error, json: json };
+  });
+  watch.handleHealthSummaryResponse({
+    RequestId: 99,
+    HealthSummaryRequest: 1,
+    HealthSummaryJson: '{"wrong":true}'
+  });
+  assert.equal(result, undefined);
+  watch.handleHealthSummaryResponse({
+    RequestId: 13,
+    HealthSummaryRequest: 1,
+    HealthSummaryJson: '{"stepCount":5}'
+  });
+  assert.deepEqual(result, { error: null, json: '{"stepCount":5}' });
+});

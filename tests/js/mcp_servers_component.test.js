@@ -116,6 +116,32 @@ test('input and change events synchronize hidden Clay value', function() {
   assert.ok(item.events.filter(function(name) { return name === 'change'; }).length >= 2);
 });
 
-test.todo('clicking nested MCP title and subtitle toggles expander');
-test.todo('clicking nested plus icon adds MCP server');
-test.todo('collapsed invalid MCP fields do not block settings submission invisibly');
+test('clicking nested MCP title and subtitle toggles expander', function() {
+  var item = createItem();
+  var Event = item.window.Event;
+
+  item.root.querySelector('.mcp-toggle-title').dispatchEvent(new Event('click', { bubbles: true }));
+  assert.equal(item.root.querySelector('[data-mcp-body]').style.display, 'block');
+  item.root.querySelector('.mcp-toggle-subtitle').dispatchEvent(new Event('click', { bubbles: true }));
+  assert.equal(item.root.querySelector('[data-mcp-body]').style.display, 'none');
+});
+
+test('clicking nested plus icon adds MCP server', function() {
+  var item = createItem();
+  setValue(item, '[]');
+
+  item.root.querySelector('.mcp-add-plus').dispatchEvent(new item.window.Event('click', { bubbles: true }));
+  assert.equal(item.root.querySelectorAll('[data-mcp-server]').length, 2);
+});
+
+test('collapsed invalid MCP fields do not block settings submission invisibly', function() {
+  var item = createItem();
+  setValue(item, JSON.stringify([{ enabled: true, label: 'Bad', url: 'not a url' }]));
+  var url = item.root.querySelector('[data-mcp-field="url"]');
+
+  assert.equal(item.root.querySelector('[data-mcp-body]').style.display, 'none');
+  assert.equal(url.disabled, true);
+  assert.equal(item.target.disabled, false);
+  item.root.querySelector('[data-mcp-toggle]').dispatchEvent(new item.window.Event('click', { bubbles: true }));
+  assert.equal(url.disabled, false);
+});

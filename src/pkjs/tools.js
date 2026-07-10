@@ -32,8 +32,27 @@ var TIMELINE_RAW_PIN_ARG_KEYS = {
   actions: true
 };
 var MAX_HEALTH_RANGE_SECONDS = 7 * 24 * 60 * 60;
+var TIMELINE_MAX_PAST_MS = 2 * 24 * 60 * 60 * 1000;
+var TIMELINE_MAX_FUTURE_MS = 365 * 24 * 60 * 60 * 1000;
+var TIMELINE_RETRY_DELAY_MS = 250;
 
 var s_mcp_request_id = 1;
+
+var MCP_MAX_RESULT_CHARS = 12000;
+var MCP_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
+var MCP_MAX_PAGINATION_PAGES = 20;
+var MCP_MAX_TOOLS_PER_SERVER = 64;
+var MCP_MAX_TOOLS_GLOBAL = 64;
+var MCP_MAX_DESCRIPTION_CHARS = 1024;
+var MCP_MAX_INPUTSCHEMA_CHARS = 8192;
+var MCP_SUPPORTED_PROTOCOL_VERSIONS = { '2025-06-18': true };
+var MCP_CACHE_TTL_MS = 5 * 60 * 1000;
+
+var s_mcp_cache = null;
+
+function hasOwn(object, key) {
+  return object !== null && object !== undefined && Object.prototype.hasOwnProperty.call(object, key);
+}
 
 function hasToolArgValue(value) {
   return value !== undefined && value !== null && value !== '';
@@ -93,7 +112,7 @@ function formatToolCallDetail(toolName, args, toolInfo) {
   }
 
   for (key in args) {
-    if (args.hasOwnProperty(key) && args[key] !== undefined) {
+    if (hasOwn(args, key) && args[key] !== undefined) {
       parts.push(key + ':' + formatToolParamValue(args[key], 80));
     }
   }
@@ -133,7 +152,7 @@ function formatToolLabel(toolInfo) {
 
 function formatToolCallLabel(call, toolMap) {
   var name = String((call && (call.name || call.tool || call.function)) || '');
-  var toolInfo = toolMap && toolMap[name];
+  var toolInfo = toolMap && hasOwn(toolMap, name) ? toolMap[name] : null;
   var serverLabel;
   var toolLabel;
 
@@ -151,32 +170,95 @@ function formatToolCallLabel(call, toolMap) {
   return formatToolWords(name) || 'Unknown Tool';
 }
 
-function parseJsonOrSse(text) {
-  var value = common.trim(text);
-  var lines;
+function isMatchingResponse(msg, expectedId, allowMissingId) {
+  if (!msg || typeof msg !== 'object') {
+    return false;
+  }
+  if (msg.method) {
+    return false;
+  }
+  if (msg.result === undefined && msg.error === undefined) {
+    return false;
+  }
+  if (expectedId !== undefined && msg.id === undefined && !allowMissingId) {
+    return false;
+  }
+  if (msg.id !== undefined && msg.id !== expectedId) {
+    return false;
+  }
+  return true;
+}
+
+function parseSseEventData(eventBlock) {
+  var lines = eventBlock.split(/\r?\n/);
   var data = '';
   var i;
+  var line;
+  var value;
 
-  if (!value) {
+  for (i = 0; i < lines.length; i += 1) {
+    line = lines[i];
+    if (!line || line.charAt(0) === ':') {
+      continue;
+    }
+    if (line.indexOf('data:') === 0) {
+      value = line.substring(5);
+      if (value.charAt(0) === ' ') {
+        value = value.substring(1);
+      }
+      if (data) {
+        data += '\n';
+      }
+      data += value;
+    }
+  }
+
+  return data;
+}
+
+function parseMcpResponse(text, expectedId) {
+  var trimmed = common.trim(text);
+  var parsed;
+  var events;
+  var i;
+  var eventData;
+  var msg;
+
+  if (!trimmed) {
     return null;
   }
 
   try {
-    return JSON.parse(value);
+    parsed = JSON.parse(trimmed);
+    // A single JSON response is isolated to this HTTP request; tolerate legacy
+    // servers that omit the JSON-RPC id. SSE may contain multiple messages and
+    // therefore requires an exact id below.
+    if (isMatchingResponse(parsed, expectedId, true)) {
+      return parsed;
+    }
+    return null;
   } catch (e) {}
 
-  lines = value.split(/\r?\n/);
-  for (i = 0; i < lines.length; i += 1) {
-    if (lines[i].indexOf('data:') === 0) {
-      data += common.trim(lines[i].substring(5));
+  events = trimmed.split(/\r?\n\r?\n/);
+  for (i = 0; i < events.length; i += 1) {
+    if (!common.trim(events[i])) {
+      continue;
+    }
+    eventData = parseSseEventData(events[i]);
+    if (!eventData || eventData === '[DONE]') {
+      continue;
+    }
+    try {
+      msg = JSON.parse(eventData);
+    } catch (e2) {
+      continue;
+    }
+    if (isMatchingResponse(msg, expectedId, false)) {
+      return msg;
     }
   }
 
-  if (!data || data === '[DONE]') {
-    return null;
-  }
-
-  return JSON.parse(data);
+  return null;
 }
 
 function slugify(value) {
@@ -230,7 +312,7 @@ function normalizeMcpHeaders(value) {
     headerValue = common.trim(String(header.value || '').replace(/[\r\n]+/g, ' '));
     lowerName = name.toLowerCase();
 
-    if (!name || !headerValue || !isValidHttpHeaderName(name) || isReservedMcpHeader(name) || seen[lowerName]) {
+    if (!name || !headerValue || !isValidHttpHeaderName(name) || isReservedMcpHeader(name) || hasOwn(seen, lowerName)) {
       continue;
     }
 
@@ -259,6 +341,32 @@ function parseOptionalToolCallLimit(value) {
   }
 
   return number;
+}
+
+function isValidMcpUrl(url) {
+  var text = common.trim(url);
+  var match;
+  var scheme;
+  var host;
+  var hostPart;
+
+  match = /^(https?):\/\/([^\/\?#]+)/i.exec(text);
+  if (!match) {
+    return false;
+  }
+  scheme = match[1].toLowerCase();
+  host = match[2].toLowerCase();
+
+  if (scheme === 'https') {
+    return true;
+  }
+
+  if (host.charAt(0) === '[') {
+    hostPart = host.substring(0, host.indexOf(']') + 1);
+  } else {
+    hostPart = host.split(':')[0];
+  }
+  return hostPart === 'localhost' || hostPart === '127.0.0.1' || hostPart === '[::1]';
 }
 
 function parseMcpServers(settings) {
@@ -295,6 +403,10 @@ function parseMcpServers(settings) {
         sessionId: ''
       };
       if (server.label && server.url && server.maxToolCalls !== 0) {
+        if (!isValidMcpUrl(server.url)) {
+          common.logDebug('mcp server omitted invalid url server=' + server.label);
+          continue;
+        }
         servers.push(server);
       }
     }
@@ -343,6 +455,7 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
     method: method
   };
   var authorization = authHeader(server.authorization);
+  var jsonRpcId;
 
   if (method.indexOf('notifications/') !== 0) {
     payload.id = s_mcp_request_id;
@@ -351,6 +464,7 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
   if (params) {
     payload.params = params;
   }
+  jsonRpcId = payload.id;
 
   request.open('POST', server.url, true);
   request.setRequestHeader('Content-Type', 'application/json');
@@ -383,7 +497,7 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
     common.logDebug('mcp response server=' + server.label + ' method=' + method + ' status=' + request.status + ' bytes=' + String(request.responseText || '').length);
 
     if (request.status < 200 || request.status >= 300) {
-      callback('MCP HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 180));
+      callback('MCP HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 180), null, request.status);
       return;
     }
 
@@ -395,23 +509,28 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
     } catch (e) {}
 
     if (!expectBody || !common.trim(request.responseText)) {
-      callback(null, null);
+      callback(null, null, request.status);
       return;
     }
 
     try {
-      json = parseJsonOrSse(request.responseText);
+      json = parseMcpResponse(request.responseText, jsonRpcId);
     } catch (e2) {
-      callback('Bad MCP JSON response');
+      callback('Bad MCP JSON response', null, request.status);
+      return;
+    }
+
+    if (!json) {
+      callback('No matching MCP response', null, request.status);
       return;
     }
 
     if (json.error) {
-      callback(json.error.message || common.safeJson(json.error));
+      callback(json.error.message || common.safeJson(json.error), null, request.status);
       return;
     }
 
-    callback(null, json.result || {});
+    callback(null, json.result || {}, request.status);
   };
 
   request.onerror = function() {
@@ -420,7 +539,7 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
       return;
     }
     common.logDebug('mcp network error server=' + server.label + ' method=' + method);
-    callback('MCP network error');
+    callback('MCP network error', null, 0);
   };
 
   request.ontimeout = function() {
@@ -429,7 +548,7 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
       return;
     }
     common.logDebug('mcp timeout server=' + server.label + ' method=' + method);
-    callback('MCP request timed out');
+    callback('MCP request timed out', null, 0);
   };
 
   request.onabort = function() {
@@ -447,111 +566,331 @@ function initializeMcpServer(server, requestId, callback) {
       name: MCP_CLIENT_NAME,
       version: MCP_CLIENT_VERSION
     }
-  }, true, requestId, function(error) {
+  }, true, requestId, function(error, result) {
+    var caps;
+    var protocolVersion;
+
     if (error) {
       callback(error);
       return;
     }
 
-    mcpJsonRpc(server, 'notifications/initialized', {}, false, requestId, function() {
-      callback(null);
+    protocolVersion = result && result.protocolVersion;
+    if (!hasOwn(MCP_SUPPORTED_PROTOCOL_VERSIONS, protocolVersion)) {
+      callback('MCP incompatible protocolVersion: ' + (protocolVersion || 'missing'));
+      return;
+    }
+
+    caps = result && result.capabilities;
+    if (caps && typeof caps === 'object' && !caps.tools) {
+      callback(null, { noTools: true });
+      return;
+    }
+
+    mcpJsonRpc(server, 'notifications/initialized', {}, false, requestId, function(initError) {
+      if (initError) {
+        callback(initError);
+        return;
+      }
+      callback(null, null);
     });
   });
+}
+
+function capMcpResult(text) {
+  var value = String(text || '');
+
+  if (value.length <= MCP_MAX_RESULT_CHARS) {
+    return value;
+  }
+
+  return value.substring(0, MCP_MAX_RESULT_CHARS - MCP_RESULT_TRUNCATION_SUFFIX.length) + MCP_RESULT_TRUNCATION_SUFFIX;
 }
 
 function formatMcpToolResult(result) {
   var text = common.collectTextFromContent(result && result.content);
 
   if (text) {
-    return text;
+    return capMcpResult(text);
   }
 
-  return common.safeJson(result || {});
+  if (result && result.structuredContent !== undefined && result.structuredContent !== null) {
+    return capMcpResult(common.safeJson(result.structuredContent));
+  }
+
+  return capMcpResult(common.safeJson(result || {}));
+}
+
+function mcpCacheKey(servers) {
+  var entries = [];
+  var i;
+  var s;
+
+  for (i = 0; i < servers.length; i += 1) {
+    s = servers[i];
+    entries.push({
+      displayLabel: s.displayLabel,
+      label: s.label,
+      url: s.url,
+      description: s.description,
+      allowedTools: s.allowedTools,
+      maxToolCalls: s.maxToolCalls,
+      authorization: s.authorization,
+      headers: s.headers
+    });
+  }
+
+  return JSON.stringify(entries);
+}
+
+function lookupMcpCache(key) {
+  if (!s_mcp_cache || s_mcp_cache.key !== key) {
+    return null;
+  }
+  if (Date.now() - s_mcp_cache.time > MCP_CACHE_TTL_MS) {
+    s_mcp_cache = null;
+    return null;
+  }
+  return s_mcp_cache;
+}
+
+function cloneTools(tools) {
+  var copy = [];
+  var i;
+
+  for (i = 0; i < tools.length; i += 1) {
+    copy.push(tools[i]);
+  }
+  return copy;
+}
+
+function cloneToolMap(toolMap) {
+  var copy = Object.create(null);
+  var key;
+
+  for (key in toolMap) {
+    if (hasOwn(toolMap, key)) {
+      copy[key] = toolMap[key];
+    }
+  }
+  return copy;
+}
+
+function listAllMcpTools(server, requestId, callback) {
+  var allTools = [];
+  var done = false;
+  var pageCount = 0;
+
+  function finish(error, tools) {
+    if (done) {
+      return;
+    }
+    done = true;
+    callback(error, tools);
+  }
+
+  function fetchPage(cursor) {
+    var params = cursor ? { cursor: cursor } : {};
+    var i;
+
+    if (pageCount >= MCP_MAX_PAGINATION_PAGES) {
+      common.logDebug('mcp tools/list page limit reached server=' + server.label);
+      finish(null, allTools);
+      return;
+    }
+    pageCount += 1;
+
+    mcpJsonRpc(server, 'tools/list', params, true, requestId, function(listError, result) {
+      var serverTools;
+      var nextCursor;
+
+      if (!watch.isCurrentRequest(requestId)) {
+        return;
+      }
+      if (listError) {
+        finish(listError, null);
+        return;
+      }
+
+      serverTools = (result && result.tools) || [];
+      for (i = 0; i < serverTools.length; i += 1) {
+        if (allTools.length >= MCP_MAX_TOOLS_PER_SERVER) {
+          common.logDebug('mcp tools/list per-server limit reached server=' + server.label);
+          finish(null, allTools);
+          return;
+        }
+        allTools.push(serverTools[i]);
+      }
+
+      nextCursor = result && result.nextCursor;
+      if (nextCursor) {
+        fetchPage(nextCursor);
+      } else {
+        finish(null, allTools);
+      }
+    });
+  }
+
+  fetchPage(null);
 }
 
 function discoverMcpTools(settings, requestId, callback) {
   var servers = parseMcpServers(settings);
+  var cacheKey = mcpCacheKey(servers);
+  var cached;
   var tools = [];
-  var toolMap = {};
-  var usedNames = {};
+  var toolMap = Object.create(null);
+  var usedNames = Object.create(null);
+  var results = [];
   var remaining = servers.length;
+  var hadError = false;
 
   common.logDebug('mcp discover start servers=' + servers.length);
 
-  function finishOne() {
-    remaining -= 1;
-    if (remaining <= 0) {
-      callback(null, tools, toolMap);
-    }
+  cached = lookupMcpCache(cacheKey);
+  if (cached) {
+    common.logDebug('mcp cache hit');
+    callback(null, cloneTools(cached.tools), cloneToolMap(cached.toolMap));
+    return;
   }
 
-  function addTools(server, result) {
-    var serverTools = (result && result.tools) || [];
+  function addTools(server, serverTools) {
     var i;
     var tool;
     var exposedName;
     var baseName;
     var suffix;
+    var description;
+    var inputSchema;
+    var schemaSize;
 
     for (i = 0; i < serverTools.length; i += 1) {
+      if (tools.length >= MCP_MAX_TOOLS_GLOBAL) {
+        common.logDebug('mcp tools global limit reached');
+        return;
+      }
       tool = serverTools[i] || {};
       if (!tool.name || !isAllowedTool(server, tool.name)) {
+        continue;
+      }
+
+      inputSchema = tool.inputSchema || { type: 'object', properties: {} };
+      try {
+        schemaSize = JSON.stringify(inputSchema).length;
+      } catch (e) {
+        schemaSize = MCP_MAX_INPUTSCHEMA_CHARS + 1;
+      }
+      if (schemaSize > MCP_MAX_INPUTSCHEMA_CHARS) {
+        common.logDebug('mcp tool skipped oversized inputSchema server=' + server.label + ' tool=' + tool.name);
         continue;
       }
 
       baseName = slugify(server.label) + '__' + slugify(tool.name);
       exposedName = baseName;
       suffix = 2;
-      while (usedNames[exposedName]) {
+      while (hasOwn(usedNames, exposedName)) {
         exposedName = baseName + '_' + suffix;
         suffix += 1;
       }
       usedNames[exposedName] = true;
 
+      description = common.trim(tool.description || server.description || 'MCP tool');
+      if (description.length > MCP_MAX_DESCRIPTION_CHARS) {
+        description = description.substring(0, MCP_MAX_DESCRIPTION_CHARS);
+      }
+      if (server.maxToolCalls !== null) {
+        description += ' This MCP server may be called at most ' + server.maxToolCalls + ' time(s) this request.';
+      }
+
       tools.push({
         name: exposedName,
-        description: common.trim(tool.description || server.description || 'MCP tool') + (server.maxToolCalls !== null ? ' This MCP server may be called at most ' + server.maxToolCalls + ' time(s) this request.' : ''),
-        parameters: tool.inputSchema || { type: 'object', properties: {} }
+        description: description,
+        parameters: inputSchema
       });
       toolMap[exposedName] = {
         kind: 'mcp',
         server: server,
         toolName: tool.name,
-        parameters: tool.inputSchema || { type: 'object', properties: {} }
+        parameters: inputSchema
       };
       common.logDebug('mcp tool exposed=' + exposedName + ' original=' + tool.name + ' server=' + server.label);
     }
   }
 
+  function finalize() {
+    var i;
+    var entry;
+
+    for (i = 0; i < results.length; i += 1) {
+      entry = results[i];
+      if (entry && entry.tools) {
+        addTools(entry.server, entry.tools);
+      }
+    }
+
+    if (!hadError) {
+      s_mcp_cache = {
+        key: cacheKey,
+        time: Date.now(),
+        tools: cloneTools(tools),
+        toolMap: cloneToolMap(toolMap)
+      };
+    }
+
+    callback(null, cloneTools(tools), cloneToolMap(toolMap));
+  }
+
   if (!remaining) {
-    callback(null, tools, toolMap);
+    finalize();
     return;
   }
 
-  servers.forEach(function(server) {
-    initializeMcpServer(server, requestId, function(initError) {
+  servers.forEach(function(server, index) {
+    initializeMcpServer(server, requestId, function(initError, initResult) {
+      var noTools = initResult && initResult.noTools;
+
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
       if (initError) {
         common.logDebug('mcp initialize failed server=' + server.label + ' error=' + initError);
-        finishOne();
+        hadError = true;
+        results[index] = null;
+        remaining -= 1;
+        if (remaining <= 0) {
+          finalize();
+        }
+        return;
+      }
+
+      if (noTools) {
+        common.logDebug('mcp server declares no tools capability server=' + server.label);
+        results[index] = { server: server, tools: [] };
+        remaining -= 1;
+        if (remaining <= 0) {
+          finalize();
+        }
         return;
       }
 
       common.logDebug('mcp initialized server=' + server.label);
 
-      mcpJsonRpc(server, 'tools/list', {}, true, requestId, function(listError, result) {
+      listAllMcpTools(server, requestId, function(listError, serverTools) {
         if (!watch.isCurrentRequest(requestId)) {
           return;
         }
         if (listError) {
           common.logDebug('mcp tools/list failed server=' + server.label + ' error=' + listError);
+          hadError = true;
+          results[index] = null;
         } else {
-          addTools(server, result);
-          common.logDebug('mcp tools/list ok server=' + server.label + ' count=' + (((result && result.tools) || []).length));
+          results[index] = { server: server, tools: serverTools };
+          common.logDebug('mcp tools/list ok server=' + server.label + ' count=' + serverTools.length);
         }
-        finishOne();
+        remaining -= 1;
+        if (remaining <= 0) {
+          finalize();
+        }
       });
     });
   });
@@ -1215,6 +1554,8 @@ function validateTimelinePin(pin) {
   var layoutType;
   var i;
   var reminder;
+  var pinTimeMs;
+  var nowMs;
 
   if (!pin || typeof pin !== 'object') {
     return 'Pin must be an object';
@@ -1229,6 +1570,17 @@ function validateTimelinePin(pin) {
   }
   if (!common.trim(pin.time)) {
     return 'Pin time is required';
+  }
+  pinTimeMs = Date.parse(pin.time);
+  if (!isFinite(pinTimeMs)) {
+    return 'Pin time is invalid';
+  }
+  nowMs = new Date().getTime();
+  if (pinTimeMs < nowMs - TIMELINE_MAX_PAST_MS) {
+    return 'Pin time cannot be more than 2 days in the past';
+  }
+  if (pinTimeMs > nowMs + TIMELINE_MAX_FUTURE_MS) {
+    return 'Pin time cannot be more than 1 year in the future';
   }
   if (!pin.layout || typeof pin.layout !== 'object') {
     return 'Pin layout is required';
@@ -1282,7 +1634,7 @@ function validateTimelinePin(pin) {
 
 function timelinePinRequest(method, id, pin, requestId, callback) {
   getTimelineToken(function(tokenError, token) {
-    var request;
+    var finished = false;
 
     if (!watch.isCurrentRequest(requestId)) {
       return;
@@ -1292,55 +1644,109 @@ function timelinePinRequest(method, id, pin, requestId, callback) {
       return;
     }
 
-    request = new XMLHttpRequest();
-    request.open(method, TIMELINE_API_BASE + encodeURIComponent(id), true);
-    request.setRequestHeader('X-User-Token', token);
-    if (pin) {
-      request.setRequestHeader('Content-Type', 'application/json');
-    }
-    request.timeout = 30000;
-
-    if (!watch.trackXhr(requestId, request)) {
-      return;
+    function finish(error, result) {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      callback(error, result);
     }
 
-    request.onload = function() {
-      var responseText = String(request.responseText || '');
+    function retryDelay(request) {
+      var retryAfter = null;
+      var seconds;
 
-      watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
+      try {
+        retryAfter = request.getResponseHeader('Retry-After');
+      } catch (e) {}
+      seconds = parseFloat(retryAfter);
+      if (!isNaN(seconds) && seconds >= 0) {
+        return Math.min(seconds * 1000, common.MAX_RETRY_AFTER_MS || 5000);
+      }
+      return TIMELINE_RETRY_DELAY_MS;
+    }
+
+    function retry(attempt, delay) {
+      setTimeout(function() {
+        if (watch.isCurrentRequest(requestId)) {
+          sendAttempt(attempt + 1);
+        }
+      }, delay);
+    }
+
+    function sendAttempt(attempt) {
+      var request = new XMLHttpRequest();
+
+      request.open(method, TIMELINE_API_BASE + encodeURIComponent(id), true);
+      request.setRequestHeader('X-User-Token', token);
+      if (pin) {
+        request.setRequestHeader('Content-Type', 'application/json');
+      }
+      request.timeout = 30000;
+
+      if (!watch.trackXhr(requestId, request)) {
         return;
       }
 
-      if (request.status < 200 || request.status >= 300) {
-        callback('Timeline HTTP ' + request.status + ': ' + responseText.substring(0, 180));
-        return;
-      }
+      request.onload = function() {
+        var responseText = String(request.responseText || '');
+        var retryable = request.status === 408 || request.status === 429 || request.status >= 500;
 
-      callback(null, method === 'DELETE' ? 'Timeline pin deleted successfully.' : 'Timeline pin saved successfully.');
-    };
+        watch.untrackXhr(requestId, request);
+        if (!watch.isCurrentRequest(requestId)) {
+          return;
+        }
+        if (retryable && attempt === 0) {
+          common.logDebug('timeline retry status=' + request.status);
+          retry(attempt, retryDelay(request));
+          return;
+        }
+        if (method === 'DELETE' && attempt > 0 && request.status === 404) {
+          finish(null, 'Timeline pin deleted successfully.');
+          return;
+        }
+        if (request.status < 200 || request.status >= 300) {
+          finish('Timeline HTTP ' + request.status + ': ' + responseText.substring(0, 180));
+          return;
+        }
 
-    request.onerror = function() {
-      watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
-        return;
-      }
-      callback('Timeline network error');
-    };
+        finish(null, method === 'DELETE' ? 'Timeline pin deleted successfully.' : 'Timeline pin saved successfully.');
+      };
 
-    request.ontimeout = function() {
-      watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
-        return;
-      }
-      callback('Timeline request timed out');
-    };
+      request.onerror = function() {
+        watch.untrackXhr(requestId, request);
+        if (!watch.isCurrentRequest(requestId)) {
+          return;
+        }
+        if (attempt === 0) {
+          common.logDebug('timeline retry network error');
+          retry(attempt, TIMELINE_RETRY_DELAY_MS);
+          return;
+        }
+        finish('Timeline network error');
+      };
 
-    request.onabort = function() {
-      watch.untrackXhr(requestId, request);
-    };
+      request.ontimeout = function() {
+        watch.untrackXhr(requestId, request);
+        if (!watch.isCurrentRequest(requestId)) {
+          return;
+        }
+        if (attempt === 0) {
+          common.logDebug('timeline retry timeout');
+          retry(attempt, TIMELINE_RETRY_DELAY_MS);
+          return;
+        }
+        finish('Timeline request timed out');
+      };
 
-    request.send(pin ? JSON.stringify(pin) : null);
+      request.onabort = function() {
+        watch.untrackXhr(requestId, request);
+      };
+
+      request.send(pin ? JSON.stringify(pin) : null);
+    }
+
+    sendAttempt(0);
   });
 }
 
@@ -1527,10 +1933,10 @@ function addBuiltinTool(tools, toolMap, definition) {
   var exposedName = baseName;
   var suffix = 2;
 
-  while (toolMap[exposedName]) {
-    exposedName = baseName + '_' + suffix;
-    suffix += 1;
-  }
+while (hasOwn(toolMap, exposedName)) {
+      exposedName = baseName + '_' + suffix;
+      suffix += 1;
+    }
 
   tools.push({
     name: exposedName,
@@ -1675,23 +2081,61 @@ function discoverPhoneTools(settings, requestId, callback) {
 }
 
 function callMcpTool(toolInfo, args, requestId, callback) {
-  common.logDebug('mcp tool call server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' args=' + common.safeJson(args).substring(0, 240));
-  mcpJsonRpc(toolInfo.server, 'tools/call', {
-    name: toolInfo.toolName,
-    arguments: args || {}
-  }, true, requestId, function(error, result) {
-    if (!watch.isCurrentRequest(requestId)) {
+  var called = false;
+  var retried = false;
+
+  function once(error, resultText) {
+    if (called) {
       return;
     }
+    called = true;
     if (error) {
       common.logDebug('mcp tool error server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' error=' + error);
       callback(error);
       return;
     }
+    common.logDebug('mcp tool result server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' chars=' + String(resultText || '').length);
+    callback(null, resultText);
+  }
 
-    common.logDebug('mcp tool result server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' chars=' + formatMcpToolResult(result).length);
-    callback(null, formatMcpToolResult(result));
-  });
+  function doCall() {
+    common.logDebug('mcp tool call server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' args=' + common.safeJson(args).substring(0, 240));
+    mcpJsonRpc(toolInfo.server, 'tools/call', {
+      name: toolInfo.toolName,
+      arguments: args || {}
+    }, true, requestId, function(error, result, httpStatus) {
+      if (!watch.isCurrentRequest(requestId)) {
+        return;
+      }
+      if (error && httpStatus === 404 && toolInfo.server.sessionId && !retried) {
+        retried = true;
+        common.logDebug('mcp tool 404 reinitialize server=' + toolInfo.server.label);
+        toolInfo.server.sessionId = '';
+        initializeMcpServer(toolInfo.server, requestId, function(initError) {
+          if (!watch.isCurrentRequest(requestId)) {
+            return;
+          }
+          if (initError) {
+            once(initError);
+            return;
+          }
+          doCall();
+        });
+        return;
+      }
+      if (error) {
+        once(error);
+        return;
+      }
+      if (result && result.isError === true) {
+        once(formatMcpToolResult(result));
+        return;
+      }
+      once(null, formatMcpToolResult(result));
+    });
+  }
+
+  doCall();
 }
 
 function callBuiltinTool(toolInfo, args, requestId, callback) {
@@ -1745,11 +2189,111 @@ function parseToolArgsValue(value) {
   return { args: value };
 }
 
+function valueMatchesType(value, type) {
+  if (type === 'string') {
+    return typeof value === 'string';
+  }
+  if (type === 'integer') {
+    return typeof value === 'number' && isFinite(value) && Math.floor(value) === value;
+  }
+  if (type === 'number') {
+    return typeof value === 'number' && isFinite(value);
+  }
+  if (type === 'boolean') {
+    return typeof value === 'boolean';
+  }
+  if (type === 'object') {
+    return isObjectValue(value);
+  }
+  if (type === 'array') {
+    return isArrayValue(value);
+  }
+  if (type === 'null') {
+    return value === null;
+  }
+  return true;
+}
+
+function argValuesEqual(a, b) {
+  if (typeof a !== typeof b) {
+    return false;
+  }
+  if (typeof a === 'object' && a !== null && b !== null) {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch (e) {
+      return false;
+    }
+  }
+  return a === b;
+}
+
+function articleFor(type) {
+  if (type === 'integer' || type === 'object' || type === 'array') {
+    return 'an';
+  }
+  return 'a';
+}
+
+function validateToolArgValue(value, schema, key) {
+  var type;
+  var i;
+  var matched;
+
+  if (!isObjectValue(schema)) {
+    return '';
+  }
+
+  type = schema.type;
+  if (type) {
+    if (isArrayValue(type)) {
+      matched = false;
+      for (i = 0; i < type.length; i += 1) {
+        if (valueMatchesType(value, type[i])) {
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        return key + ' must be ' + type.join(' or ');
+      }
+    } else if (!valueMatchesType(value, type)) {
+      return key + ' must be ' + articleFor(type) + ' ' + type;
+    }
+  }
+
+  if (isArrayValue(schema.enum) && schema.enum.length) {
+    matched = false;
+    for (i = 0; i < schema.enum.length; i += 1) {
+      if (argValuesEqual(value, schema.enum[i])) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return key + ' must be one of ' + schema.enum.map(function(v) { return String(v); }).join(', ');
+    }
+  }
+
+  if (schema.minimum !== undefined && typeof value === 'number' && value < schema.minimum) {
+    return key + ' must be ' + schema.minimum + ' or greater';
+  }
+  if (schema.maximum !== undefined && typeof value === 'number' && value > schema.maximum) {
+    return key + ' must be ' + schema.maximum + ' or less';
+  }
+  if (schema.maxLength !== undefined && typeof value === 'string' && value.length > schema.maxLength) {
+    return key + ' exceeds max length ' + schema.maxLength;
+  }
+
+  return '';
+}
+
 function validateToolArgs(args, schema) {
   var required;
   var properties;
   var i;
   var key;
+  var argError;
 
   schema = schema || {};
   required = isArrayValue(schema.required) ? schema.required : [];
@@ -1768,8 +2312,20 @@ function validateToolArgs(args, schema) {
 
   if (schema.additionalProperties === false) {
     for (key in args) {
-      if (args.hasOwnProperty(key) && !properties.hasOwnProperty(key)) {
+      if (hasOwn(args, key) && !hasOwn(properties, key)) {
         return 'Unsupported tool argument: ' + key;
+      }
+    }
+  }
+
+  for (key in args) {
+    if (!hasOwn(args, key)) {
+      continue;
+    }
+    if (hasOwn(properties, key)) {
+      argError = validateToolArgValue(args[key], properties[key], key);
+      if (argError) {
+        return argError;
       }
     }
   }
@@ -1810,7 +2366,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     }
     callId = call.call_id || call.id || name || String(index);
 
-    toolInfo = toolMap[name];
+    toolInfo = hasOwn(toolMap, name) ? toolMap[name] : null;
     if (!toolInfo) {
       watch.progressDone(requestId, String(name || 'unknown'), 'unknown tool');
       results.push({

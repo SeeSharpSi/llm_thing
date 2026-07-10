@@ -43,6 +43,7 @@
 #define TEXT_LAYOUT_FLAG_BOLD 0x01
 #define TEXT_LAYOUT_FLAG_PROMPT 0x02
 #define TEXT_LAYOUT_FLAG_SMALL 0x04
+#define TEXT_LAYOUT_DEBOUNCE_MS 120
 // Phone-side Markdown parsing sends these non-NUL markers inside ResponseChunk.
 #define TEXT_BOLD_ON '\x01'
 #define TEXT_BOLD_OFF '\x02'
@@ -111,6 +112,7 @@ static TextLayer *s_progress_output_context_layer;
 static Layer *s_progress_loading_layer;
 static AppTimer *s_progress_loading_timer;
 static AppTimer *s_quick_launch_dictation_timer;
+static AppTimer *s_text_layout_timer;
 #if defined(PBL_MICROPHONE)
 static DictationSession *s_dictation_session;
 #endif
@@ -155,6 +157,8 @@ static GColor s_background_color;
 static GColor s_prompt_background_color;
 static GColor s_bold_text_color;
 static uint32_t s_request_id;
+static uint32_t s_response_chunk_index;
+static bool s_response_done;
 static uint16_t s_progress_loading_frame;
 static bool s_start_dictation_quick_launch;
 static bool s_launched_from_quick_launch;
@@ -182,6 +186,7 @@ static int32_t s_touch_velocity_y;
 #endif
 
 static void prv_update_scroll_text(void);
+static void prv_schedule_scroll_text_update(void);
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx);
 static void prv_set_response(const char *text);
 #if defined(PBL_MICROPHONE)
@@ -190,6 +195,7 @@ static void prv_request_past_chats(void);
 #endif
 
 static void prv_progress_loading_timer_callback(void *context);
+static void prv_text_layout_timer_callback(void *context);
 #if defined(PBL_TOUCH)
 static void prv_touch_momentum_timer_callback(void *context);
 static void prv_stop_touch_momentum(void);
@@ -842,6 +848,27 @@ static void prv_update_scroll_text(void) {
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_layer_width, scroll_height));
 }
 
+static void prv_text_layout_timer_callback(void *context) {
+  (void)context;
+  s_text_layout_timer = NULL;
+  prv_update_scroll_text();
+}
+
+static void prv_schedule_scroll_text_update(void) {
+  if (!s_text_layout_timer) {
+    s_text_layout_timer = app_timer_register(TEXT_LAYOUT_DEBOUNCE_MS,
+        prv_text_layout_timer_callback, NULL);
+  }
+}
+
+static void prv_flush_scroll_text_update(void) {
+  if (s_text_layout_timer) {
+    app_timer_cancel(s_text_layout_timer);
+    s_text_layout_timer = NULL;
+  }
+  prv_update_scroll_text();
+}
+
 static int32_t prv_clamp_scroll_offset_y(int32_t offset_y) {
   return llm_clamp_scroll_offset_y(offset_y, s_min_text_height, s_scroll_text_height,
       TEXT_MEASURE_HEIGHT);
@@ -1366,18 +1393,29 @@ static void prv_send_health_summary_response(uint32_t request_id, uint32_t healt
                                              const char *json, const char *error) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
+  DictionaryResult write_result;
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "health response outbox begin failed result=%d", result);
     return;
   }
 
-  dict_write_uint32(iter, MESSAGE_KEY_RequestId, request_id);
-  dict_write_uint32(iter, MESSAGE_KEY_HealthSummaryRequest, health_request_id);
+  write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestId, request_id);
+  if (write_result == DICT_OK) {
+    write_result = dict_write_uint32(iter, MESSAGE_KEY_HealthSummaryRequest, health_request_id);
+  }
   if (error && error[0] != '\0') {
-    dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryError, error);
+    if (write_result == DICT_OK) {
+      write_result = dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryError, error);
+    }
   } else {
-    dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryJson, json ? json : "{}");
+    if (write_result == DICT_OK) {
+      write_result = dict_write_cstring(iter, MESSAGE_KEY_HealthSummaryJson, json ? json : "{}");
+    }
+  }
+  if (write_result != DICT_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "health response dictionary write failed result=%d", write_result);
+    return;
   }
   dict_write_end(iter);
 
@@ -1595,7 +1633,7 @@ static void prv_set_response(const char *text) {
 
   prv_show_response_view();
   s_home_screen_visible = false;
-  snprintf(s_response, sizeof(s_response), "%s", text);
+  snprintf(s_response, sizeof(s_response), "%s", text ? text : "");
   s_response_truncated = false;
   prv_update_scroll_text();
   scroll_layer_set_content_offset(s_scroll_layer, GPointZero, false);
@@ -1629,7 +1667,7 @@ static void prv_append_response(const char *text) {
   prv_show_response_view();
   s_home_screen_visible = false;
   prv_append_text_limited(text);
-  prv_update_scroll_text();
+  prv_schedule_scroll_text_update();
   prv_scroll_to_latest_prompt(false);
 }
 
@@ -1637,7 +1675,9 @@ static void prv_append_response(const char *text) {
 static void prv_send_request(const char *text) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "send request start next_id=%lu text_len=%u", (unsigned long)(s_request_id + 1), (unsigned int)strlen(text));
+  DictionaryResult write_result;
+  uint32_t next_request_id = s_request_id + 1;
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "send request start next_id=%lu text_len=%u", (unsigned long)next_request_id, (unsigned int)strlen(text));
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox begin failed result=%d", result);
@@ -1646,22 +1686,31 @@ static void prv_send_request(const char *text) {
     return;
   }
 
-  s_request_id += 1;
-  dict_write_uint32(iter, MESSAGE_KEY_RequestId, s_request_id);
+  write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestId, next_request_id);
   if (s_chat_reset_pending) {
-    dict_write_uint8(iter, MESSAGE_KEY_ChatReset, 1);
+    if (write_result == DICT_OK) {
+      write_result = dict_write_uint8(iter, MESSAGE_KEY_ChatReset, 1);
+    }
   }
-  dict_write_cstring(iter, MESSAGE_KEY_RequestText, text);
+  if (write_result == DICT_OK) {
+    write_result = dict_write_cstring(iter, MESSAGE_KEY_RequestText, text);
+  }
+  if (write_result != DICT_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "request dictionary write failed result=%d", write_result);
+    prv_append_notice("Prompt is too long to send.");
+    return;
+  }
   dict_write_end(iter);
 
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
-    APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)s_request_id, result);
+    APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)next_request_id, result);
     prv_set_status("Send failed");
     prv_append_notice("Could not send request to phone.");
     return;
   }
 
+  s_request_id = next_request_id;
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
   s_chat_reset_pending = false;
   prv_append_prompt(text);
@@ -1788,13 +1837,18 @@ static void prv_set_past_chats_status(const char *text, bool loading) {
 static bool prv_send_past_chats_request_message(void) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
+  DictionaryResult write_result;
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "past chats outbox begin failed result=%d", result);
     return false;
   }
 
-  dict_write_uint8(iter, MESSAGE_KEY_PastChatsRequest, 1);
+  write_result = dict_write_uint8(iter, MESSAGE_KEY_PastChatsRequest, 1);
+  if (write_result != DICT_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chats dictionary write failed result=%d", write_result);
+    return false;
+  }
   dict_write_end(iter);
 
   result = app_message_outbox_send();
@@ -1809,13 +1863,18 @@ static bool prv_send_past_chats_request_message(void) {
 static bool prv_send_past_chat_id_message(uint32_t key, const char *id) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
+  DictionaryResult write_result;
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "past chat id outbox begin failed result=%d", result);
     return false;
   }
 
-  dict_write_cstring(iter, key, id ? id : "");
+  write_result = dict_write_cstring(iter, key, id ? id : "");
+  if (write_result != DICT_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "past chat id dictionary write failed result=%d", write_result);
+    return false;
+  }
   dict_write_end(iter);
 
   result = app_message_outbox_send();
@@ -2223,7 +2282,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       s_chat_started = true;
       s_chat_reset_pending = false;
     } else {
-      prv_update_scroll_text();
+      prv_flush_scroll_text_update();
       prv_scroll_to_latest_prompt(false);
     }
   }
@@ -2235,6 +2294,8 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_set_status("Receiving");
     prv_show_response_view();
     s_response_truncated = false;
+    s_response_chunk_index = 0;
+    s_response_done = false;
     prv_update_scroll_text();
     prv_scroll_to_latest_prompt(false);
   }
@@ -2294,26 +2355,42 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
-  if (chunk_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk len=%u", (unsigned int)strlen(chunk_t->value->cstring));
-    prv_append_response(chunk_t->value->cstring);
+  if (chunk_t && !s_response_done) {
+    Tuple *chunk_index_t = dict_find(iter, MESSAGE_KEY_ResponseChunkIndex);
+    uint32_t chunk_index = prv_uint32_from_tuple(chunk_index_t, s_response_chunk_index);
+
+    if (chunk_index < s_response_chunk_index) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored duplicate response chunk index=%lu expected=%lu",
+          (unsigned long)chunk_index, (unsigned long)s_response_chunk_index);
+    } else if (chunk_index > s_response_chunk_index) {
+      APP_LOG(APP_LOG_LEVEL_ERROR, "ignored out-of-order response chunk index=%lu expected=%lu",
+          (unsigned long)chunk_index, (unsigned long)s_response_chunk_index);
+    } else {
+      s_response_chunk_index += 1;
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk index=%lu len=%u",
+          (unsigned long)chunk_index, (unsigned int)strlen(chunk_t->value->cstring));
+      prv_append_response(chunk_t->value->cstring);
+    }
   }
 
   Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
-  if (error_t) {
+  if (error_t && !s_response_done) {
+    s_response_done = true;
     APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
     prv_set_status("Error");
     prv_append_response(error_t->value->cstring);
+    prv_flush_scroll_text_update();
   }
 
   Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
-  if (done_t) {
+  if (done_t && !s_response_done) {
+    s_response_done = true;
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
     prv_set_status("Done");
     if (s_response[0] == '\0') {
       prv_set_response("No response text.");
     } else {
-      prv_update_scroll_text();
+      prv_flush_scroll_text_update();
       prv_scroll_to_latest_prompt(false);
     }
     prv_buzz_response_done();
@@ -2443,18 +2520,32 @@ static void prv_window_unload(Window *window) {
 #endif
 
   prv_stop_progress_loading();
+  if (s_text_layout_timer) {
+    app_timer_cancel(s_text_layout_timer);
+    s_text_layout_timer = NULL;
+  }
   text_layer_destroy(s_progress_output_context_layer);
+  s_progress_output_context_layer = NULL;
   text_layer_destroy(s_progress_input_context_layer);
+  s_progress_input_context_layer = NULL;
   layer_destroy(s_progress_loading_layer);
+  s_progress_loading_layer = NULL;
   text_layer_destroy(s_progress_detail_layer);
+  s_progress_detail_layer = NULL;
   text_layer_destroy(s_progress_title_layer);
+  s_progress_title_layer = NULL;
   text_layer_destroy(s_progress_history_layer);
+  s_progress_history_layer = NULL;
   layer_destroy(s_progress_layer);
+  s_progress_layer = NULL;
   layer_destroy(s_text_layer);
+  s_text_layer = NULL;
   scroll_layer_destroy(s_scroll_layer);
+  s_scroll_layer = NULL;
 }
 
 static void prv_init(void) {
+  AppMessageResult app_message_result;
   APP_LOG(APP_LOG_LEVEL_DEBUG, "app init");
   if (persist_exists(PERSIST_KEY_FONT_SIZE)) {
     s_font_size = prv_normalize_font_size(persist_read_int(PERSIST_KEY_FONT_SIZE));
@@ -2502,8 +2593,14 @@ static void prv_init(void) {
   app_message_register_inbox_received(prv_inbox_received_handler);
   app_message_register_inbox_dropped(prv_inbox_dropped_handler);
   app_message_register_outbox_failed(prv_outbox_failed_handler);
-  app_message_open(APP_MESSAGE_INBOX_SIZE, APP_MESSAGE_OUTBOX_SIZE);
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "appmessage opened inbox=%lu outbox=%lu", (unsigned long)APP_MESSAGE_INBOX_SIZE, (unsigned long)APP_MESSAGE_OUTBOX_SIZE);
+  app_message_result = app_message_open(APP_MESSAGE_INBOX_SIZE, APP_MESSAGE_OUTBOX_SIZE);
+  if (app_message_result == APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "appmessage opened inbox=%lu outbox=%lu", (unsigned long)APP_MESSAGE_INBOX_SIZE, (unsigned long)APP_MESSAGE_OUTBOX_SIZE);
+  } else {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "appmessage open failed result=%d inbox=%lu outbox=%lu",
+        app_message_result, (unsigned long)APP_MESSAGE_INBOX_SIZE,
+        (unsigned long)APP_MESSAGE_OUTBOX_SIZE);
+  }
 
   window_stack_push(s_window, true);
   prv_maybe_schedule_quick_launch_dictation();

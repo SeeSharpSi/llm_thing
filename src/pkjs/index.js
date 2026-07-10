@@ -85,7 +85,12 @@ Pebble.addEventListener('webviewclosed', function(e) {
   }
 
   settings.logDebug('configuration saved');
-  savedSettings = clay.getSettings(e.response, false);
+  try {
+    savedSettings = clay.getSettings(e.response, false);
+  } catch (error) {
+    settings.logDebug('configuration response invalid: ' + String(error && error.message || error));
+    return;
+  }
   normalizedSettings = settings.extend(settings.DEFAULT_SETTINGS, savedSettings);
   if (normalizedSettings.DeleteAllPastChats) {
     settings.logDebug('delete all saved chats from settings');
@@ -100,7 +105,7 @@ Pebble.addEventListener('appmessage', function(e) {
   var dict = e.payload || {};
   var requestId = dict.RequestId || 0;
 
-  if (dict.HealthSummaryRequest && (dict.HealthSummaryJson !== undefined || dict.HealthSummaryError !== undefined)) {
+  if (dict.HealthSummaryRequest) {
     watch.handleHealthSummaryResponse(dict);
     return;
   }

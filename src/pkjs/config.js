@@ -44,6 +44,71 @@ module.exports = [
         }
       },
       {
+        "type": "select",
+        "messageKey": "ApiMode",
+        "label": "API Mode",
+        "defaultValue": "auto",
+        "options": [
+          {
+            "label": "Auto (detect from endpoint)",
+            "value": "auto"
+          },
+          {
+            "label": "Responses",
+            "value": "responses"
+          },
+          {
+            "label": "Chat Completions",
+            "value": "chat-completions"
+          }
+        ]
+      },
+      {
+        "type": "input",
+        "messageKey": "MaxOutputTokens",
+        "label": "Max Output Tokens",
+        "description": "0 lets the model choose. >0 caps output length; may affect reasoning depth, keep 0 when reasoning matter.",
+        "defaultValue": 0,
+        "attributes": {
+          "type": "number",
+          "min": 0,
+          "max": 100000,
+          "step": 128
+        }
+      },
+      {
+        "type": "select",
+        "messageKey": "ReasoningEffort",
+        "label": "Reasoning Effort",
+        "defaultValue": "",
+        "options": [
+          {
+            "label": "Off (provider default)",
+            "value": ""
+          },
+          {
+            "label": "None",
+            "value": "none"
+          },
+          {
+            "label": "Minimal",
+            "value": "minimal"
+          },
+          {
+            "label": "Low",
+            "value": "low"
+          },
+          {
+            "label": "Medium",
+            "value": "medium"
+          },
+          {
+            "label": "High",
+            "value": "high"
+          }
+        ]
+      },
+      {
         "type": "input",
         "messageKey": "RequestTimeoutMs",
         "label": "Request Timeout (ms)",
@@ -148,11 +213,12 @@ module.exports = [
         "type": "input",
         "messageKey": "MaxToolCalls",
         "label": "Max Tool Calls",
-        "description": "Maximum phone-side tool calls per request. Use 0 to disable all tools.",
+        "description": "Maximum phone-side tool calls per request, up to 16. Use 0 to disable all tools.",
         "defaultValue": 4,
         "attributes": {
           "type": "number",
           "min": 0,
+          "max": 16,
           "step": 1
         }
       }

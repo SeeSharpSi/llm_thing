@@ -107,6 +107,19 @@ module.exports = {
       return null;
     }
 
+    function setExpanded(expanded) {
+      var controls = body.querySelectorAll('input, button');
+      var i;
+
+      body.style.display = expanded ? 'block' : 'none';
+      root.className = root.className.replace(/\s*open/g, '') + (expanded ? ' open' : '');
+      for (i = 0; i < controls.length; i += 1) {
+        if (controls[i].getAttribute('data-manipulator-target') === null) {
+          controls[i].disabled = !expanded;
+        }
+      }
+    }
+
     function serverIndex(card) {
       var cards = root.querySelectorAll('[data-mcp-server]');
       var i;
@@ -215,6 +228,7 @@ module.exports = {
 
       list.innerHTML = html;
       item.$manipulatorTarget.set('value', JSON.stringify(item.collectServers()));
+      setExpanded(body.style.display !== 'none');
     };
 
     function syncValue() {
@@ -229,18 +243,12 @@ module.exports = {
       var index;
       var header;
 
-      if (e.target.getAttribute('data-mcp-toggle') !== null) {
-        if (body.style.display === 'none') {
-          body.style.display = 'block';
-          root.className += ' open';
-        } else {
-          body.style.display = 'none';
-          root.className = root.className.replace(/\s*open/g, '');
-        }
+      if (closestByAttr(e.target, 'data-mcp-toggle')) {
+        setExpanded(body.style.display === 'none');
         return;
       }
 
-      if (e.target.getAttribute('data-mcp-add') !== null) {
+      if (closestByAttr(e.target, 'data-mcp-add')) {
         servers = item.collectServers();
         servers.push(emptyServer());
         item.renderServers(servers);
@@ -287,6 +295,7 @@ module.exports = {
 
     root.addEventListener('input', syncValue);
     root.addEventListener('change', syncValue);
+    setExpanded(false);
   },
   defaults: {
     defaultValue: ''

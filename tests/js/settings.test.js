@@ -37,6 +37,7 @@ test('extend clamps numeric settings and enforces font choices', function() {
   var settings = require(settingsPath);
 
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxToolCalls: -4 }).MaxToolCalls, 0);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxToolCalls: 99 }).MaxToolCalls, 16);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { RequestTimeoutMs: 50 }).RequestTimeoutMs, 1000);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { RequestTimeoutMs: 'bad' }).RequestTimeoutMs, 60000);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { FontSize: 19 }).FontSize, 18);
@@ -84,4 +85,27 @@ test('text and JSON helpers handle nested provider content', function() {
     { text: 'one' },
     { content: [{ text: 'two' }, 'three'] }
   ]), 'onetwothree');
+});
+
+test('extend normalizes ApiMode, MaxOutputTokens, and ReasoningEffort', function() {
+  var settings = require(settingsPath);
+
+  assert.equal(settings.DEFAULT_SETTINGS.ApiMode, 'auto');
+  assert.equal(settings.DEFAULT_SETTINGS.MaxOutputTokens, 0);
+  assert.equal(settings.DEFAULT_SETTINGS.ReasoningEffort, '');
+
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'chat-completions' }).ApiMode, 'chat-completions');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'responses' }).ApiMode, 'responses');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'bogus' }).ApiMode, 'auto');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: '' }).ApiMode, 'auto');
+
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxOutputTokens: 200000 }).MaxOutputTokens, 100000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxOutputTokens: -5 }).MaxOutputTokens, 0);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxOutputTokens: 'bad' }).MaxOutputTokens, 0);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxOutputTokens: 2048 }).MaxOutputTokens, 2048);
+
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ReasoningEffort: 'high' }).ReasoningEffort, 'high');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ReasoningEffort: 'minimal' }).ReasoningEffort, 'minimal');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ReasoningEffort: 'none' }).ReasoningEffort, 'none');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ReasoningEffort: 'bogus' }).ReasoningEffort, '');
 });

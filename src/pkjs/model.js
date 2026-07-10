@@ -6,6 +6,38 @@ var chatStore = require('./chat_store');
 var s_chat_history = [];
 var s_saved_chat_history = [];
 var s_active_chat_id = null;
+var s_native_unsupported_keys = {};
+var MAX_TOOL_RESULT_CHARS = 6000;
+var MAX_TOOL_RESULTS_TOTAL_CHARS = 12000;
+var TOOL_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
+var NATIVE_UNSUPPORTED_TTL_MS = 5 * 60 * 1000;
+
+function nativeUnsupportedKey(settings) {
+  return String((settings && settings.Endpoint) || '').toLowerCase() + '|' +
+    String((settings && settings.ApiMode) || 'auto') + '|' +
+    String((settings && settings.Model) || '');
+}
+
+function isNativeToolsUnsupported(settings) {
+  var key = nativeUnsupportedKey(settings);
+  var markedAt = s_native_unsupported_keys[key];
+
+  if (!markedAt) {
+    return false;
+  }
+  if (new Date().getTime() - markedAt > NATIVE_UNSUPPORTED_TTL_MS) {
+    delete s_native_unsupported_keys[key];
+    return false;
+  }
+  return true;
+}
+
+function markNativeToolsUnsupported(settings) {
+  if (Object.keys(s_native_unsupported_keys).length >= 32) {
+    s_native_unsupported_keys = {};
+  }
+  s_native_unsupported_keys[nativeUnsupportedKey(settings)] = new Date().getTime();
+}
 
 function pad2(value) {
   return value < 10 ? '0' + value : String(value);
@@ -50,7 +82,7 @@ function buildToolGuidance(toolDefinitions, maxToolCalls) {
     return '';
   }
 
-  text = '\n\nPhone-side tools are available. Current phone date/time: ' + formatDateTime(new Date()) + '.' +
+  text = '\n\nPhone-side tools are available.' +
     '\nOnly tools listed here are enabled in app settings.' +
     '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.';
 
@@ -84,6 +116,8 @@ function buildToolInstructions(toolDefinitions, maxToolCalls, nativeTools) {
     text += '\n- ' + toolDefinitions[i].name + ': ' + toolDefinitions[i].description + '\n  Parameters JSON Schema: ' + common.safeJson(toolDefinitions[i].parameters);
   }
 
+  text += '\nCurrent phone date/time: ' + formatDateTime(new Date()) + '.';
+
   return text;
 }
 
@@ -98,7 +132,32 @@ function buildSystemPrompt(settings, toolInstructions) {
 }
 
 function isChatEndpoint(settings) {
-  return String(settings.Endpoint || '').toLowerCase().indexOf('/chat/completions') !== -1;
+  if (settings && settings.ApiMode === 'chat-completions') {
+    return true;
+  }
+  if (settings && settings.ApiMode === 'responses') {
+    return false;
+  }
+  return String((settings && settings.Endpoint) || '').toLowerCase().indexOf('/chat/completions') !== -1;
+}
+
+function endpointHost(settings) {
+  var endpoint = String((settings && settings.Endpoint) || '');
+  var match;
+
+  try {
+    match = endpoint.match(/^https?:\/\/([^\/]+)/i);
+    return match ? match[1].toLowerCase() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function isOpenAiResponsesEndpoint(settings) {
+  if (isChatEndpoint(settings)) {
+    return false;
+  }
+  return endpointHost(settings) === 'api.openai.com';
 }
 
 function shouldRequestReasoningSummary(settings, options) {
@@ -133,6 +192,27 @@ function buildConversation(settings, userText, toolInstructions) {
   return conversation;
 }
 
+function historyTotalChars(history) {
+  var total = 0;
+  var i;
+
+  for (i = 0; i < history.length; i += 1) {
+    total += String((history[i] && history[i].content) || '').length;
+  }
+
+  return total;
+}
+
+function trimHistoryByCountAndChars(history) {
+  while (history.length > common.MAX_CHAT_HISTORY_MESSAGES) {
+    history.splice(0, 2);
+  }
+
+  while (history.length >= 2 && historyTotalChars(history) > common.MAX_CHAT_HISTORY_TOTAL_CHARS) {
+    history.splice(0, 2);
+  }
+}
+
 function appendChatTurn(history, userText, assistantText) {
   history.push({
     role: 'user',
@@ -143,9 +223,7 @@ function appendChatTurn(history, userText, assistantText) {
     content: common.truncate(assistantText, common.MAX_CHAT_HISTORY_MESSAGE_CHARS)
   });
 
-  while (history.length > common.MAX_CHAT_HISTORY_MESSAGES) {
-    history.splice(0, 2);
-  }
+  trimHistoryByCountAndChars(history);
 }
 
 function copyChatHistory(messages) {
@@ -165,23 +243,22 @@ function copyChatHistory(messages) {
     });
   }
 
-  while (result.length > common.MAX_CHAT_HISTORY_MESSAGES) {
-    result.splice(0, 2);
-  }
+  trimHistoryByCountAndChars(result);
 
   return result;
 }
 
 function rememberChatTurn(settings, userText, assistantText) {
   var saved;
+  var answerOnly = stripThinkingWrapper(assistantText);
 
-  appendChatTurn(s_chat_history, userText, assistantText);
+  appendChatTurn(s_chat_history, userText, answerOnly);
 
   if (!settings.PreserveChats) {
     return;
   }
 
-  appendChatTurn(s_saved_chat_history, userText, stripThinkingWrapper(assistantText));
+  appendChatTurn(s_saved_chat_history, userText, answerOnly);
   saved = chatStore.saveChatHistory(s_active_chat_id, s_saved_chat_history);
   if (saved) {
     s_active_chat_id = saved.id;
@@ -275,9 +352,29 @@ function buildNativeTools(toolDefinitions, chatMode) {
   return result;
 }
 
+function buildReasoningObject(settings, options) {
+  var reasoning = {};
+  var effort;
+
+  if (shouldRequestReasoningSummary(settings, options)) {
+    reasoning.summary = 'auto';
+  }
+
+  effort = common.REASONING_EFFORTS && common.REASONING_EFFORTS.hasOwnProperty(settings.ReasoningEffort)
+    ? common.REASONING_EFFORTS[settings.ReasoningEffort]
+    : '';
+  if (effort) {
+    reasoning.effort = effort;
+  }
+
+  return Object.keys(reasoning).length ? reasoning : null;
+}
+
 function buildBody(settings, conversation, options) {
   var chatMode = isChatEndpoint(settings);
   var body;
+  var reasoning;
+  var tools;
 
   options = options || {};
 
@@ -289,6 +386,9 @@ function buildBody(settings, conversation, options) {
     if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
       body.tools = buildNativeTools(options.toolDefinitions, true);
     }
+    if (settings.MaxOutputTokens && settings.MaxOutputTokens > 0) {
+      body.max_completion_tokens = settings.MaxOutputTokens;
+    }
     return body;
   }
 
@@ -297,15 +397,60 @@ function buildBody(settings, conversation, options) {
     input: conversation
   };
 
-  if (shouldRequestReasoningSummary(settings, options)) {
-    body.reasoning = { summary: 'auto' };
+  reasoning = buildReasoningObject(settings, options);
+  if (reasoning) {
+    body.reasoning = reasoning;
+    if (isOpenAiResponsesEndpoint(settings)) {
+      reasoning.encrypted_content = 'auto';
+    }
   }
 
+  tools = [];
   if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
-    body.tools = buildNativeTools(options.toolDefinitions, false);
+    tools = buildNativeTools(options.toolDefinitions, false);
+  }
+  if (settings.WebSearchEnabled && !options.skipWebSearch) {
+    tools.push({ type: 'web_search' });
+  }
+  if (tools.length) {
+    body.tools = tools;
+  }
+
+  if (settings.MaxOutputTokens && settings.MaxOutputTokens > 0) {
+    body.max_output_tokens = settings.MaxOutputTokens;
+  }
+
+  if (isOpenAiResponsesEndpoint(settings)) {
+    body.store = false;
   }
 
   return body;
+}
+
+function isTransientHttpStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status < 600);
+}
+
+function parseRetryAfterMs(request) {
+  var raw;
+  var seconds;
+
+  try {
+    raw = request.getResponseHeader('Retry-After');
+  } catch (e) {
+    raw = null;
+  }
+
+  if (!raw) {
+    return 0;
+  }
+
+  seconds = parseInt(raw, 10);
+  if (isNaN(seconds) || seconds < 0) {
+    return 0;
+  }
+
+  return Math.min(seconds * 1000, common.MAX_RETRY_AFTER_MS);
 }
 
 function requestModel(settings, conversation, requestId, options, callback) {
@@ -315,19 +460,48 @@ function requestModel(settings, conversation, requestId, options, callback) {
   }
   options = options || {};
 
-  function sendAttempt(skipReasoningSummary) {
+  var done = false;
+  var reasoningSummarySkipped = false;
+  var webSearchFallbackDone = false;
+  var transientRetried = false;
+
+  function finishOnce(error, json, meta) {
+    if (done) {
+      return;
+    }
+    done = true;
+    callback(error, json, meta);
+  }
+
+  function scheduleTransientRetry(skipReasoningSummary, skipWebSearch, delayMs) {
+    transientRetried = true;
+    setTimeout(function() {
+      if (done || !watch.isCurrentRequest(requestId)) {
+        return;
+      }
+      attempt(skipReasoningSummary, skipWebSearch);
+    }, delayMs);
+  }
+
+  function attempt(skipReasoningSummary, skipWebSearch) {
     var request = new XMLHttpRequest();
     var requestOptions = copyRequestOptions(options);
     var includeReasoningSummary;
+    var webSearchActive;
     var body;
 
     if (skipReasoningSummary) {
       requestOptions.skipReasoningSummary = true;
     }
+    if (skipWebSearch) {
+      requestOptions.skipWebSearch = true;
+    }
+
     includeReasoningSummary = shouldRequestReasoningSummary(settings, requestOptions);
+    webSearchActive = !!settings.WebSearchEnabled && !skipWebSearch && !isChatEndpoint(settings);
     body = JSON.stringify(buildBody(settings, conversation, requestOptions));
 
-    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + settings.RequestTimeoutMs);
+    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' webSearch=' + (webSearchActive ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + settings.RequestTimeoutMs);
 
     request.open('POST', settings.Endpoint, true);
     request.setRequestHeader('Content-Type', 'application/json');
@@ -349,23 +523,38 @@ function requestModel(settings, conversation, requestId, options, callback) {
       common.logDebug('llm response status=' + request.status + ' bytes=' + String(request.responseText || '').length);
 
       if (request.status < 200 || request.status >= 300) {
-        if (includeReasoningSummary && (request.status === 400 || request.status === 422)) {
+        if (includeReasoningSummary && (request.status === 400 || request.status === 422) && !reasoningSummarySkipped) {
           common.logDebug('reasoning summary rejected; retrying without summary');
-          sendAttempt(true);
+          reasoningSummarySkipped = true;
+          attempt(true, skipWebSearch);
           return;
         }
-        callback('HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 250), null, { status: request.status });
+
+        if (webSearchActive && (request.status === 400 || request.status === 404 || request.status === 422) && !webSearchFallbackDone) {
+          common.logDebug('web search hosted tool rejected; retrying without hosted web tool');
+          webSearchFallbackDone = true;
+          attempt(skipReasoningSummary, true);
+          return;
+        }
+
+        if (isTransientHttpStatus(request.status) && !transientRetried) {
+          common.logDebug('transient http status=' + request.status + '; retrying once');
+          scheduleTransientRetry(skipReasoningSummary, skipWebSearch, parseRetryAfterMs(request));
+          return;
+        }
+
+        finishOnce('HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 250), null, { status: request.status });
         return;
       }
 
       try {
         json = JSON.parse(request.responseText);
       } catch (e) {
-        callback('Bad JSON response');
+        finishOnce('Bad JSON response');
         return;
       }
 
-      callback(null, json, { status: request.status });
+      finishOnce(null, json, { status: request.status });
     };
 
     request.onerror = function() {
@@ -374,7 +563,11 @@ function requestModel(settings, conversation, requestId, options, callback) {
         return;
       }
       common.logDebug('llm network error');
-      callback('Network error');
+      if (!transientRetried) {
+        scheduleTransientRetry(skipReasoningSummary, skipWebSearch, 0);
+        return;
+      }
+      finishOnce('Network error');
     };
 
     request.ontimeout = function() {
@@ -383,7 +576,11 @@ function requestModel(settings, conversation, requestId, options, callback) {
         return;
       }
       common.logDebug('llm timeout');
-      callback('Request timed out');
+      if (!transientRetried) {
+        scheduleTransientRetry(skipReasoningSummary, skipWebSearch, 0);
+        return;
+      }
+      finishOnce('Request timed out');
     };
 
     request.onabort = function() {
@@ -393,7 +590,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
     request.send(body);
   }
 
-  sendAttempt(false);
+  attempt(false, false);
 }
 
 function getUsageToken(usage, primaryName, fallbackName) {
@@ -603,7 +800,11 @@ function extractResponseText(json) {
 }
 
 function stripThinking(text) {
-  return String(text || '').replace(/<\/think>[\s\S]*?<\/think>/gi, '').replace(/^\s+/, '');
+  return String(text || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+    .replace(/<\/think>/gi, '')
+    .replace(/^\s+/, '');
 }
 
 function stripThinkingWrapper(text) {
@@ -643,28 +844,200 @@ function appendToolRoundTrace(base, json, toolCalls, toolMap) {
   return appendThinkingText(trace, formatToolCallTrace(toolCalls, toolMap));
 }
 
+function extractRefusal(json) {
+  var message = getChoiceMessage(json);
+  var i;
+  var j;
+  var item;
+  var content;
+
+  if (message && message.refusal) {
+    return common.trim(String(message.refusal));
+  }
+
+  if (message && message.content && message.content.length) {
+    for (i = 0; i < message.content.length; i += 1) {
+      content = message.content[i] || {};
+      if (content.type === 'refusal' && content.text) {
+        return common.trim(String(content.text));
+      }
+    }
+  }
+
+  if (json.output && json.output.length) {
+    for (i = 0; i < json.output.length; i += 1) {
+      item = json.output[i] || {};
+      if (item.content && item.content.length) {
+        for (j = 0; j < item.content.length; j += 1) {
+          content = item.content[j] || {};
+          if (content.type === 'refusal' && content.text) {
+            return common.trim(String(content.text));
+          }
+        }
+      }
+    }
+  }
+
+  return '';
+}
+
+function extractIncompleteReason(json) {
+  var status = String(json && json.status || '');
+  var details = json && json.incomplete_details;
+
+  if (status !== 'incomplete') {
+    return '';
+  }
+
+  if (details && details.reason) {
+    return common.trim(String(details.reason));
+  }
+
+  return '';
+}
+
+function collectCitationUrl(value, urls, seen) {
+  var url = '';
+
+  if (!value) {
+    return;
+  }
+
+  if (typeof value === 'string') {
+    url = common.trim(value);
+  } else if (value.url) {
+    url = common.trim(typeof value.url === 'string' ? value.url : (value.url.url || value.url.href || ''));
+  } else if (value.citation) {
+    url = common.trim(typeof value.citation === 'string' ? value.citation : (value.citation.url || ''));
+  }
+
+  if (!url || seen[url] || url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0) {
+    return;
+  }
+
+  seen[url] = true;
+  urls.push(url);
+}
+
+function extractCitationUrls(json) {
+  var urls = [];
+  var seen = {};
+  var message = getChoiceMessage(json);
+  var i;
+  var j;
+  var k;
+  var item;
+  var content;
+  var annotation;
+
+  if (message && message.annotations && message.annotations.length) {
+    for (i = 0; i < message.annotations.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
+      annotation = message.annotations[i] || {};
+      if (annotation.type === 'url_citation') {
+        collectCitationUrl(annotation, urls, seen);
+      }
+    }
+  }
+
+  if (message && message.citations && message.citations.length) {
+    for (i = 0; i < message.citations.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
+      collectCitationUrl(message.citations[i], urls, seen);
+    }
+  }
+
+  if (json.output && json.output.length) {
+    for (i = 0; i < json.output.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
+      item = json.output[i] || {};
+      if (item.content && item.content.length) {
+        for (j = 0; j < item.content.length && urls.length < common.MAX_SOURCES_URLS; j += 1) {
+          content = item.content[j] || {};
+          if (content.annotations && content.annotations.length) {
+            for (k = 0; k < content.annotations.length && urls.length < common.MAX_SOURCES_URLS; k += 1) {
+              annotation = content.annotations[k] || {};
+              if (annotation.type === 'url_citation') {
+                collectCitationUrl(annotation, urls, seen);
+              }
+            }
+          }
+          if (content.url && content.type === 'url_citation') {
+            collectCitationUrl(content, urls, seen);
+          }
+        }
+      }
+    }
+  }
+
+  return urls;
+}
+
+function appendCitations(json, answer) {
+  var urls = extractCitationUrls(json);
+  var text = String(answer || '');
+  var lines = [];
+  var i;
+
+  if (!urls.length) {
+    return text;
+  }
+
+  for (i = 0; i < urls.length; i += 1) {
+    if (text.indexOf(urls[i]) !== -1) {
+      continue;
+    }
+    lines.push('- ' + urls[i]);
+  }
+
+  if (!lines.length) {
+    return text;
+  }
+
+  return text + '\n\nSources:\n' + lines.join('\n');
+}
+
 function parseResponse(json, showThinking, extraThinking) {
   var answer = extractResponseText(json);
-  var fallback = 'No response text. ' + summarizeResponseShape(json);
-  var thinking = extractResponseThinking(json);
+  var refusal;
+  var incomplete;
+  var thinking;
   var blocks;
+  var result;
 
-  answer = answer || fallback;
+  if (!answer) {
+    refusal = extractRefusal(json);
+    if (refusal) {
+      answer = refusal;
+    }
+  }
+
+  if (!answer) {
+    incomplete = extractIncompleteReason(json);
+    if (incomplete) {
+      answer = 'Response incomplete: ' + incomplete;
+    }
+  }
+
+  if (!answer) {
+    common.logDebug('no response text; shape=' + summarizeResponseShape(json));
+    answer = 'No response text.';
+  }
+
+  answer = appendCitations(json, answer);
 
   if (!showThinking) {
     return stripThinking(answer);
   }
 
   blocks = extractThinkingBlocks(answer);
+  thinking = extractResponseThinking(json);
   thinking = appendThinkingText(thinking, blocks.thinking);
   thinking = appendThinkingText(common.trim(extraThinking), thinking);
-  answer = blocks.answer;
+  result = blocks.answer;
 
   if (!thinking) {
-    return answer;
+    return result;
   }
 
-  return 'Thinking:\n' + thinking + '\n\nAnswer:\n' + stripThinking(answer);
+  return 'Thinking:\n' + thinking + '\n\nAnswer:\n' + stripThinking(result);
 }
 
 function stripCodeFence(text) {
@@ -888,6 +1261,39 @@ function formatToolResultOutput(result) {
   }
 
   return common.safeJson({ result: result.result });
+}
+
+function capToolResults(results, remainingChars) {
+  var i;
+  var result;
+  var value;
+  var limit;
+
+  for (i = 0; i < results.length; i += 1) {
+    result = results[i] || {};
+    if (result.error || result.result === undefined || result.result === null) {
+      continue;
+    }
+    if (remainingChars <= 0) {
+      delete result.result;
+      result.error = 'Tool result omitted: total tool-result budget exhausted';
+      continue;
+    }
+
+    value = typeof result.result === 'string' ? result.result : common.safeJson(result.result);
+    limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingChars);
+    if (value.length > limit) {
+      if (limit > TOOL_RESULT_TRUNCATION_SUFFIX.length) {
+        value = value.substring(0, limit - TOOL_RESULT_TRUNCATION_SUFFIX.length) + TOOL_RESULT_TRUNCATION_SUFFIX;
+      } else {
+        value = value.substring(0, limit);
+      }
+    }
+    result.result = value;
+    remainingChars -= value.length;
+  }
+
+  return remainingChars;
 }
 
 function buildSkippedToolResult(call, index, error) {
@@ -1115,11 +1521,12 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
   });
 }
 
-function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, mcpToolCallCounts, thinkingTrace, callback) {
+function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
 
   mcpToolCallCounts = mcpToolCallCounts || {};
   thinkingTrace = thinkingTrace || '';
+  remainingToolResultChars = typeof remainingToolResultChars === 'number' ? remainingToolResultChars : MAX_TOOL_RESULTS_TOTAL_CHARS;
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
   watch.progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
@@ -1182,13 +1589,14 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
         return;
       }
       results = mergePlannedToolResults(budgetPlan.plan, results);
+      remainingToolResultChars = capToolResults(results, remainingToolResultChars);
       common.logDebug('tool loop results=' + results.length + ' skipped=' + skippedCount);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
         requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
         return;
       }
-      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, callback);
+      completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
     });
   });
 }
@@ -1217,7 +1625,7 @@ function requestCompletion(requestId, userText) {
   if (settings.MaxToolCalls <= 0) {
     common.logDebug('tools disabled maxToolCalls=0');
     conversation = buildConversation(settings, userText, '');
-    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '', function(completionError, text) {
+    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -1227,8 +1635,8 @@ function requestCompletion(requestId, userText) {
         return;
       }
 
-      watch.sendResponse(requestId, settings, text, function() {
-        if (watch.isCurrentRequest(requestId)) {
+      watch.sendResponse(requestId, settings, text, function(sendError) {
+        if (!sendError && watch.isCurrentRequest(requestId)) {
           rememberChatTurn(settings, userText, text);
         }
         watch.finishRequestLifecycle(requestId);
@@ -1248,8 +1656,8 @@ function requestCompletion(requestId, userText) {
       return;
     }
 
-    conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, true));
-    common.logDebug('tools discover done tools=' + discoveredTools.length);
+    conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, !isNativeToolsUnsupported(settings)));
+    common.logDebug('tools discover done tools=' + discoveredTools.length + ' nativeUnsupported=' + (isNativeToolsUnsupported(settings) ? '1' : '0'));
     watch.progressDone(requestId, 'Tools loaded', discoveredTools.length + ' tools');
 
     function finishCompletion(completionError, text) {
@@ -1262,23 +1670,24 @@ function requestCompletion(requestId, userText) {
         return;
       }
 
-      watch.sendResponse(requestId, settings, text, function() {
-        if (watch.isCurrentRequest(requestId)) {
+      watch.sendResponse(requestId, settings, text, function(sendError) {
+        if (!sendError && watch.isCurrentRequest(requestId)) {
           rememberChatTurn(settings, userText, text);
         }
         watch.finishRequestLifecycle(requestId);
       });
     }
 
-    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'native', 0, 0, {}, '', function(completionError, text, meta) {
+    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, isNativeToolsUnsupported(settings) ? 'text' : 'native', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text, meta) {
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
 
       if (completionError && meta && meta.nativeUnsupported) {
         common.logDebug('native tool request rejected; retrying text tool fallback');
+        markNativeToolsUnsupported(settings);
         conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, false));
-        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, {}, '', finishCompletion);
+        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, finishCompletion);
         return;
       }
 

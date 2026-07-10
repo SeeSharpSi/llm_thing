@@ -2,6 +2,8 @@ var common = require('./settings');
 
 var CHUNK_SIZE = 400;
 var MAX_RESPONSE_CHARS = 6000;
+var MAX_SEND_ATTEMPTS = 3;
+var SEND_RETRY_DELAY_MS = 100;
 // Non-NUL style markers are stripped from display and drive watch-side fonts.
 var WATCH_BOLD_ON = '\u0001';
 var WATCH_BOLD_OFF = '\u0002';
@@ -43,6 +45,68 @@ function isCurrentRequest(requestId) {
 
 function isCurrentMessage(dict) {
   return !dictHasRequestId(dict) || isCurrentRequest(dict.RequestId);
+}
+
+function utf8BytesForCodePoint(codePoint) {
+  if (codePoint <= 0x7f) {
+    return 1;
+  }
+  if (codePoint <= 0x7ff) {
+    return 2;
+  }
+  if (codePoint <= 0xffff) {
+    return 3;
+  }
+  return 4;
+}
+
+function truncateAtCodePointBoundary(text, maxLength) {
+  var value = String(text || '');
+  var end = value.length > maxLength ? maxLength : value.length;
+
+  if (end > 0 && end < value.length &&
+      value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff &&
+      value.charCodeAt(end) >= 0xdc00 && value.charCodeAt(end) <= 0xdfff) {
+    end -= 1;
+  }
+
+  return value.substring(0, end);
+}
+
+function nextUtf8Chunk(text, start, maxBytes) {
+  var value = String(text || '');
+  var end = start;
+  var bytes = 0;
+  var first;
+  var second;
+  var width;
+  var codePoint;
+  var codePointBytes;
+
+  while (end < value.length) {
+    first = value.charCodeAt(end);
+    codePoint = first;
+    width = 1;
+    if (first >= 0xd800 && first <= 0xdbff && end + 1 < value.length) {
+      second = value.charCodeAt(end + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        codePoint = 0x10000 + ((first - 0xd800) * 0x400) + (second - 0xdc00);
+        width = 2;
+      }
+    }
+    codePointBytes = utf8BytesForCodePoint(codePoint);
+    if (bytes + codePointBytes > maxBytes) {
+      break;
+    }
+    bytes += codePointBytes;
+    end += width;
+  }
+
+  return {
+    text: value.substring(start, end),
+    end: end,
+    bytes: bytes
+  };
 }
 
 function abortXhrsForKey(key) {
@@ -188,9 +252,16 @@ function processSendQueue() {
     processSendQueue();
   }, function(e) {
     s_send_busy = false;
-    common.logDebug('sendAppMessage failed: ' + JSON.stringify(e));
+    if (item.attempts < MAX_SEND_ATTEMPTS && isCurrentMessage(item.dict)) {
+      item.attempts += 1;
+      common.logDebug('sendAppMessage retry=' + item.attempts + ' error=' + JSON.stringify(e));
+      s_send_queue.unshift(item);
+      setTimeout(processSendQueue, SEND_RETRY_DELAY_MS);
+      return;
+    }
+    common.logDebug('sendAppMessage failed attempts=' + item.attempts + ': ' + JSON.stringify(e));
     if (item.onFailure) {
-      item.onFailure(e);
+      item.onFailure(e || { error: 'AppMessage failed' });
     }
     processSendQueue();
   });
@@ -199,15 +270,20 @@ function processSendQueue() {
 function sendMessage(dict, onSuccess, onFailure) {
   if (!isCurrentMessage(dict)) {
     common.logDebug('dropping stale message request=' + dict.RequestId);
-    return;
+    if (onFailure) {
+      onFailure({ error: 'Stale request' });
+    }
+    return false;
   }
 
   s_send_queue.push({
     dict: dict,
     onSuccess: onSuccess,
-    onFailure: onFailure
+    onFailure: onFailure,
+    attempts: 1
   });
   processSendQueue();
+  return true;
 }
 
 function syncWatchSettings(settings) {
@@ -227,38 +303,76 @@ function syncWatchSettings(settings) {
   });
 }
 
-function sendReset(requestId, onSuccess) {
-  sendMessage({ ResponseReset: 1, RequestId: requestId }, onSuccess);
+function sendReset(requestId, onSuccess, onFailure) {
+  sendMessage({ ResponseReset: 1, RequestId: requestId }, onSuccess, onFailure);
 }
 
 function sendWatchText(requestId, text, includeDone, onDone) {
   var i = 0;
-  var value = String(text || '').substring(0, MAX_RESPONSE_CHARS);
+  var chunkIndex = 0;
+  var completed = false;
+  var value = truncateAtCodePointBoundary(text, MAX_RESPONSE_CHARS);
+
+  function complete(error) {
+    if (completed) {
+      return;
+    }
+    completed = true;
+    if (onDone) {
+      onDone(error || null);
+    }
+  }
+
+  function fail(error) {
+    var message = 'Response transfer failed. Try again.';
+
+    if (!isCurrentRequest(requestId)) {
+      complete(error || new Error(message));
+      return;
+    }
+    sendMessage({ ResponseError: message, RequestId: requestId }, function() {
+      complete(error || new Error(message));
+    }, function() {
+      complete(error || new Error(message));
+    });
+  }
 
   function finish() {
     if (includeDone) {
-      sendMessage({ ResponseDone: 1, RequestId: requestId }, onDone);
-    } else if (onDone) {
-      onDone();
+      sendMessage({ ResponseDone: 1, RequestId: requestId }, function() {
+        complete(null);
+      }, fail);
+    } else {
+      complete(null);
     }
   }
 
   function sendNext() {
+    var chunk;
+
     if (i >= value.length) {
       finish();
       return;
     }
 
+    chunk = nextUtf8Chunk(value, i, CHUNK_SIZE);
+    if (!chunk.text) {
+      fail(new Error('Unable to encode response chunk'));
+      return;
+    }
+
     sendMessage({
-      ResponseChunk: value.substring(i, i + CHUNK_SIZE),
+      ResponseChunk: chunk.text,
+      ResponseChunkIndex: chunkIndex,
       RequestId: requestId
     }, function() {
-      i += CHUNK_SIZE;
+      i = chunk.end;
+      chunkIndex += 1;
       sendNext();
-    });
+    }, fail);
   }
 
-  sendReset(requestId, sendNext);
+  sendReset(requestId, sendNext, fail);
 }
 
 function sendPastChats(chats, onDone) {
@@ -714,7 +828,7 @@ function requestHealthSummary(range, requestId, callback) {
 
 function handleHealthSummaryResponse(dict) {
   var key = String(dict.HealthSummaryRequest || 0);
-  var pending = clearPendingHealthSummary(key);
+  var pending = s_pending_health_summaries[key];
   var callback;
 
   if (!pending) {
@@ -722,10 +836,11 @@ function handleHealthSummaryResponse(dict) {
     return;
   }
 
-  callback = pending.callback;
   if (dictHasRequestId(dict) && Number(dict.RequestId) !== Number(pending.requestId)) {
     return;
   }
+  pending = clearPendingHealthSummary(key);
+  callback = pending.callback;
   if (!isCurrentRequest(pending.requestId)) {
     return;
   }

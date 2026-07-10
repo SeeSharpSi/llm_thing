@@ -144,5 +144,20 @@ test('saved-chat requests reject disabled preservation and missing chats', funct
   ]);
 });
 
-test.todo('token-only health responses route to missing-data handling');
-test.todo('malformed Clay webview responses are caught without losing settings');
+test('token-only health responses route to missing-data handling', function() {
+  var harness = createHarness();
+
+  global.Pebble.emit('appmessage', { payload: { RequestId: 7, HealthSummaryRequest: 2 } });
+
+  assert.deepEqual(harness.watch.calls, [['health', { RequestId: 7, HealthSummaryRequest: 2 }]]);
+});
+
+test('malformed Clay webview responses are caught without losing settings', function() {
+  var harness = createHarness();
+
+  assert.doesNotThrow(function() {
+    global.Pebble.emit('webviewclosed', { response: '{bad' });
+  });
+  assert.deepEqual(harness.settings.saved, []);
+  assert.deepEqual(harness.watch.calls, []);
+});

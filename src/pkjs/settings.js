@@ -3,6 +3,11 @@ var DEFAULT_MAX_TOOL_CALLS = 4;
 var DEFAULT_REQUEST_TIMEOUT_MS = 60000;
 var MAX_CHAT_HISTORY_MESSAGES = 16;
 var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
+var MAX_CHAT_HISTORY_TOTAL_CHARS = 12000;
+var MAX_RETRY_AFTER_MS = 5000;
+var MAX_SOURCES_URLS = 5;
+var API_MODES = { 'auto': 'auto', 'responses': 'responses', 'chat-completions': 'chat-completions' };
+var REASONING_EFFORTS = { '': '', 'none': 'none', 'minimal': 'minimal', 'low': 'low', 'medium': 'medium', 'high': 'high' };
 
 var DEFAULT_SETTINGS = {
   Endpoint: 'https://api.openai.com/v1/responses',
@@ -20,6 +25,9 @@ var DEFAULT_SETTINGS = {
   TimelineToolEnabled: false,
   HealthToolEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
+  ApiMode: 'auto',
+  MaxOutputTokens: 0,
+  ReasoningEffort: '',
   FontSize: 18,
   BuzzStrength: 1,
   ScrollLines: 3,
@@ -104,7 +112,12 @@ function extend(base, extra) {
   result.HealthToolEnabled = result.HealthToolEnabled === true || result.HealthToolEnabled === 1 || result.HealthToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
   result.TouchScrollEnabled = result.TouchScrollEnabled === true || result.TouchScrollEnabled === 1 || result.TouchScrollEnabled === '1';
-  result.MaxToolCalls = minNumber(result.MaxToolCalls, 0, DEFAULT_MAX_TOOL_CALLS);
+  result.ApiMode = API_MODES.hasOwnProperty(result.ApiMode) ? API_MODES[result.ApiMode] : 'auto';
+  result.MaxOutputTokens = clampNumber(result.MaxOutputTokens, 0, 100000, 0);
+  result.ReasoningEffort = REASONING_EFFORTS.hasOwnProperty(result.ReasoningEffort) && result.ReasoningEffort !== undefined && result.ReasoningEffort !== null
+    ? REASONING_EFFORTS[result.ReasoningEffort]
+    : '';
+  result.MaxToolCalls = clampNumber(result.MaxToolCalls, 0, 16, DEFAULT_MAX_TOOL_CALLS);
   result.RequestTimeoutMs = minNumber(result.RequestTimeoutMs, 1000, DEFAULT_REQUEST_TIMEOUT_MS);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
@@ -211,6 +224,11 @@ module.exports = {
   DEFAULT_REQUEST_TIMEOUT_MS: DEFAULT_REQUEST_TIMEOUT_MS,
   MAX_CHAT_HISTORY_MESSAGES: MAX_CHAT_HISTORY_MESSAGES,
   MAX_CHAT_HISTORY_MESSAGE_CHARS: MAX_CHAT_HISTORY_MESSAGE_CHARS,
+  MAX_CHAT_HISTORY_TOTAL_CHARS: MAX_CHAT_HISTORY_TOTAL_CHARS,
+  MAX_RETRY_AFTER_MS: MAX_RETRY_AFTER_MS,
+  MAX_SOURCES_URLS: MAX_SOURCES_URLS,
+  API_MODES: API_MODES,
+  REASONING_EFFORTS: REASONING_EFFORTS,
   logDebug: logDebug,
   clampNumber: clampNumber,
   minNumber: minNumber,
