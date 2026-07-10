@@ -6,6 +6,13 @@
     "pebble-app"
   ],
   "private": true,
+  "scripts": {
+    "test": "npm run test:js && npm run test:c",
+    "test:js": "node --test tests/js/*.test.js",
+    "test:c": "sh tests/c/run.sh",
+    "test:bundle": "node --test tests/integration/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage tests/js/*.test.js"
+  },
   "dependencies": {
     "@rebble/clay": "^1.0.10"
   },
@@ -93,5 +100,8 @@
     "resources": {
       "media": []
     }
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }

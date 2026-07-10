@@ -1,11 +1,13 @@
 #include <pebble.h>
 #include <stdlib.h>
 
+#include "llm_core.h"
+
 #define DICTATION_BUFFER_SIZE 384
 #define RESPONSE_BUFFER_SIZE 8192
-#define FONT_SIZE_DEFAULT 18
-#define BUZZ_STRENGTH_DEFAULT 1
-#define SCROLL_LINES_DEFAULT 3
+#define FONT_SIZE_DEFAULT LLM_FONT_SIZE_DEFAULT
+#define BUZZ_STRENGTH_DEFAULT LLM_BUZZ_STRENGTH_DEFAULT
+#define SCROLL_LINES_DEFAULT LLM_SCROLL_LINES_DEFAULT
 #define PERSIST_KEY_FONT_SIZE 1
 #define PERSIST_KEY_BUZZ_STRENGTH 2
 #define PERSIST_KEY_START_DICTATION_QUICK_LAUNCH 3
@@ -204,15 +206,7 @@ static bool prv_ui_loaded(void) {
 #endif
 
 static int prv_normalize_font_size(int size) {
-  switch (size) {
-    case 14:
-    case 18:
-    case 24:
-    case 28:
-      return size;
-    default:
-      return FONT_SIZE_DEFAULT;
-  }
+  return llm_normalize_font_size(size);
 }
 
 static const char *prv_font_key_for_size(int size) {
@@ -244,32 +238,15 @@ static const char *prv_bold_font_key_for_size(int size) {
 }
 
 static int prv_smaller_font_size(int size) {
-  switch (prv_normalize_font_size(size)) {
-    case 28:
-      return 24;
-    case 24:
-      return 18;
-    case 18:
-    case 14:
-    default:
-      return 14;
-  }
+  return llm_smaller_font_size(size);
 }
 
 static int prv_normalize_buzz_strength(int strength) {
-  if (strength >= 0 && strength <= 3) {
-    return strength;
-  }
-
-  return BUZZ_STRENGTH_DEFAULT;
+  return llm_normalize_buzz_strength(strength);
 }
 
 static int prv_normalize_scroll_lines(int lines) {
-  if (lines >= 1 && lines <= 10) {
-    return lines;
-  }
-
-  return SCROLL_LINES_DEFAULT;
+  return llm_normalize_scroll_lines(lines);
 }
 
 static int prv_int_from_tuple(Tuple *tuple, int fallback) {
@@ -589,18 +566,7 @@ static int16_t prv_space_width(GFont font) {
 }
 
 static size_t prv_safe_chunk_length(const char *text, size_t length) {
-  size_t chunk_length = length < sizeof(s_text_run) - 1 ? length : sizeof(s_text_run) - 1;
-
-  if (chunk_length < length) {
-    while (chunk_length > 1 && (((uint8_t)text[chunk_length] & 0xc0) == 0x80)) {
-      chunk_length -= 1;
-    }
-  }
-  if (chunk_length == 0) {
-    chunk_length = 1;
-  }
-
-  return chunk_length;
+  return llm_safe_utf8_prefix_length(text, length, sizeof(s_text_run) - 1);
 }
 
 static size_t prv_fit_chunk_length(const char *text, size_t length, GFont font) {
@@ -876,30 +842,9 @@ static void prv_update_scroll_text(void) {
   scroll_layer_set_content_size(s_scroll_layer, GSize(s_text_layer_width, scroll_height));
 }
 
-static int32_t prv_min_scroll_offset_y(void) {
-  int32_t min_y = s_min_text_height - s_scroll_text_height;
-
-  if (min_y < -TEXT_MEASURE_HEIGHT) {
-    min_y = -TEXT_MEASURE_HEIGHT;
-  }
-  if (min_y > 0) {
-    min_y = 0;
-  }
-
-  return min_y;
-}
-
 static int32_t prv_clamp_scroll_offset_y(int32_t offset_y) {
-  int32_t min_y = prv_min_scroll_offset_y();
-
-  if (offset_y < min_y) {
-    offset_y = min_y;
-  }
-  if (offset_y > 0) {
-    offset_y = 0;
-  }
-
-  return offset_y;
+  return llm_clamp_scroll_offset_y(offset_y, s_min_text_height, s_scroll_text_height,
+      TEXT_MEASURE_HEIGHT);
 }
 
 static void prv_scroll_to_latest_prompt(bool animated) {
@@ -1365,49 +1310,9 @@ static void prv_set_progress_output_context(const char *text) {
   prv_update_progress_context_layers();
 }
 
-static bool prv_trim_oldest_turn(void) {
-  char *next_turn;
-
-  if (s_response[0] == '\0') {
-    return false;
-  }
-
-  next_turn = strchr(s_response + 1, TEXT_PROMPT_ON);
-
-  if (next_turn) {
-    memmove(s_response, next_turn, strlen(next_turn) + 1);
-    s_response_truncated = false;
-    return true;
-  }
-
-  s_response[0] = '\0';
-  s_response_truncated = false;
-  return true;
-}
-
 static void prv_append_text_limited(const char *text) {
-  size_t used = strlen(s_response);
-  size_t incoming = strlen(text);
-
-  while (used + incoming >= sizeof(s_response) && prv_trim_oldest_turn()) {
-    used = strlen(s_response);
-  }
-
-  if (used + incoming < sizeof(s_response)) {
-    memcpy(s_response + used, text, incoming + 1);
-  } else if (!s_response_truncated) {
-    const char *suffix = "\n\n[Truncated]";
-    size_t suffix_len = strlen(suffix);
-    size_t available = sizeof(s_response) - used - suffix_len - 1;
-
-    if (available > 0) {
-      memcpy(s_response + used, text, available);
-      used += available;
-    }
-
-    memcpy(s_response + used, suffix, suffix_len + 1);
-    s_response_truncated = true;
-  }
+  llm_response_append(s_response, sizeof(s_response), &s_response_truncated,
+      TEXT_PROMPT_ON, text);
 }
 
 #if defined(PBL_MICROPHONE)

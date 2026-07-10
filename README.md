@@ -1,36 +1,91 @@
-# llm_thing2
+# llm_thing
 
-A Pebble watchapp/watchface written in C using the Pebble SDK.
+Pebble watchapp that sends dictated prompts through the phone to an
+OpenAI-compatible API and displays responses on the watch. Phone-side tools
+support geolocation, Pebble Timeline, Pebble Health, and remote MCP servers.
 
-## Building & running
+## Requirements
+
+- Pebble SDK and `pebble` command-line tool
+- Node.js `^20.19.0`, `^22.13.0`, or `>=24.0.0` for automated tests
+- A host C compiler such as Clang or GCC for watch-core unit tests
+
+Install the test dependency once with:
 
 ```sh
-pebble build                          # build for all targetPlatforms
-pebble install --emulator emery       # install on the emery emulator
-pebble install --phone <ip>           # install to a paired phone
+npm install
 ```
 
-## Target platforms
+## Build And Install
 
-`targetPlatforms` in `package.json` controls which watches you build for. The
-modern Pebble hardware is **emery** (Pebble Time 2), **gabbro** (Pebble Round
-2), and **flint** (Pebble 2 Duo); the original Pebble platforms (aplite,
-basalt, chalk, diorite) are included by default for backwards compatibility.
-
-## Project layout
-
-```
-src/c/           C source for the watchapp
-src/pkjs/        PebbleKit JS (phone-side) source, if any
-worker_src/c/    Background worker source, if any
-resources/       Images, fonts, and other bundled resources
-package.json     Project metadata (UUID, platforms, resources, message keys)
-wscript          Build rules — usually no need to edit
+```sh
+pebble build
+pebble install --cloudpebble
 ```
 
-By default this project is configured as a watchapp. To make it a watchface,
-set `pebble.watchapp.watchface` to `true` in `package.json`.
+Other install targets:
+
+```sh
+pebble install --emulator emery
+pebble install --emulator emery --logs
+pebble install --phone <ip>
+```
+
+`pebble build` compiles every target listed in `package.json`: `aplite`,
+`basalt`, `chalk`, `diorite`, `emery`, `flint`, and `gabbro`.
+
+## Tests
+
+Run JavaScript, contract, DOM, and host-C unit tests:
+
+```sh
+npm test
+```
+
+Run individual suites:
+
+```sh
+npm run test:js
+npm run test:c
+npm run test:coverage
+```
+
+The built-bundle smoke test must run after `pebble build`:
+
+```sh
+pebble build
+npm run test:bundle
+```
+
+Tests never use live API credentials, MCP servers, geolocation, Timeline, or
+health data. JavaScript tests use deterministic fakes. C tests compile
+`src/c/llm_core.c` on the host with warnings as errors and UndefinedBehavior
+Sanitizer.
+
+Known defects that were intentionally not changed while introducing tests are
+recorded as non-gating `test.todo` cases. Passing tests describe supported
+behavior; TODO tests describe desired behavior for later fixes.
+
+## Architecture
+
+- `src/c/llm_thing2.c`: watch UI, dictation, persistence, scrolling, health,
+  saved-chat menus, vibration, and AppMessage handling.
+- `src/c/llm_core.c`: Pebble-independent watch algorithms shared with host-C
+  unit tests.
+- `src/pkjs/index.js`: Pebble event and configuration entrypoint.
+- `src/pkjs/model.js`: API request shaping, response parsing, chat history,
+  reasoning, and tool-call orchestration.
+- `src/pkjs/tools.js`: MCP, geolocation, Timeline, and health tools.
+- `src/pkjs/watch.js`: request lifecycle, response formatting, progress, and
+  AppMessage queueing/chunking.
+- `src/pkjs/settings.js`: defaults, normalization, and settings persistence.
+- `src/pkjs/chat_store.js`: saved-chat persistence and limits.
+- `src/pkjs/config.js`: Clay configuration schema.
+- `src/pkjs/mcp_servers_component.js`: custom MCP server configuration UI.
+- `tests/js/`: phone-side unit, regression, contract, and DOM tests.
+- `tests/c/`: host-C unit tests.
+- `tests/integration/`: generated PebbleKit bundle smoke test.
 
 ## Documentation
 
-Full SDK docs, tutorials, and API reference: <https://developer.repebble.com>
+Pebble SDK documentation: <https://developer.repebble.com/docs/>
