@@ -39,4 +39,14 @@ test('built PebbleKit bundle loads and registers runtime handlers', function() {
   assert.ok(pebble.messages.length > 0);
   assert.equal(pebble.messages[0].FontSize, 18);
   assert.equal(pebble.messages[0].TouchScrollEnabled, 1);
+
+  pebble.emit('showConfiguration');
+  assert.equal(pebble.openedUrls.length, 1);
+  assert.match(pebble.openedUrls[0], /^data:text\/html/);
+  var configHtml = decodeURIComponent(pebble.openedUrls[0].split(',').slice(1).join(','));
+  var componentEnd = configHtml.indexOf('item.reloadModels = function');
+  var firstScriptEnd = configHtml.indexOf('</script>');
+
+  assert.ok(componentEnd > 0, 'model selector source missing');
+  assert.ok(componentEnd < firstScriptEnd, 'model selector source escaped its script');
 });

@@ -35,13 +35,12 @@ module.exports = [
         }
       },
       {
-        "type": "input",
+        "type": "model_selector",
         "messageKey": "Model",
         "label": "Model",
         "defaultValue": "gpt-4.1-mini",
-        "attributes": {
-          "placeholder": "gpt-4.1-mini"
-        }
+        "placeholder": "gpt-4.1-mini",
+        "description": "Enter a model or load models from the endpoint."
       },
       {
         "type": "select",

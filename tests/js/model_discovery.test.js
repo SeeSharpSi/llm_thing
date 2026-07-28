@@ -1,0 +1,69 @@
+'use strict';
+
+var test = require('node:test');
+var assert = require('node:assert/strict');
+var FakeXMLHttpRequest = require('./helpers/fake_xhr');
+var discovery = require('../../src/pkjs/model_discovery');
+
+test.beforeEach(function() {
+  FakeXMLHttpRequest.reset();
+  global.XMLHttpRequest = FakeXMLHttpRequest;
+});
+
+test.afterEach(function() {
+  delete global.XMLHttpRequest;
+});
+
+test('derives model URLs and normalizes OpenAI model lists', function() {
+  assert.equal(discovery.deriveModelsUrl('https://api.openai.com/v1/responses'), 'https://api.openai.com/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/openai/v1/chat/completions/'), 'https://example.test/openai/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/models?ignored=1'), 'https://example.test/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/completions'), '');
+
+  assert.deepEqual(discovery.parseModels(JSON.stringify({
+    data: [{ id: ' model-b ' }, { id: 'model-a' }, { id: 'model-b' }, { id: 'constructor' }, {}]
+  })), ['constructor', 'model-a', 'model-b']);
+  assert.deepEqual(discovery.parseModels('{bad'), []);
+});
+
+test('discovers models through phone-side XHR', function() {
+  var result;
+
+  discovery.discover({
+    Endpoint: 'https://example.test/v1/responses',
+    ApiKey: 'test-secret'
+  }, function(value) {
+    result = value;
+  });
+  var request = FakeXMLHttpRequest.last();
+
+  assert.equal(request.method, 'GET');
+  assert.equal(request.url, 'https://example.test/v1/models');
+  assert.equal(request.headers.Authorization, 'Bearer test-secret');
+  assert.equal(request.timeout, 15000);
+  request.respond(200, { data: [{ id: 'model-b' }, { id: 'model-a' }] });
+
+  assert.deepEqual(result.models, ['model-a', 'model-b']);
+  assert.equal(result.status, '2 models loaded.');
+});
+
+test('returns manual-entry status for missing settings and provider failures', function() {
+  var result;
+
+  discovery.discover({ Endpoint: '', ApiKey: 'secret' }, function(value) { result = value; });
+  assert.equal(FakeXMLHttpRequest.instances.length, 0);
+  assert.match(result.status, /Enter an endpoint/);
+
+  discovery.discover({ Endpoint: 'https://example.test/v1/responses', ApiKey: 'secret' }, function(value) { result = value; });
+  FakeXMLHttpRequest.last().respond(403, { error: { message: 'secret response' } });
+  assert.equal(result.status, 'Could not load models (HTTP 403). Manual entry remains available.');
+  assert.doesNotMatch(result.status, /secret response/);
+
+  discovery.discover({ Endpoint: 'https://example.test/v1/responses', ApiKey: 'secret' }, function(value) { result = value; });
+  FakeXMLHttpRequest.last().networkError();
+  assert.match(result.status, /Manual entry remains available/);
+
+  discovery.discover({ Endpoint: 'https://example.test/v1/responses', ApiKey: 'secret' }, function(value) { result = value; });
+  FakeXMLHttpRequest.last().timeOut();
+  assert.match(result.status, /timed out/);
+});

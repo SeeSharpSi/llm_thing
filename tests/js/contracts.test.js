@@ -55,6 +55,15 @@ test('configuration defaults normalize to runtime defaults', function() {
   });
 });
 
+test('model configuration uses the dynamic selector', function() {
+  var modelItem = configItems(config).filter(function(item) {
+    return item.messageKey === 'Model';
+  })[0];
+
+  assert.equal(modelItem.type, 'model_selector');
+  assert.equal(modelItem.defaultValue, settings.DEFAULT_SETTINGS.Model);
+});
+
 test('watch settings sync excludes phone-only settings and secrets', function() {
   global.Pebble = createFakePebble();
   var watch = require(watchPath);

@@ -1,6 +1,8 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var mcpServersComponent = require('./mcp_servers_component');
+var modelDiscovery = require('./model_discovery');
+var modelSelectorComponent = require('./model_selector_component');
 var settings = require('./settings');
 var watch = require('./watch');
 var model = require('./model');
@@ -62,6 +64,40 @@ function clayCustomFn() {
 
 var clay = new Clay(clayConfig, clayCustomFn, { autoHandleEvents: false });
 clay.registerComponent(mcpServersComponent);
+clay.registerComponent(modelSelectorComponent);
+
+function findConfigItem(items, messageKey) {
+  var found = null;
+
+  (items || []).some(function(item) {
+    if (item.messageKey === messageKey) {
+      found = item;
+      return true;
+    }
+    found = findConfigItem(item.items, messageKey);
+    return !!found;
+  });
+  return found;
+}
+
+function setDiscoveredModels(result) {
+  var modelItem = findConfigItem(clay.config, 'Model');
+
+  if (!modelItem) {
+    return;
+  }
+  modelItem.modelsEncoded = encodeURIComponent(JSON.stringify(result.models || []));
+  modelItem.modelsStatus = result.status || '';
+}
+
+function openConfiguration(currentSettings) {
+  clay.setSettings(currentSettings);
+  modelDiscovery.discover(currentSettings, function(result) {
+    settings.logDebug('configuration model discovery count=' + result.models.length);
+    setDiscoveredModels(result);
+    Pebble.openURL(clay.generateUrl());
+  });
+}
 
 Pebble.addEventListener('ready', function() {
   settings.logDebug('ready');
@@ -70,14 +106,17 @@ Pebble.addEventListener('ready', function() {
 });
 
 Pebble.addEventListener('showConfiguration', function() {
+  var currentSettings = settings.loadSettings();
+
   settings.logDebug('show configuration');
-  clay.setSettings(settings.loadSettings());
-  Pebble.openURL(clay.generateUrl());
+  openConfiguration(currentSettings);
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
   var savedSettings;
   var normalizedSettings;
+  var reloadModels;
+  var settingsAction;
 
   if (!e || !e.response) {
     settings.logDebug('configuration closed without response');
@@ -91,6 +130,14 @@ Pebble.addEventListener('webviewclosed', function(e) {
     settings.logDebug('configuration response invalid: ' + String(error && error.message || error));
     return;
   }
+  settingsAction = savedSettings.DeleteAllPastChats;
+  if (settingsAction && typeof settingsAction === 'object' && settingsAction.value !== undefined) {
+    settingsAction = settingsAction.value;
+  }
+  reloadModels = settingsAction === 2 || settingsAction === '2';
+  if (reloadModels) {
+    savedSettings.DeleteAllPastChats = false;
+  }
   normalizedSettings = settings.extend(settings.DEFAULT_SETTINGS, savedSettings);
   if (normalizedSettings.DeleteAllPastChats) {
     settings.logDebug('delete all saved chats from settings');
@@ -99,6 +146,10 @@ Pebble.addEventListener('webviewclosed', function(e) {
   }
   settings.saveSettings(normalizedSettings);
   watch.syncWatchSettings(normalizedSettings);
+  if (reloadModels) {
+    settings.logDebug('reopening configuration with refreshed models');
+    openConfiguration(normalizedSettings);
+  }
 });
 
 Pebble.addEventListener('appmessage', function(e) {

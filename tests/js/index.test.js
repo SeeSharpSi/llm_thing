@@ -66,17 +66,30 @@ function createHarness(options) {
     deleteAllSavedChats: function() { model.calls.push(['delete-all']); },
     requestCompletion: function(id, text) { model.calls.push(['request', id, text]); }
   };
+  var modelDiscovery = {
+    calls: [],
+    discover: function(value, callback) {
+      modelDiscovery.calls.push(value);
+      callback({ models: ['model-a', "$'model-b"], status: '2 models loaded.' });
+    }
+  };
+  var config = [{
+    type: 'section',
+    items: [{ type: 'model_selector', messageKey: 'Model' }]
+  }];
 
   load.loadWithStubs(indexPath, {
     '@rebble/clay': FakeClay,
-    './config': [],
+    './config': config,
     './mcp_servers_component': { name: 'mcp_servers' },
+    './model_discovery': modelDiscovery,
+    './model_selector_component': { name: 'model_selector' },
     './settings': settings,
     './watch': watch,
     './model': model
   });
 
-  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model };
+  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery };
 }
 
 test.afterEach(function() {
@@ -91,12 +104,16 @@ test('registers Clay and handles ready and configuration open', function() {
 
   assert.deepEqual(harness.clay.options, { autoHandleEvents: false });
   assert.equal(harness.clay.registered[0].name, 'mcp_servers');
+  assert.equal(harness.clay.registered[1].name, 'model_selector');
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
 
   global.Pebble.emit('showConfiguration');
   assert.equal(harness.clay.currentSettings.FontSize, 18);
+  assert.equal(harness.modelDiscovery.calls.length, 1);
+  assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[0].modelsEncoded)), ['model-a', "$'model-b"]);
+  assert.equal(harness.clay.config[0].items[0].modelsStatus, '2 models loaded.');
   assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
 });
 
@@ -110,6 +127,24 @@ test('webview close normalizes, deletes chats once, saves, and syncs', function(
   assert.equal(harness.settings.saved[0].DeleteAllPastChats, false);
   assert.equal(harness.settings.saved[0].FontSize, 24);
   assert.equal(harness.watch.calls[0][0], 'sync');
+});
+
+test('model reload submission saves settings and reopens with phone-side discovery', function() {
+  var harness = createHarness();
+
+  global.Pebble.emit('webviewclosed', {
+    response: JSON.stringify({
+      DeleteAllPastChats: '2',
+      Endpoint: 'https://new.example/v1/responses',
+      ApiKey: 'new-secret'
+    })
+  });
+
+  assert.equal(harness.settings.saved[0].DeleteAllPastChats, false);
+  assert.equal(harness.modelDiscovery.calls.length, 1);
+  assert.equal(harness.modelDiscovery.calls[0].Endpoint, 'https://new.example/v1/responses');
+  assert.equal(harness.clay.currentSettings.DeleteAllPastChats, false);
+  assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
 });
 
 test('appmessage routes reset, request, saved chat, delete, and health flows', function() {
