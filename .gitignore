@@ -9,3 +9,19 @@ build/config.log
 
 # Generated webpack host config (rebuilt by pebble build)
 build/webpack/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs and scratch
+*.log
+*.tmp
+coverage/
