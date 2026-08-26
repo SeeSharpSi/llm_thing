@@ -72,10 +72,23 @@ cases.
 The default endpoint uses the OpenAI Responses API. `API Mode` controls request
 shape:
 
-- `Auto` selects Chat Completions when the endpoint contains
-  `/chat/completions`; otherwise it uses Responses.
-- `Responses` and `Chat Completions` override endpoint detection for compatible
-  providers.
+- `Auto` infers the protocol from the configured endpoint suffix:
+  `/responses` uses Responses, `/chat/completions` uses Chat Completions, and
+  `/messages` uses Messages. Any other path defaults to Responses and is never
+  rewritten to a guessed endpoint.
+- `Responses`, `Chat Completions`, and `Messages` pin one request format for
+  compatible providers and disable auto rotation.
+- `Messages` sends the Anthropic Messages body (`system`, `messages`,
+  `max_tokens`, Anthropic-shaped tools) authenticated with `x-api-key` and an
+  `anthropic-version` header; it expects a compatible `/v1/messages`-style
+  endpoint.
+- When `Auto` is selected and the configured path ends in one of the three
+  known suffixes above, an exact HTTP 500 rotates the same request across the
+  other protocol endpoints once each. The first successful protocol is
+  remembered per normalized provider endpoint/base path and model so later
+  requests try it first.
+  Other 5xx statuses, network errors, timeouts, HTTP 408, and HTTP 429 keep
+  the normal single retry on the same endpoint instead of rotating.
 - `Max Output Tokens` sends the provider-specific output limit when nonzero.
 - `Reasoning Effort` sends a Responses reasoning-effort hint. Thinking display
   remains controlled separately.
@@ -83,8 +96,9 @@ shape:
   endpoint rejects that tool, the request falls back once without it. Returned
   citation URLs are appended to the watch answer.
 
-Model network errors, timeouts, HTTP 408, HTTP 429, and HTTP 5xx responses are
-retried once. `Retry-After` is honored up to five seconds. Ordinary HTTP 4xx
+Requests are single-shot; streaming is not used. Model network errors,
+timeouts, HTTP 408, HTTP 429, and HTTP 5xx responses are retried once as
+described above. `Retry-After` is honored up to five seconds. Ordinary HTTP 4xx
 responses are not retried. Unsupported native function tools are remembered for
 five minutes by endpoint, API mode, and model so later requests skip the failed
 native attempt.

@@ -104,6 +104,7 @@ test('extend normalizes ApiMode, MaxOutputTokens, and ReasoningEffort', function
 
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'chat-completions' }).ApiMode, 'chat-completions');
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'responses' }).ApiMode, 'responses');
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'messages' }).ApiMode, 'messages');
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: 'bogus' }).ApiMode, 'auto');
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { ApiMode: '' }).ApiMode, 'auto');
 

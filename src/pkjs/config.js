@@ -46,6 +46,7 @@ module.exports = [
         "type": "select",
         "messageKey": "ApiMode",
         "label": "API Mode",
+        "description": "Auto infers the protocol from the configured endpoint suffix and, on exact HTTP 500, rotates across known protocol endpoints, remembering what works per provider and model. An explicit mode pins one protocol and disables rotation.",
         "defaultValue": "auto",
         "options": [
           {
@@ -59,6 +60,10 @@ module.exports = [
           {
             "label": "Chat Completions",
             "value": "chat-completions"
+          },
+          {
+            "label": "Messages",
+            "value": "messages"
           }
         ]
       },

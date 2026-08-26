@@ -2,6 +2,15 @@ var common = require('./settings');
 var watch = require('./watch');
 var tools = require('./tools');
 var chatStore = require('./chat_store');
+var endpointCache = require('./endpoint_cache');
+
+var CANDIDATE_PROTOCOL_ORDER = ['responses', 'chat', 'messages'];
+var CANONICAL_SUFFIX_BY_PROTOCOL = {
+  responses: '/responses',
+  chat: '/chat/completions',
+  messages: '/messages'
+};
+var CACHE_PROTOCOL_NAMES = { 'responses': true, 'chat-completions': true, 'messages': true };
 
 var s_chat_history = [];
 var s_saved_chat_history = [];
@@ -10,6 +19,8 @@ var s_native_unsupported_keys = {};
 var MAX_TOOL_RESULT_CHARS = 6000;
 var MAX_TOOL_RESULTS_TOTAL_CHARS = 12000;
 var TOOL_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
+var DEFAULT_MESSAGES_MAX_TOKENS = 4096;
+var ANTHROPIC_API_VERSION = '2023-06-01';
 var NATIVE_UNSUPPORTED_TTL_MS = 5 * 60 * 1000;
 
 function nativeUnsupportedKey(settings) {
@@ -131,14 +142,221 @@ function buildSystemPrompt(settings, toolInstructions) {
   return prompt + (toolInstructions || '');
 }
 
-function isChatEndpoint(settings) {
+function endpointProtocol(settings) {
+  var path;
+  var suffix;
+
   if (settings && settings.ApiMode === 'chat-completions') {
-    return true;
+    return 'chat';
   }
   if (settings && settings.ApiMode === 'responses') {
-    return false;
+    return 'responses';
   }
-  return String((settings && settings.Endpoint) || '').toLowerCase().indexOf('/chat/completions') !== -1;
+  if (settings && settings.ApiMode === 'messages') {
+    return 'messages';
+  }
+
+  path = String((settings && settings.Endpoint) || '').toLowerCase();
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(path)) {
+    path = path.replace(/^[a-z][a-z0-9+.-]*:\/\/[^\/]*/, '');
+  }
+  path = path.split('#')[0].split('?')[0];
+  while (path.length > 1 && path.charAt(path.length - 1) === '/') {
+    path = path.substring(0, path.length - 1);
+  }
+
+  suffix = '/chat/completions';
+  if (path.length >= suffix.length && path.substring(path.length - suffix.length) === suffix) {
+    return 'chat';
+  }
+  suffix = '/messages';
+  if (path.length >= suffix.length && path.substring(path.length - suffix.length) === suffix) {
+    return 'messages';
+  }
+
+  return 'responses';
+}
+
+function internalProtocolFromCacheName(name) {
+  if (!CACHE_PROTOCOL_NAMES[name]) {
+    return '';
+  }
+  return name === 'chat-completions' ? 'chat' : name;
+}
+
+function cacheProtocolNameFromInternal(protocol) {
+  return protocol === 'chat' ? 'chat-completions' : protocol;
+}
+
+function isExplicitApiMode(settings) {
+  var mode = String((settings && settings.ApiMode) || '');
+  return mode === 'responses' || mode === 'chat-completions' || mode === 'messages';
+}
+
+function analyzeConfiguredEndpoint(endpoint) {
+  var raw = String(endpoint === undefined || endpoint === null ? '' : endpoint);
+  var queryIndex = raw.indexOf('?');
+  var hashIndex = raw.indexOf('#');
+  var cutIndex;
+  var main;
+  var tail;
+  var schemeMatch;
+  var rest;
+  var slashIndex;
+  var authority;
+  var path;
+  var trailingSlashes;
+  var trimmedPath;
+  var loweredPath;
+  var suffixes = [
+    ['responses', '/responses'],
+    ['chat', '/chat/completions'],
+    ['messages', '/messages']
+  ];
+  var i;
+  var entry;
+  var offset;
+
+  if (queryIndex === -1 && hashIndex === -1) {
+    main = raw;
+    tail = '';
+  } else {
+    if (queryIndex === -1) {
+      cutIndex = hashIndex;
+    } else if (hashIndex === -1) {
+      cutIndex = queryIndex;
+    } else {
+      cutIndex = queryIndex < hashIndex ? queryIndex : hashIndex;
+    }
+    main = raw.substring(0, cutIndex);
+    tail = raw.substring(cutIndex);
+  }
+
+  schemeMatch = /^[A-Za-z][A-Za-z0-9+\-.]*:\/\//.exec(main);
+  if (!schemeMatch) {
+    return null;
+  }
+
+  rest = main.substring(schemeMatch[0].length);
+  slashIndex = rest.indexOf('/');
+  if (slashIndex === -1) {
+    authority = rest;
+    path = '';
+  } else {
+    authority = rest.substring(0, slashIndex);
+    path = rest.substring(slashIndex);
+  }
+  if (!authority) {
+    return null;
+  }
+
+  trailingSlashes = 0;
+  while (path.length - trailingSlashes > 0 && path.charAt(path.length - 1 - trailingSlashes) === '/') {
+    trailingSlashes += 1;
+  }
+  trimmedPath = path.substring(0, path.length - trailingSlashes);
+  loweredPath = trimmedPath.toLowerCase();
+
+  for (i = 0; i < suffixes.length; i += 1) {
+    entry = suffixes[i];
+    offset = loweredPath.length - entry[1].length;
+    if (offset >= 0 && loweredPath.substring(offset) === entry[1]) {
+      return {
+        protocol: entry[0],
+        root: main.substring(0, main.length - trailingSlashes - entry[1].length),
+        tail: tail
+      };
+    }
+  }
+
+  return null;
+}
+
+function shallowCopySettings(source) {
+  var copy = {};
+  var key;
+
+  source = source || {};
+  for (key in source) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      copy[key] = source[key];
+    }
+  }
+
+  return copy;
+}
+
+function buildEndpointPlan(settings) {
+  var plan = {
+    rotationActive: false,
+    originalEndpoint: String((settings && settings.Endpoint) || ''),
+    candidates: []
+  };
+  var info;
+  var order;
+  var seen;
+  var rememberedRaw;
+  var remembered;
+  var i;
+  var protocol;
+
+  function pushCandidate(protocolName, url) {
+    var attemptSettings = shallowCopySettings(settings);
+    attemptSettings.Endpoint = url;
+    plan.candidates.push({ protocol: protocolName, settings: attemptSettings });
+  }
+
+  function addProtocol(protocolName) {
+    if (!seen[protocolName]) {
+      seen[protocolName] = true;
+      order.push(protocolName);
+    }
+  }
+
+  if (!settings || !settings.Endpoint) {
+    pushCandidate(endpointProtocol(settings), '');
+    return plan;
+  }
+
+  info = analyzeConfiguredEndpoint(settings.Endpoint);
+  if (!info || isExplicitApiMode(settings)) {
+    pushCandidate(endpointProtocol(settings), settings.Endpoint);
+    return plan;
+  }
+
+  plan.rotationActive = true;
+  seen = {};
+  order = [];
+
+  rememberedRaw = endpointCache.get(settings.Endpoint, settings.Model);
+  remembered = internalProtocolFromCacheName(String(rememberedRaw));
+  if (!remembered) {
+    addProtocol(info.protocol);
+  } else {
+    addProtocol(remembered);
+  }
+  for (i = 0; i < CANDIDATE_PROTOCOL_ORDER.length; i += 1) {
+    addProtocol(CANDIDATE_PROTOCOL_ORDER[i]);
+  }
+
+  for (i = 0; i < order.length; i += 1) {
+    protocol = order[i];
+    if (protocol === info.protocol) {
+      pushCandidate(protocol, settings.Endpoint);
+    } else {
+      pushCandidate(protocol, info.root + CANONICAL_SUFFIX_BY_PROTOCOL[protocol] + info.tail);
+    }
+  }
+
+  return plan;
+}
+
+function isChatEndpoint(settings) {
+  return endpointProtocol(settings) === 'chat';
+}
+
+function isMessagesEndpoint(settings) {
+  return endpointProtocol(settings) === 'messages';
 }
 
 function endpointHost(settings) {
@@ -154,14 +372,16 @@ function endpointHost(settings) {
 }
 
 function isOpenAiResponsesEndpoint(settings) {
-  if (isChatEndpoint(settings)) {
+  if (endpointProtocol(settings) !== 'responses') {
     return false;
   }
   return endpointHost(settings) === 'api.openai.com';
 }
 
 function shouldRequestReasoningSummary(settings, options) {
-  return !!(settings.ShowThinking && !isChatEndpoint(settings) && !(options && options.skipReasoningSummary));
+  return !!(settings && settings.ShowThinking) &&
+    endpointProtocol(settings) === 'responses' &&
+    !(options && options.skipReasoningSummary);
 }
 
 function copyRequestOptions(options) {
@@ -320,7 +540,7 @@ function normalizeToolParameters(parameters) {
   return parameters;
 }
 
-function buildNativeTools(toolDefinitions, chatMode) {
+function buildNativeTools(toolDefinitions, protocol) {
   var result = [];
   var i;
   var tool;
@@ -334,10 +554,16 @@ function buildNativeTools(toolDefinitions, chatMode) {
       parameters: normalizeToolParameters(tool.parameters)
     };
 
-    if (chatMode) {
+    if (protocol === 'chat') {
       result.push({
         type: 'function',
         function: definition
+      });
+    } else if (protocol === 'messages') {
+      result.push({
+        name: definition.name,
+        description: definition.description,
+        input_schema: definition.parameters
       });
     } else {
       result.push({
@@ -370,8 +596,38 @@ function buildReasoningObject(settings, options) {
   return Object.keys(reasoning).length ? reasoning : null;
 }
 
+function extractSystemPrompt(conversation) {
+  if (conversation.length && conversation[0] && conversation[0].role === 'system') {
+    return String(conversation[0].content || '');
+  }
+
+  return '';
+}
+
+function collectRoleTurns(conversation) {
+  var turns = [];
+  var i;
+
+  for (i = 0; i < conversation.length; i += 1) {
+    if (conversation[i] && (conversation[i].role === 'user' || conversation[i].role === 'assistant')) {
+      turns.push(conversation[i]);
+    }
+  }
+
+  return turns;
+}
+
+function buildMessagesMaxTokens(settings) {
+  if (settings.MaxOutputTokens && settings.MaxOutputTokens > 0) {
+    return settings.MaxOutputTokens;
+  }
+
+  return DEFAULT_MESSAGES_MAX_TOKENS;
+}
+
 function buildBody(settings, conversation, options) {
   var chatMode = isChatEndpoint(settings);
+  var protocol = endpointProtocol(settings);
   var body;
   var reasoning;
   var tools;
@@ -384,10 +640,23 @@ function buildBody(settings, conversation, options) {
       messages: conversation
     };
     if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
-      body.tools = buildNativeTools(options.toolDefinitions, true);
+      body.tools = buildNativeTools(options.toolDefinitions, 'chat');
     }
     if (settings.MaxOutputTokens && settings.MaxOutputTokens > 0) {
       body.max_completion_tokens = settings.MaxOutputTokens;
+    }
+    return body;
+  }
+
+  if (protocol === 'messages') {
+    body = {
+      model: settings.Model,
+      max_tokens: buildMessagesMaxTokens(settings),
+      system: extractSystemPrompt(conversation),
+      messages: collectRoleTurns(conversation)
+    };
+    if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
+      body.tools = buildNativeTools(options.toolDefinitions, 'messages');
     }
     return body;
   }
@@ -407,7 +676,7 @@ function buildBody(settings, conversation, options) {
 
   tools = [];
   if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
-    tools = buildNativeTools(options.toolDefinitions, false);
+    tools = buildNativeTools(options.toolDefinitions, 'responses');
   }
   if (settings.WebSearchEnabled && !options.skipWebSearch) {
     tools.push({ type: 'web_search' });
@@ -464,6 +733,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
   var reasoningSummarySkipped = false;
   var webSearchFallbackDone = false;
   var transientRetried = false;
+  var plan = buildEndpointPlan(settings);
 
   function finishOnce(error, json, meta) {
     if (done) {
@@ -473,17 +743,19 @@ function requestModel(settings, conversation, requestId, options, callback) {
     callback(error, json, meta);
   }
 
-  function scheduleTransientRetry(skipReasoningSummary, skipWebSearch, delayMs) {
+  function scheduleTransientRetry(runAttempt, delayMs) {
     transientRetried = true;
     setTimeout(function() {
       if (done || !watch.isCurrentRequest(requestId)) {
         return;
       }
-      attempt(skipReasoningSummary, skipWebSearch);
+      runAttempt();
     }, delayMs);
   }
 
-  function attempt(skipReasoningSummary, skipWebSearch) {
+  function attempt(candidateIndex, skipReasoningSummary, skipWebSearch) {
+    var candidate = plan.candidates[candidateIndex];
+    var attemptSettings = candidate.settings;
     var request = new XMLHttpRequest();
     var requestOptions = copyRequestOptions(options);
     var includeReasoningSummary;
@@ -497,16 +769,21 @@ function requestModel(settings, conversation, requestId, options, callback) {
       requestOptions.skipWebSearch = true;
     }
 
-    includeReasoningSummary = shouldRequestReasoningSummary(settings, requestOptions);
-    webSearchActive = !!settings.WebSearchEnabled && !skipWebSearch && !isChatEndpoint(settings);
-    body = JSON.stringify(buildBody(settings, conversation, requestOptions));
+    includeReasoningSummary = shouldRequestReasoningSummary(attemptSettings, requestOptions);
+    webSearchActive = !!attemptSettings.WebSearchEnabled && !skipWebSearch && endpointProtocol(attemptSettings) === 'responses';
+    body = JSON.stringify(buildBody(attemptSettings, conversation, requestOptions));
 
-    common.logDebug('llm request endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' mode=' + (isChatEndpoint(settings) ? 'chat' : 'responses') + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' webSearch=' + (webSearchActive ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + settings.RequestTimeoutMs);
+    common.logDebug('llm request endpoint=' + attemptSettings.Endpoint + ' model=' + attemptSettings.Model + ' mode=' + endpointProtocol(attemptSettings) + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' webSearch=' + (webSearchActive ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + attemptSettings.RequestTimeoutMs);
 
-    request.open('POST', settings.Endpoint, true);
+    request.open('POST', attemptSettings.Endpoint, true);
     request.setRequestHeader('Content-Type', 'application/json');
-    request.setRequestHeader('Authorization', 'Bearer ' + settings.ApiKey);
-    request.timeout = settings.RequestTimeoutMs;
+    if (isMessagesEndpoint(attemptSettings)) {
+      request.setRequestHeader('x-api-key', attemptSettings.ApiKey);
+      request.setRequestHeader('anthropic-version', ANTHROPIC_API_VERSION);
+    } else {
+      request.setRequestHeader('Authorization', 'Bearer ' + attemptSettings.ApiKey);
+    }
+    request.timeout = attemptSettings.RequestTimeoutMs;
 
     if (!watch.trackXhr(requestId, request)) {
       return;
@@ -526,20 +803,32 @@ function requestModel(settings, conversation, requestId, options, callback) {
         if (includeReasoningSummary && (request.status === 400 || request.status === 422) && !reasoningSummarySkipped) {
           common.logDebug('reasoning summary rejected; retrying without summary');
           reasoningSummarySkipped = true;
-          attempt(true, skipWebSearch);
+          attempt(candidateIndex, true, skipWebSearch);
           return;
         }
 
         if (webSearchActive && (request.status === 400 || request.status === 404 || request.status === 422) && !webSearchFallbackDone) {
           common.logDebug('web search hosted tool rejected; retrying without hosted web tool');
           webSearchFallbackDone = true;
-          attempt(skipReasoningSummary, true);
+          attempt(candidateIndex, skipReasoningSummary, true);
+          return;
+        }
+
+        if (plan.rotationActive && request.status === 500) {
+          common.logDebug('http 500 rotating protocol candidate=' + (candidateIndex + 1) + '/' + plan.candidates.length + ' failedProtocol=' + candidate.protocol);
+          if (candidateIndex + 1 < plan.candidates.length) {
+            attempt(candidateIndex + 1, false, false);
+          } else {
+            finishOnce('HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 250), null, { status: request.status });
+          }
           return;
         }
 
         if (isTransientHttpStatus(request.status) && !transientRetried) {
           common.logDebug('transient http status=' + request.status + '; retrying once');
-          scheduleTransientRetry(skipReasoningSummary, skipWebSearch, parseRetryAfterMs(request));
+          scheduleTransientRetry(function() {
+            attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+          }, parseRetryAfterMs(request));
           return;
         }
 
@@ -554,6 +843,10 @@ function requestModel(settings, conversation, requestId, options, callback) {
         return;
       }
 
+      if (plan.rotationActive) {
+        endpointCache.remember(plan.originalEndpoint, attemptSettings.Model, cacheProtocolNameFromInternal(candidate.protocol));
+      }
+
       finishOnce(null, json, { status: request.status });
     };
 
@@ -564,7 +857,9 @@ function requestModel(settings, conversation, requestId, options, callback) {
       }
       common.logDebug('llm network error');
       if (!transientRetried) {
-        scheduleTransientRetry(skipReasoningSummary, skipWebSearch, 0);
+        scheduleTransientRetry(function() {
+          attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+        }, 0);
         return;
       }
       finishOnce('Network error');
@@ -577,7 +872,9 @@ function requestModel(settings, conversation, requestId, options, callback) {
       }
       common.logDebug('llm timeout');
       if (!transientRetried) {
-        scheduleTransientRetry(skipReasoningSummary, skipWebSearch, 0);
+        scheduleTransientRetry(function() {
+          attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+        }, 0);
         return;
       }
       finishOnce('Request timed out');
@@ -590,7 +887,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
     request.send(body);
   }
 
-  attempt(false, false);
+  attempt(0, false, false);
 }
 
 function getUsageToken(usage, primaryName, fallbackName) {
@@ -733,6 +1030,15 @@ function extractResponseThinking(json) {
     }
   }
 
+  if (json.content && json.content.length) {
+    for (i = 0; i < json.content.length; i += 1) {
+      item = json.content[i] || {};
+      if (item.type === 'thinking' && typeof item.thinking === 'string') {
+        thinking = appendThinkingText(thinking, item.thinking);
+      }
+    }
+  }
+
   return thinking;
 }
 
@@ -792,6 +1098,15 @@ function extractResponseText(json) {
             answer += content.text || '';
           }
         }
+      }
+    }
+  }
+
+  if (json.content && json.content.length) {
+    for (i = 0; i < json.content.length; i += 1) {
+      item = json.content[i] || {};
+      if (!hasOutputText && item.type === 'text' && typeof item.text === 'string') {
+        answer += item.text;
       }
     }
   }
@@ -886,6 +1201,9 @@ function extractIncompleteReason(json) {
   var details = json && json.incomplete_details;
 
   if (status !== 'incomplete') {
+    if (json && json.stop_reason === 'max_tokens') {
+      return 'max_tokens';
+    }
     return '';
   }
 
@@ -1222,6 +1540,15 @@ function extractNativeToolCalls(json) {
     }
   }
 
+  if (json.content && json.content.length) {
+    for (i = 0; i < json.content.length; i += 1) {
+      item = json.content[i] || {};
+      if (item.type === 'tool_use') {
+        addToolCall(result, item, null, true);
+      }
+    }
+  }
+
   return result;
 }
 
@@ -1432,9 +1759,112 @@ function chatAssistantToolMessage(json, toolCalls) {
   return output;
 }
 
+function buildMessagesAssistantReplay(json, toolCalls) {
+  var blocks = [];
+  var sawToolUse = false;
+  var content = json && json.content;
+  var block;
+  var item;
+  var call;
+  var i;
+
+  if (content && content.length) {
+    for (i = 0; i < content.length; i += 1) {
+      item = content[i] || {};
+      if (item.type === 'text' && typeof item.text === 'string' && item.text !== '') {
+        blocks.push({ type: 'text', text: item.text });
+      } else if (item.type === 'thinking' && typeof item.thinking === 'string') {
+        block = { type: 'thinking', thinking: item.thinking };
+        if (typeof item.signature === 'string' && item.signature) {
+          block.signature = item.signature;
+        }
+        blocks.push(block);
+      } else if (item.type === 'redacted_thinking' && typeof item.data === 'string' && item.data) {
+        blocks.push({ type: 'redacted_thinking', data: item.data });
+      } else if (item.type === 'tool_use' && typeof item.id === 'string' && item.id &&
+          typeof item.name === 'string' && item.name) {
+        sawToolUse = true;
+        blocks.push({
+          type: 'tool_use',
+          id: item.id,
+          name: item.name,
+          input: item.input && typeof item.input === 'object' ? item.input : {}
+        });
+      }
+    }
+  }
+
+  if (!sawToolUse && toolCalls && toolCalls.length) {
+    for (i = 0; i < toolCalls.length; i += 1) {
+      call = toolCalls[i] || {};
+      if (!call.name) {
+        continue;
+      }
+      blocks.push({
+        type: 'tool_use',
+        id: String(call.call_id || call.id || call.name),
+        name: call.name,
+        input: call.arguments && typeof call.arguments === 'object' ? call.arguments : {}
+      });
+    }
+  }
+
+  return blocks;
+}
+
+function messagesToolUseId(result, index, toolCalls) {
+  var call = toolCalls && toolCalls[index] ? toolCalls[index] : null;
+
+  if (result.call_id) {
+    return String(result.call_id);
+  }
+  if (result.id) {
+    return String(result.id);
+  }
+  if (result.name) {
+    return String(result.name);
+  }
+  if (call) {
+    return String(call.call_id || call.id || call.name);
+  }
+
+  return String(index + 1);
+}
+
+function appendMessagesToolResults(conversation, json, toolCalls, results, noMoreTools, skippedCount) {
+  var toolResultBlocks = [];
+  var i;
+  var result;
+
+  conversation.push({
+    role: 'assistant',
+    content: buildMessagesAssistantReplay(json, toolCalls)
+  });
+
+  for (i = 0; i < results.length; i += 1) {
+    result = results[i] || {};
+    toolResultBlocks.push({
+      type: 'tool_result',
+      tool_use_id: messagesToolUseId(result, i, toolCalls),
+      content: formatToolResultOutput(result)
+    });
+  }
+
+  if (noMoreTools) {
+    toolResultBlocks.push({ type: 'text', text: buildToolCapNotice(skippedCount) });
+  }
+
+  conversation.push({ role: 'user', content: toolResultBlocks });
+}
+
 function appendNativeToolResults(conversation, settings, json, toolCalls, results, noMoreTools, skippedCount) {
   var i;
   var result;
+
+  if (isMessagesEndpoint(settings)) {
+    appendMessagesToolResults(conversation, json, toolCalls, results, noMoreTools, skippedCount);
+    return;
+  }
 
   if (isChatEndpoint(settings)) {
     conversation.push(chatAssistantToolMessage(json, toolCalls));

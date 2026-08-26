@@ -6,7 +6,7 @@ var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
 var MAX_CHAT_HISTORY_TOTAL_CHARS = 12000;
 var MAX_RETRY_AFTER_MS = 5000;
 var MAX_SOURCES_URLS = 5;
-var API_MODES = { 'auto': 'auto', 'responses': 'responses', 'chat-completions': 'chat-completions' };
+var API_MODES = { 'auto': 'auto', 'responses': 'responses', 'chat-completions': 'chat-completions', 'messages': 'messages' };
 var REASONING_EFFORTS = { '': '', 'none': 'none', 'minimal': 'minimal', 'low': 'low', 'medium': 'medium', 'high': 'high' };
 
 var DEFAULT_SETTINGS = {

@@ -17,8 +17,30 @@ test.afterEach(function() {
 test('derives model URLs and normalizes OpenAI model lists', function() {
   assert.equal(discovery.deriveModelsUrl('https://api.openai.com/v1/responses'), 'https://api.openai.com/v1/models');
   assert.equal(discovery.deriveModelsUrl('https://example.test/openai/v1/chat/completions/'), 'https://example.test/openai/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/messages'), 'https://example.test/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/messages'), 'https://example.test/models');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/Messages/'), 'https://example.test/v1/models');
+  assert.equal(discovery.deriveModelsUrl('HTTPS://Example.Test/v1/messages?ignored=1#frag'), 'HTTPS://Example.Test/v1/models');
   assert.equal(discovery.deriveModelsUrl('https://example.test/v1/models?ignored=1'), 'https://example.test/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://user:secret@example.test/v1/messages'), 'https://user:secret@example.test/v1/models');
+  assert.equal(discovery.deriveModelsUrl('https://Messages.example.test/V1/Messages/'), 'https://Messages.example.test/V1/models');
+
+  assert.equal(discovery.deriveModelsUrl('https://messages'), '');
+  assert.equal(discovery.deriveModelsUrl('https://messages/'), '');
+  assert.equal(discovery.deriveModelsUrl('https://responses/'), '');
+  assert.equal(discovery.deriveModelsUrl('https://chat/completions'), '');
+
+  assert.equal(discovery.deriveModelsUrl(''), '');
+  assert.equal(discovery.deriveModelsUrl('   '), '');
+  assert.equal(discovery.deriveModelsUrl('https://'), '');
+  assert.equal(discovery.deriveModelsUrl('https:///v1/messages'), '');
+  assert.equal(discovery.deriveModelsUrl('//example.test/v1/responses'), '');
+  assert.equal(discovery.deriveModelsUrl('ftp://example.test/v1/responses'), '');
+  assert.equal(discovery.deriveModelsUrl('not-a-url'), '');
+
   assert.equal(discovery.deriveModelsUrl('https://example.test/v1/completions'), '');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/messages.txt'), '');
+  assert.equal(discovery.deriveModelsUrl('https://example.test/v1/messages/extra'), '');
 
   assert.deepEqual(discovery.parseModels(JSON.stringify({
     data: [{ id: ' model-b ' }, { id: 'model-a' }, { id: 'model-b' }, { id: 'constructor' }, {}]

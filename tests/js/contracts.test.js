@@ -64,6 +64,12 @@ test('configuration defaults normalize to runtime defaults', function() {
   Object.keys(settings.DEFAULT_SETTINGS).forEach(function(key) {
     assert.deepEqual(normalized[key], settings.DEFAULT_SETTINGS[key], key + ' default differs');
   });
+
+  var apiModeItem = configItems(config).filter(function(item) {
+    return item.messageKey === 'ApiMode';
+  })[0];
+  assert.equal(apiModeItem.defaultValue, settings.DEFAULT_SETTINGS.ApiMode);
+  assert.deepEqual(apiModeItem.options.map(function(option) { return option.value; }), Object.keys(settings.API_MODES));
 });
 
 test('model configuration uses the dynamic selector', function() {

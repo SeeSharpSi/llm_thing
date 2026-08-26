@@ -8,17 +8,20 @@ function trim(value) {
 }
 
 function deriveModelsUrl(endpoint) {
-  endpoint = trim(endpoint);
-  endpoint = endpoint.replace(/[?#].*$/, '').replace(/\/+$/, '');
+  var url = trim(endpoint).replace(/[?#].*$/, '').replace(/\/+$/, '');
+  var parts = /^(https?:\/\/[^\/?#]+)(\/.*)$/i.exec(url);
+  var path;
 
-  if (!/^https?:\/\/[^/]+/i.test(endpoint)) {
+  if (!parts) {
     return '';
   }
-  if (/\/models$/i.test(endpoint)) {
-    return endpoint;
+
+  path = parts[2];
+  if (/\/models$/i.test(path)) {
+    return parts[1] + path;
   }
-  if (/\/(responses|chat\/completions)$/i.test(endpoint)) {
-    return endpoint.replace(/\/(responses|chat\/completions)$/i, '/models');
+  if (/\/(responses|chat\/completions|messages)$/i.test(path)) {
+    return parts[1] + path.replace(/\/(responses|chat\/completions|messages)$/i, '/models');
   }
   return '';
 }
