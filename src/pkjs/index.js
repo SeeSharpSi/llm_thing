@@ -24,14 +24,14 @@ function clayCustomFn() {
   self.on(self.EVENTS.AFTER_BUILD, function() {
     var resetButton = self.getItemById('ResetWatchDisplay');
     var deleteAllButton = self.getItemById('DeleteAllPastChats');
-    var deleteAllFlag = self.getItemByMessageKey('DeleteAllPastChats');
+    var configAction = self.getItemByMessageKey('ConfigAction');
 
-    if (deleteAllFlag) {
-      deleteAllFlag.hide();
-      deleteAllFlag.set('0');
+    if (configAction) {
+      configAction.hide();
+      configAction.set('');
     }
 
-    if (deleteAllButton && deleteAllFlag) {
+    if (deleteAllButton && configAction) {
       deleteAllButton.on('click', function() {
         var submitButton;
 
@@ -39,7 +39,7 @@ function clayCustomFn() {
           return;
         }
 
-        deleteAllFlag.set('1');
+        configAction.set('delete_saved_chats');
         submitButton = document.querySelector('.component-submit button');
         if (submitButton) {
           submitButton.click();
@@ -115,7 +115,6 @@ Pebble.addEventListener('showConfiguration', function() {
 Pebble.addEventListener('webviewclosed', function(e) {
   var savedSettings;
   var normalizedSettings;
-  var reloadModels;
   var settingsAction;
 
   if (!e || !e.response) {
@@ -130,24 +129,24 @@ Pebble.addEventListener('webviewclosed', function(e) {
     settings.logDebug('configuration response invalid: ' + String(error && error.message || error));
     return;
   }
-  settingsAction = savedSettings.DeleteAllPastChats;
+  settingsAction = savedSettings.ConfigAction;
   if (settingsAction && typeof settingsAction === 'object' && settingsAction.value !== undefined) {
     settingsAction = settingsAction.value;
   }
-  reloadModels = settingsAction === 2 || settingsAction === '2';
-  if (reloadModels) {
-    savedSettings.DeleteAllPastChats = false;
-  }
+  delete savedSettings.ConfigAction;
   normalizedSettings = settings.extend(settings.DEFAULT_SETTINGS, savedSettings);
-  if (normalizedSettings.DeleteAllPastChats) {
+  if (settingsAction === 'delete_saved_chats') {
     settings.logDebug('delete all saved chats from settings');
     model.deleteAllSavedChats();
-    normalizedSettings.DeleteAllPastChats = false;
+  } else if (settingsAction === 'reload_models') {
+    settings.logDebug('reopening configuration with refreshed models');
+  } else if (settingsAction) {
+    settings.logDebug('ignored unknown configuration action');
+    settingsAction = '';
   }
   settings.saveSettings(normalizedSettings);
   watch.syncWatchSettings(normalizedSettings);
-  if (reloadModels) {
-    settings.logDebug('reopening configuration with refreshed models');
+  if (settingsAction === 'reload_models') {
     openConfiguration(normalizedSettings);
   }
 });

@@ -8,21 +8,6 @@ var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
 var TIMELINE_DEFAULT_PIN_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_REMINDER_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_NOTIFICATION_ICON = 'NOTIFICATION_GENERIC';
-var TIMELINE_UPSERT_ALLOWED_ARGS = {
-  id: true,
-  title: true,
-  time: true,
-  durationMinutes: true,
-  pinType: true,
-  subtitle: true,
-  body: true,
-  locationName: true,
-  icon: true,
-  reminderTime: true,
-  remindMinutesBefore: true,
-  reminderTitle: true,
-  reminderIcon: true
-};
 var TIMELINE_RAW_PIN_ARG_KEYS = {
   pin: true,
   layout: true,
@@ -1050,16 +1035,13 @@ function firstTimelineValue(args, keys) {
   return undefined;
 }
 
-function validateTimelineArgShape(args, allowedArgs) {
+function validateTimelineArgShape(args) {
   var key;
 
   for (key in args) {
     if (args.hasOwnProperty(key)) {
       if (TIMELINE_RAW_PIN_ARG_KEYS[key]) {
         return 'Use structured timeline arguments, not raw Pebble pin JSON';
-      }
-      if (allowedArgs && !allowedArgs[key]) {
-        return 'Unsupported timeline argument: ' + key;
       }
     }
   }
@@ -1498,7 +1480,7 @@ function buildTimelinePin(args, options) {
       error: 'Timeline arguments must be an object'
     };
   }
-  validationError = validateTimelineArgShape(args, options.allowedArgs);
+  validationError = validateTimelineArgShape(args);
   if (validationError) {
     return {
       error: validationError
@@ -1769,10 +1751,7 @@ function extractTimelinePinId(args) {
 }
 
 function callTimelineUpsertBuiltin(args, requestId, callback) {
-  var built = buildTimelinePin(args, {
-    forceReminder: false,
-    allowedArgs: TIMELINE_UPSERT_ALLOWED_ARGS
-  });
+  var built = buildTimelinePin(args, { forceReminder: false });
   var pin;
   var validationError;
 

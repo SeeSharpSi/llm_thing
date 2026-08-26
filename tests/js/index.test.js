@@ -31,8 +31,7 @@ function createHarness(options) {
 
   var currentSettings = options.settings || {
     FontSize: 18,
-    PreserveChats: true,
-    DeleteAllPastChats: false
+    PreserveChats: true
   };
   var settings = {
     DEFAULT_SETTINGS: currentSettings,
@@ -43,7 +42,6 @@ function createHarness(options) {
       var result = {};
       Object.keys(base).forEach(function(key) { result[key] = base[key]; });
       Object.keys(value || {}).forEach(function(key) { result[key] = value[key]; });
-      result.DeleteAllPastChats = result.DeleteAllPastChats === true || result.DeleteAllPastChats === '1';
       return result;
     },
     logDebug: function() {}
@@ -117,34 +115,73 @@ test('registers Clay and handles ready and configuration open', function() {
   assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
 });
 
-test('webview close normalizes, deletes chats once, saves, and syncs', function() {
+test('webview close deletes chats once for the delete action without reloading', function() {
   var harness = createHarness();
 
-  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ DeleteAllPastChats: '1', FontSize: 24 }) });
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: 'delete_saved_chats', FontSize: 24 }) });
 
   assert.deepEqual(harness.clay.lastGetSettings[1], false);
   assert.deepEqual(harness.model.calls, [['delete-all']]);
-  assert.equal(harness.settings.saved[0].DeleteAllPastChats, false);
-  assert.equal(harness.settings.saved[0].FontSize, 24);
+  assert.equal(harness.settings.saved.length, 1);
   assert.equal(harness.watch.calls[0][0], 'sync');
+  assert.equal(harness.watch.calls[0][1].FontSize, 24);
+  assert.ok(!('ConfigAction' in harness.settings.saved[0]));
+  assert.ok(!('DeleteAllPastChats' in harness.settings.saved[0]));
+  assert.deepEqual(global.Pebble.openedUrls, []);
 });
 
-test('model reload submission saves settings and reopens with phone-side discovery', function() {
+test('webview close object-wrapped delete action unwraps and executes once', function() {
+  var harness = createHarness();
+
+  global.Pebble.emit('webviewclosed', {
+    response: JSON.stringify({ ConfigAction: { value: 'delete_saved_chats' }, FontSize: 18 })
+  });
+
+  assert.deepEqual(harness.model.calls, [['delete-all']]);
+  assert.ok(!('ConfigAction' in harness.settings.saved[0]));
+  assert.deepEqual(global.Pebble.openedUrls, []);
+});
+
+test('model reload action saves settings and reopens with phone-side discovery', function() {
   var harness = createHarness();
 
   global.Pebble.emit('webviewclosed', {
     response: JSON.stringify({
-      DeleteAllPastChats: '2',
+      ConfigAction: 'reload_models',
       Endpoint: 'https://new.example/v1/responses',
       ApiKey: 'new-secret'
     })
   });
 
-  assert.equal(harness.settings.saved[0].DeleteAllPastChats, false);
+  assert.deepEqual(harness.model.calls, []);
+  assert.equal(harness.settings.saved.length, 1);
+  assert.equal(harness.watch.calls[0][0], 'sync');
   assert.equal(harness.modelDiscovery.calls.length, 1);
   assert.equal(harness.modelDiscovery.calls[0].Endpoint, 'https://new.example/v1/responses');
-  assert.equal(harness.clay.currentSettings.DeleteAllPastChats, false);
+  assert.ok(!('ConfigAction' in harness.settings.saved[0]));
+  assert.ok(!('DeleteAllPastChats' in harness.settings.saved[0]));
+  assert.ok(!('ConfigAction' in harness.clay.currentSettings));
+  assert.ok(!('DeleteAllPastChats' in harness.clay.currentSettings));
   assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
+});
+
+test('empty or unknown configuration actions perform neither flow and stay unpersisted', function() {
+  var harness = createHarness();
+
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: '', FontSize: 20 }) });
+  assert.deepEqual(harness.model.calls, []);
+  assert.equal(harness.modelDiscovery.calls.length, 0);
+  assert.equal(harness.settings.saved.length, 1);
+  assert.equal(harness.watch.calls.length, 1);
+  assert.ok(!('ConfigAction' in harness.settings.saved[0]));
+  assert.deepEqual(global.Pebble.openedUrls, []);
+
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: true }) });
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: 'bogus_action' }) });
+  assert.deepEqual(harness.model.calls, []);
+  assert.equal(harness.modelDiscovery.calls.length, 0);
+  assert.equal(harness.settings.saved.length, 3);
+  assert.deepEqual(global.Pebble.openedUrls, []);
 });
 
 test('appmessage routes reset, request, saved chat, delete, and health flows', function() {
@@ -168,7 +205,7 @@ test('appmessage routes reset, request, saved chat, delete, and health flows', f
 });
 
 test('saved-chat requests reject disabled preservation and missing chats', function() {
-  var harness = createHarness({ settings: { PreserveChats: false, DeleteAllPastChats: false } });
+  var harness = createHarness({ settings: { PreserveChats: false } });
 
   global.Pebble.emit('appmessage', { payload: { PastChatsRequest: 1 } });
   global.Pebble.emit('appmessage', { payload: { PastChatLoad: 'missing' } });

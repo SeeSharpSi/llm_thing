@@ -174,8 +174,9 @@ module.exports = [
       },
       {
         "type": "input",
-        "messageKey": "DeleteAllPastChats",
-        "defaultValue": "0",
+        "id": "ConfigActionInput",
+        "messageKey": "ConfigAction",
+        "defaultValue": "",
         "attributes": {
           "type": "hidden"
         }

@@ -22,14 +22,15 @@
 - After every update, run `pebble build` and then `pebble install --cloudpebble`.
 - Emulator install: `pebble install --emulator emery`; add `--logs` to stream logs during install, or use `pebble logs --emulator emery`.
 - Phone install: `pebble install --phone <ip>`.
-- GitHub Actions runs `npm test` and `npm run test:bundle`; Pebble SDK builds remain a local release gate.
+- GitHub Actions and Forgejo Actions both run `npm test` and `npm run test:bundle`; Pebble SDK builds remain a local release gate.
 
 ## References
 - Pebble SDK documentation: `https://developer.repebble.com/docs/`.
 
 ## Toolchain And Generated Files
 - `wscript` compiles `src/c/**/*.c`; bundles `src/pkjs/**/*.js`, `src/pkjs/**/*.json`, and `src/common/**/*.js`; JS entry is `src/pkjs/index.js`.
-- `build/` and `node_modules/@rebble/clay/` are tracked in git. Do not delete or treat them as disposable; after `pebble build`, check `git status` for generated changes.
+- Most of `build/` is tracked in git, as is `node_modules/@rebble/clay/`. Do not delete or treat them as disposable; after `pebble build`, check `git status` for generated changes.
+- Exceptions to tracking: Waf locks (`lock-waf*`), `.wafpickle-*` directories, `build/c4che/`, `build/config.log`, generated `build/webpack/` config, and `node_modules/.package-lock.json` are ignored ephemeral host/package-manager state and must stay untracked.
 - `@rebble/clay` is pinned and vendored/tracked. `jsdom` is a test-only dependency; run `npm install` when test dependencies are missing, then inspect tracked Clay changes before keeping them.
 
 ## Test Architecture

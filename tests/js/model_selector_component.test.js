@@ -31,8 +31,8 @@ function createItem(options) {
   var afterBuild = [];
   var endpoint = createConfigItem(options && options.endpoint);
   var apiKey = createConfigItem(options && options.apiKey);
-  var reloadModels = createConfigItem('0');
-  var configItems = { Endpoint: endpoint, ApiKey: apiKey, DeleteAllPastChats: reloadModels };
+  var reloadModels = createConfigItem('');
+  var configItems = { Endpoint: endpoint, ApiKey: apiKey, ConfigAction: reloadModels };
   var submitCount = 0;
   var clay = {
     EVENTS: { AFTER_BUILD: 'AFTER_BUILD' },
@@ -158,7 +158,7 @@ test('endpoint changes invalidate models and Load Models submits a phone-side re
   assert.match(item.root.querySelector('[data-model-status]').textContent, /changed/);
 
   click(item, '[data-model-load]');
-  assert.equal(item.reloadModelsItem.get(), '2');
+  assert.equal(item.reloadModelsItem.get(), 'reload_models');
   assert.equal(item.submitCount(), 1);
   assert.equal(item.root.querySelector('[data-model-load]').disabled, true);
   assert.equal(item.root.querySelector('[data-model-status]').textContent, 'Saving settings and loading models...');

@@ -227,3 +227,91 @@ test('mismatched health RequestId leaves matching pending request active', funct
   });
   assert.deepEqual(result, { error: null, json: '{"stepCount":5}' });
 });
+
+test('saved transcript transfers multibyte text in byte-safe sequential chunks', function() {
+  var watch = freshWatch();
+  var content = new Array(301).join('漢') + new Array(51).join('😀');
+  var resetMessages;
+  var doneMessages;
+  var chunks;
+  var completions = [];
+
+  watch.sendPastChatTranscript({
+    messages: [{ role: 'assistant', content: content }]
+  }, {}, function(error) {
+    completions.push(error);
+  });
+
+  chunks = global.Pebble.messages.filter(function(message) {
+    return message.PastChatTextChunk !== undefined;
+  });
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every(function(message) {
+    return Buffer.byteLength(message.PastChatTextChunk, 'utf8') <= 400 &&
+      !/[\ud800-\udbff]$/.test(message.PastChatTextChunk) &&
+      !/^[\udc00-\udfff]/.test(message.PastChatTextChunk) &&
+      message.PastChatTextChunk.indexOf('\uFFFD') === -1;
+  }));
+  assert.ok(chunks.every(function(message) {
+    assert.deepEqual(Object.keys(message), ['PastChatTextChunk']);
+    return true;
+  }));
+  assert.equal(
+    chunks.map(function(message) { return message.PastChatTextChunk; }).join(''),
+    content
+  );
+
+  resetMessages = global.Pebble.messages.filter(function(message) {
+    return message.PastChatTextReset !== undefined;
+  });
+  assert.equal(resetMessages.length, 1);
+  assert.deepEqual(global.Pebble.messages[0], { PastChatTextReset: 1 });
+
+  doneMessages = global.Pebble.messages.filter(function(message) {
+    return message.PastChatTextDone !== undefined;
+  });
+  assert.equal(doneMessages.length, 1);
+  assert.deepEqual(
+    global.Pebble.messages[global.Pebble.messages.length - 1],
+    { PastChatTextDone: 1 }
+  );
+
+  assert.ok(global.Pebble.messages.every(function(message) {
+    return message.RequestId === undefined &&
+      message.ResponseChunkIndex === undefined &&
+      message.ResponseChunk === undefined &&
+      message.ResponseDone === undefined &&
+      message.ResponseError === undefined;
+  }));
+
+  assert.deepEqual(completions, [undefined]);
+});
+
+test('saved transcript emits exact 400-byte chunks ending on emoji boundaries', function() {
+  var watch = freshWatch();
+  var content = new Array(351).join('😀');
+  var chunks;
+
+  watch.sendPastChatTranscript({
+    messages: [{ role: 'assistant', content: content }]
+  }, {}, function() {});
+
+  chunks = global.Pebble.messages.filter(function(message) {
+    return message.PastChatTextChunk !== undefined;
+  });
+
+  assert.equal(chunks.length, 4);
+  assert.deepEqual(chunks.map(function(message) {
+    return Buffer.byteLength(message.PastChatTextChunk, 'utf8');
+  }), [400, 400, 400, 200]);
+  assert.ok(chunks.every(function(message) {
+    return !/[\ud800-\udbff]$/.test(message.PastChatTextChunk) &&
+      !/^[\udc00-\udfff]/.test(message.PastChatTextChunk) &&
+      message.PastChatTextChunk.indexOf('\uFFFD') === -1;
+  }));
+  assert.equal(
+    chunks.map(function(message) { return message.PastChatTextChunk; }).join(''),
+    content
+  );
+});

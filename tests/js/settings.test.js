@@ -13,6 +13,14 @@ test.afterEach(function() {
   load.clearModule(settingsPath);
 });
 
+test('DEFAULT_SETTINGS owns no transient configuration action fields', function() {
+  var settings = require(settingsPath);
+
+  assert.ok(!('DeleteAllPastChats' in settings.DEFAULT_SETTINGS));
+  assert.ok(!('ConfigAction' in settings.DEFAULT_SETTINGS));
+  assert.equal(settings.DEFAULT_SETTINGS.PreserveChats, false);
+});
+
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
   var settings = require(settingsPath);
   var result = settings.extend(settings.DEFAULT_SETTINGS, {

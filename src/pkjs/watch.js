@@ -109,6 +109,51 @@ function nextUtf8Chunk(text, start, maxBytes) {
   };
 }
 
+function sendUtf8ChunkSequence(spec) {
+  var value = String(spec.text || '');
+  var offset = 0;
+  var chunkIndex = 0;
+
+  function stepFailed(error) {
+    if (spec.onFailure) {
+      spec.onFailure(error);
+    }
+  }
+
+  function sendNext() {
+    var chunk;
+
+    if (offset >= value.length) {
+      if (!spec.doneDict) {
+        if (spec.onSuccess) {
+          spec.onSuccess();
+        }
+        return;
+      }
+      sendMessage(spec.doneDict(), function() {
+        if (spec.onSuccess) {
+          spec.onSuccess();
+        }
+      }, stepFailed);
+      return;
+    }
+
+    chunk = nextUtf8Chunk(value, offset, CHUNK_SIZE);
+    if (!chunk.text) {
+      stepFailed(new Error('Unable to encode response chunk'));
+      return;
+    }
+
+    sendMessage(spec.chunkDict(chunk.text, chunkIndex), function() {
+      offset = chunk.end;
+      chunkIndex += 1;
+      sendNext();
+    }, stepFailed);
+  }
+
+  sendMessage(spec.resetDict(), sendNext, stepFailed);
+}
+
 function abortXhrsForKey(key) {
   var requests = s_active_xhrs[key] || [];
   var i;
@@ -308,8 +353,6 @@ function sendReset(requestId, onSuccess, onFailure) {
 }
 
 function sendWatchText(requestId, text, includeDone, onDone) {
-  var i = 0;
-  var chunkIndex = 0;
   var completed = false;
   var value = truncateAtCodePointBoundary(text, MAX_RESPONSE_CHARS);
 
@@ -337,42 +380,26 @@ function sendWatchText(requestId, text, includeDone, onDone) {
     });
   }
 
-  function finish() {
-    if (includeDone) {
-      sendMessage({ ResponseDone: 1, RequestId: requestId }, function() {
-        complete(null);
-      }, fail);
-    } else {
+  sendUtf8ChunkSequence({
+    text: value,
+    resetDict: function() {
+      return { ResponseReset: 1, RequestId: requestId };
+    },
+    chunkDict: function(chunkText, chunkIndex) {
+      return {
+        ResponseChunk: chunkText,
+        ResponseChunkIndex: chunkIndex,
+        RequestId: requestId
+      };
+    },
+    doneDict: includeDone ? function() {
+      return { ResponseDone: 1, RequestId: requestId };
+    } : null,
+    onSuccess: function() {
       complete(null);
-    }
-  }
-
-  function sendNext() {
-    var chunk;
-
-    if (i >= value.length) {
-      finish();
-      return;
-    }
-
-    chunk = nextUtf8Chunk(value, i, CHUNK_SIZE);
-    if (!chunk.text) {
-      fail(new Error('Unable to encode response chunk'));
-      return;
-    }
-
-    sendMessage({
-      ResponseChunk: chunk.text,
-      ResponseChunkIndex: chunkIndex,
-      RequestId: requestId
-    }, function() {
-      i = chunk.end;
-      chunkIndex += 1;
-      sendNext();
-    }, fail);
-  }
-
-  sendReset(requestId, sendNext, fail);
+    },
+    onFailure: fail
+  });
 }
 
 function sendPastChats(chats, onDone) {
@@ -499,21 +526,18 @@ function formatSavedChatTranscript(chat, settings) {
 }
 
 function sendPastChatTranscript(chat, settings, onDone) {
-  var text = formatSavedChatTranscript(chat, settings);
-  var i = 0;
-
-  sendMessage({ PastChatTextReset: 1 }, function sendNext() {
-    if (i >= text.length) {
-      sendMessage({ PastChatTextDone: 1 }, onDone);
-      return;
-    }
-
-    sendMessage({
-      PastChatTextChunk: text.substring(i, i + CHUNK_SIZE)
-    }, function() {
-      i += CHUNK_SIZE;
-      sendNext();
-    });
+  sendUtf8ChunkSequence({
+    text: formatSavedChatTranscript(chat, settings),
+    resetDict: function() {
+      return { PastChatTextReset: 1 };
+    },
+    chunkDict: function(chunkText) {
+      return { PastChatTextChunk: chunkText };
+    },
+    doneDict: function() {
+      return { PastChatTextDone: 1 };
+    },
+    onSuccess: onDone
   });
 }
 

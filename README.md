@@ -62,9 +62,10 @@ health data. JavaScript tests use deterministic fakes. C tests compile
 `src/c/llm_core.c` on the host with warnings as errors and UndefinedBehavior
 Sanitizer.
 
-GitHub Actions runs `npm test` and the tracked built-bundle smoke test on each
-push and pull request. Known regressions should be recorded as `test.todo`
-cases until fixed; the current suite has no TODO cases.
+GitHub Actions and Forgejo Actions both run `npm test` and the tracked
+built-bundle smoke test on each push and pull request. Known regressions should
+be recorded as `test.todo` cases until fixed; the current suite has no TODO
+cases.
 
 ## Model Providers
 
@@ -149,7 +150,7 @@ and scope API/MCP credentials to the minimum permissions needed.
 - `tests/js/`: phone-side unit, regression, contract, and DOM tests.
 - `tests/c/`: host-C unit tests.
 - `tests/integration/`: generated PebbleKit bundle smoke test.
-- `.github/workflows/ci.yml`: host JavaScript, C, and tracked-bundle CI.
+- `.github/workflows/ci.yml` and `.forgejo/workflows/ci.yml`: host JavaScript, C, and tracked-bundle CI on GitHub Actions and Forgejo Actions.
 
 ## Documentation
 

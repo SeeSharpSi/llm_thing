@@ -233,6 +233,68 @@ test('Timeline retries one transient PUT using Retry-After', function() {
   }
 });
 
+test('Timeline upsert rejects unknown arguments by schema before any timeline call', function() {
+  var harness = createHarness();
+  var results;
+  var tokenRequests = 0;
+  global.Pebble = {
+    getTimelineToken: function(callback) {
+      tokenRequests += 1;
+      callback('timeline-token');
+    }
+  };
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 42, function(error, definitions, map) {
+    harness.tools.runToolCalls(42, [{
+      id: 'pin',
+      name: 'pebble_timeline_create_or_update_pin',
+      arguments: {
+        id: 'unknown-arg',
+        title: 'Unknown',
+        time: new Date(new Date().getTime() + 60 * 60 * 1000).toISOString(),
+        sneakyExtra: true
+      }
+    }], map, function(value) { results = value; });
+  });
+
+  assert.equal(results[0].error, 'Unsupported tool argument: sneakyExtra');
+  assert.equal(FakeXMLHttpRequest.instances.length, 0);
+  assert.equal(tokenRequests, 0);
+});
+
+test('Timeline reminder rejects raw Pebble pin payload keys', function() {
+  var harness = createHarness();
+  var results;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 43, function(error, definitions, map) {
+    harness.tools.runToolCalls(43, [{
+      id: 'pin',
+      name: 'pebble_timeline_create_reminder',
+      arguments: {
+        title: 'Raw',
+        time: new Date(new Date().getTime() + 60 * 60 * 1000).toISOString(),
+        reminders: [{ time: '2026-01-01T00:00:00Z' }]
+      }
+    }], map, function(value) { results = value; });
+  });
+
+  assert.equal(results[0].error, 'Use structured timeline arguments, not raw Pebble pin JSON');
+  assert.equal(FakeXMLHttpRequest.instances.length, 0);
+});
+
 test('MCP parse and HTTP failures omit failed server without blocking discovery', function() {
   var harness = createHarness();
   var result;

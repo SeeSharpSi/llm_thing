@@ -118,16 +118,16 @@ module.exports = {
     };
 
     item.reloadModels = function() {
-      var reloadModelsItem = clay && clay.getItemByMessageKey && clay.getItemByMessageKey('DeleteAllPastChats');
+      var configActionItem = clay && clay.getItemByMessageKey && clay.getItemByMessageKey('ConfigAction');
       var submitButton = root.ownerDocument.querySelector('.component-submit button');
 
-      if (!reloadModelsItem || !submitButton) {
+      if (!configActionItem || !submitButton) {
         setStatus('Save settings, then reopen them to refresh models.');
         return;
       }
       loadButton.disabled = true;
       setStatus('Saving settings and loading models...');
-      reloadModelsItem.set('2');
+      configActionItem.set('reload_models');
       submitButton.click();
     };
 

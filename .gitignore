@@ -1,2 +1,11 @@
 node_modules/
-.github/workflows/ci.yml
+
+# Ephemeral Waf build host state (never tracked)
+.lock-waf_*
+build/.lock-waf_*
+build/.wafpickle-*
+build/c4che/
+build/config.log
+
+# Generated webpack host config (rebuilt by pebble build)
+build/webpack/

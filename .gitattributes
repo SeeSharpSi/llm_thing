@@ -1,0 +1,6 @@
+# Generated build artifacts: webpack prefixes every module line with a tab,
+# so blank source lines become whitespace-only lines. This is inherent tool
+# output, not a defect. Exclude these exact paths from git's trailing
+# whitespace checks (git diff --check / core.whitespace) only.
+build/pebble-js-app.js -whitespace
+build/pebble-js-app.js.map -whitespace

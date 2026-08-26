@@ -75,7 +75,7 @@
       "ProgressOutputContextSize",
       "ChatReset",
       "PreserveChats",
-      "DeleteAllPastChats",
+      "ConfigAction",
       "PastChatsRequest",
       "PastChatsReset",
       "PastChatsItemId",

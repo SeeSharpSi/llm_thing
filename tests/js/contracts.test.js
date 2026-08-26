@@ -26,6 +26,17 @@ function configItems(items, result) {
   return result;
 }
 
+function allConfigItems(items, result) {
+  result = result || [];
+  (items || []).forEach(function(item) {
+    result.push(item);
+    if (item.items) {
+      allConfigItems(item.items, result);
+    }
+  });
+  return result;
+}
+
 test.afterEach(function() {
   delete global.Pebble;
   load.clearModule(watchPath);
@@ -64,6 +75,34 @@ test('model configuration uses the dynamic selector', function() {
   assert.equal(modelItem.defaultValue, settings.DEFAULT_SETTINGS.Model);
 });
 
+test('transient ConfigAction replaces the persistent DeleteAllPastChats control', function() {
+  var manifestKeys = packageJson.pebble.messageKeys;
+  var configured = configItems(config);
+  var configuredKeys = configured.map(function(item) { return item.messageKey; });
+  var actionItems = configured.filter(function(item) { return item.messageKey === 'ConfigAction'; });
+  var allItems = allConfigItems(config);
+  var deleteButtons = allItems.filter(function(item) {
+    return item.type === 'button' && item.id === 'DeleteAllPastChats';
+  });
+
+  assert.ok(manifestKeys.indexOf('ConfigAction') !== -1, 'ConfigAction missing from package.json');
+  assert.equal(actionItems.length, 1);
+  assert.equal(actionItems[0].attributes.type, 'hidden');
+  assert.equal(actionItems[0].defaultValue, '');
+
+  assert.equal(manifestKeys.indexOf('DeleteAllPastChats'), -1);
+  configured.forEach(function(item) {
+    assert.notEqual(item.messageKey, 'DeleteAllPastChats');
+    assert.ok(!('messageKey' in item && item.defaultValue === '0' && item.attributes && item.attributes.type === 'hidden'),
+      'legacy hidden DeleteAllPastChats control remains');
+  });
+  assert.equal(deleteButtons.length, 1);
+  assert.equal(deleteButtons[0].messageKey, undefined);
+
+  assert.equal(settings.DEFAULT_SETTINGS.DeleteAllPastChats, undefined);
+  assert.equal(settings.DEFAULT_SETTINGS.ConfigAction, undefined);
+});
+
 test('watch settings sync excludes phone-only settings and secrets', function() {
   global.Pebble = createFakePebble();
   var watch = require(watchPath);
@@ -78,6 +117,8 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   ].sort());
   assert.equal(global.Pebble.messages[0].ApiKey, undefined);
   assert.equal(global.Pebble.messages[0].McpServersJson, undefined);
+  assert.equal(global.Pebble.messages[0].DeleteAllPastChats, undefined);
+  assert.equal(global.Pebble.messages[0].ConfigAction, undefined);
 });
 
 test('generated message-key artifacts are internally consistent', function() {
