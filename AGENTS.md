@@ -22,24 +22,25 @@
 - After every update, run `pebble build` and then `pebble install --cloudpebble`.
 - Emulator install: `pebble install --emulator emery`; add `--logs` to stream logs during install, or use `pebble logs --emulator emery`.
 - Phone install: `pebble install --phone <ip>`.
-- GitHub Actions and Forgejo Actions both run `npm test` and `npm run test:bundle`; Pebble SDK builds remain a local release gate.
+- GitHub Actions and Forgejo Actions run `npm test` and `npm run test:bundle` against committed generated artifacts. They do not install the Pebble SDK; Pebble SDK builds remain a local release gate.
 
 ## References
 - Pebble SDK documentation: `https://developer.repebble.com/docs/`.
 
 ## Toolchain And Generated Files
 - `wscript` compiles `src/c/**/*.c`; bundles `src/pkjs/**/*.js`, `src/pkjs/**/*.json`, and `src/common/**/*.js`; JS entry is `src/pkjs/index.js`.
-- Most of `build/` is tracked in git, as is `node_modules/@rebble/clay/`. Do not delete or treat them as disposable; after `pebble build`, check `git status` for generated changes.
-- Exceptions to tracking: Waf locks (`lock-waf*`), `.wafpickle-*` directories, `build/c4che/`, `build/config.log`, generated `build/webpack/` config, and `node_modules/.package-lock.json` are ignored ephemeral host/package-manager state and must stay untracked.
-- `@rebble/clay` is pinned and vendored/tracked. `jsdom` is a test-only dependency; run `npm install` when test dependencies are missing, then inspect tracked Clay changes before keeping them.
+- `build/` is ignored except for four generated artifacts required by tests and CI: `build/pebble-js-app.js`, `build/appinfo.json`, `build/js/message_keys.json`, and `build/include/message_keys.auto.h`.
+- Run `pebble build` locally to regenerate all output. Commit retained artifacts when source, app metadata, or message keys change. Keep platform binaries, object files, source maps, and `.pbw` packages out of git; publish `.pbw` files as release artifacts instead.
+- Waf locks (`lock-waf*`), `.wafpickle-*` directories, build caches/configuration, and `node_modules/.package-lock.json` are ephemeral host/package-manager state and must stay untracked.
+- `@rebble/clay` is pinned, vendored, and tracked. Other `node_modules/` content remains ignored. `jsdom` is a test-only dependency; run `npm install` when test dependencies are missing, then inspect tracked Clay changes before keeping them.
 
 ## Test Architecture
 - JavaScript tests use Node's built-in `node:test` runner under `tests/js/`; keep production PebbleKit JS ES5-compatible even though tests run on modern Node.
 - Use deterministic fakes from `tests/js/helpers/` for `Pebble`, `XMLHttpRequest`, `localStorage`, timers, and external APIs. Tests must not call live model, MCP, Timeline, geolocation, or health services.
-- `tests/js/contracts.test.js` checks configuration/default/message-key and watch text-marker contracts.
+- `tests/js/contracts.test.js` checks configuration/default/message-key and watch text-marker contracts, including the retained generated app-info, JSON key map, and C header.
 - `tests/js/mcp_servers_component.test.js` uses `jsdom`; other suites should not require a browser environment unless DOM behavior is under test.
 - `tests/c/run.sh` compiles only Pebble-independent `llm_core` code with the host compiler, warnings as errors, and UndefinedBehavior Sanitizer.
-- `tests/integration/bundle.test.js` executes the generated PebbleKit bundle and therefore must run after `pebble build`.
+- `tests/integration/bundle.test.js` executes the generated PebbleKit bundle. Run it after `pebble build` locally; CI tests the committed bundle because CI does not install the Pebble SDK.
 - Known unfixed regressions are represented by `test.todo` cases. Do not convert them into assertions for broken behavior; enable them when implementing the corresponding fix.
 - The current suite has no `test.todo` cases. Add one only for a deliberately documented regression, not as a substitute for completing new behavior.
 
@@ -51,7 +52,7 @@
 - Request IDs prevent stale responses: C ignores incoming messages whose `RequestId` differs from current `s_request_id`; preserve this when changing response flow.
 - Watch text layout is debounced while chunks arrive and flushed on `ResponseDone`; do not restore full text measurement after every chunk.
 - Dictation is behind `#if defined(PBL_MICROPHONE)`; keep non-microphone platforms building and showing unsupported text.
-- For new watch/phone messages, add keys in `package.json` `pebble.messageKeys`, then rebuild so generated `MESSAGE_KEY_*` and JS wrappers update.
+- For new watch/phone messages, add keys in `package.json` `pebble.messageKeys`, rebuild, and commit the updated retained app-info, JSON key map, C header, and JS bundle.
 - Color settings (`TextColor`, `BackgroundColor`, `PromptBackgroundColor`, `BoldTextColor`) are stored as hex integers, synced from phone to watch, and persisted watch-side. On black-and-white platforms any non-`0x000000` value renders as white.
 - API requests use Responses format by default. `ApiMode` can explicitly select Responses or Chat Completions; `auto` uses `/chat/completions` endpoint detection.
 - `MaxOutputTokens` is provider-shaped, and `ReasoningEffort` is Responses-only. Official OpenAI Responses requests use `store: false` and request encrypted reasoning content when reasoning is enabled.

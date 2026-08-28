@@ -1,14 +1,17 @@
 node_modules/
 
-# Ephemeral Waf build host state (never tracked)
-.lock-waf_*
-build/.lock-waf_*
-build/.wafpickle-*
-build/c4che/
-build/config.log
+# Generated Pebble output; retain only artifacts consumed by tests and CI
+build/**
+!build/appinfo.json
+!build/pebble-js-app.js
+!build/include/
+!build/include/message_keys.auto.h
+!build/js/
+!build/js/message_keys.json
 
-# Generated webpack host config (rebuilt by pebble build)
-build/webpack/
+# Ephemeral Waf host state
+.lock-waf_*
+.wafpickle-*
 
 # Editors and IDEs
 .vscode/
