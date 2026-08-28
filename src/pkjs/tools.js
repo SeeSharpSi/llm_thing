@@ -1,6 +1,7 @@
 var common = require('./settings');
 var watch = require('./watch');
 var timelineStore = require('./timeline_store');
+var webFetch = require('./web_fetch');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
@@ -2111,6 +2112,24 @@ while (hasOwn(toolMap, exposedName)) {
 }
 
 function addBuiltinTools(settings, tools, toolMap) {
+  if (settings.WebSearchEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'web_fetch',
+      label: 'Web Fetch',
+      description: 'Fetch and read an HTTP(S) web page as Markdown. Use offset and limit character ranges; fetch pages in chunks when needed. Do not assume content outside returned range.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['url'],
+        properties: {
+          url: { type: 'string', maxLength: 2048, description: 'HTTP(S) page URL.' },
+          offset: { type: 'integer', minimum: 0, maximum: 500000, description: 'Character offset in final Markdown. Default 0.' },
+          limit: { type: 'integer', minimum: 1, maximum: 6000, description: 'Maximum returned Markdown characters. Default 3000.' }
+        }
+      },
+      call: function(args, requestId, callback) { webFetch.fetch(args, requestId, watch, callback); }
+    });
+  }
   if (settings.GeolocationToolEnabled) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_get_location',

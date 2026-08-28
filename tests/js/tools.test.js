@@ -11,6 +11,7 @@ var load = require('./helpers/load_with_stubs');
 
 var toolsPath = path.resolve(__dirname, '../../src/pkjs/tools');
 var timelineStorePath = path.resolve(__dirname, '../../src/pkjs/timeline_store');
+var webFetchPath = path.resolve(__dirname, '../../src/pkjs/web_fetch');
 
 function createHarness() {
   FakeXMLHttpRequest.reset();
@@ -44,6 +45,7 @@ test.afterEach(function() {
   delete global.localStorage;
   load.clearModule(toolsPath);
   load.clearModule(timelineStorePath);
+  load.clearModule(webFetchPath);
 });
 
 test('discoverPhoneTools returns enabled built-ins in stable name order', function() {
@@ -70,6 +72,99 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
     'pebble_timeline_list_pins'
   ]);
   assert.equal(result.map.pebble_get_location.kind, 'builtin');
+});
+
+test('WebSearchEnabled discovers web_fetch with bounded schema', function() {
+  var harness = createHarness();
+  var result;
+
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 1, function(error, definitions, map) {
+    result = { error: error, definitions: definitions, map: map };
+  });
+
+  assert.equal(result.error, null);
+  assert.equal(result.definitions.length, 1);
+  assert.equal(result.definitions[0].name, 'web_fetch');
+  assert.deepEqual(result.definitions[0].parameters.required, ['url']);
+  assert.equal(result.definitions[0].parameters.additionalProperties, false);
+  assert.equal(result.map.web_fetch.kind, 'builtin');
+});
+
+test('web_fetch GET sends headers and returns HTML Markdown within offset and limit', function() {
+  var harness = createHarness();
+  var results;
+
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 2, function(error, definitions, map) {
+    harness.tools.runToolCalls(2, [{ id: 'fetch', name: 'web_fetch', arguments: { url: 'https://example.test/page', offset: 2, limit: 12 } }], map, function(value) { results = value; });
+  });
+  assert.equal(FakeXMLHttpRequest.last().method, 'GET');
+  assert.match(FakeXMLHttpRequest.last().headers.Accept, /text\/html/);
+  FakeXMLHttpRequest.last().respond(200, '<title>Page</title><h1>Hello</h1><p>World &amp; all</p>');
+
+  assert.equal(results[0].error, undefined);
+  assert.ok(results[0].result.length <= 12);
+  assert.equal(results[0].result, 'Page\n\n# Hell');
+});
+
+test('web_fetch converts useful HTML and rejects invalid URLs and HTTP failures', function() {
+  var harness = createHarness();
+  var results;
+  var markdown = require('../../src/pkjs/web_fetch').htmlToMarkdown('<h2>T</h2><strong>bold</strong><em>it</em><ul><li>one</li></ul><ol><li>two</li></ol><a href=https://x.test><strong>link</strong></a><pre>&amp;amp;</pre><script>bad</script>');
+  assert.match(markdown, /## T/);
+  assert.match(markdown, /\*\*bold\*\*/);
+  assert.match(markdown, /- one/);
+  assert.match(markdown, /1\. two/);
+  assert.match(markdown, /\[link\]\(https:\/\/x\.test\)/);
+  assert.match(markdown, /```\n&amp;\n```/);
+  assert.doesNotMatch(markdown, /bad/);
+
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 3, function(error, definitions, map) {
+    harness.tools.runToolCalls(3, [{ id: 'bad', name: 'web_fetch', arguments: { url: 'ftp://example.test' } }, { id: 'http', name: 'web_fetch', arguments: { url: 'https://example.test' } }], map, function(value) { results = value; });
+  });
+  FakeXMLHttpRequest.last().respond(503, 'down');
+  assert.match(results[0].error, /HTTP\(S\)/);
+  assert.match(results[1].error, /HTTP 503/);
+});
+
+test('web_fetch never exceeds small limits and preserves entity Unicode', function() {
+  var harness = createHarness();
+  var results;
+  var markdown = require('../../src/pkjs/web_fetch').htmlToMarkdown('A &#x1F600; &amp;amp;');
+
+  assert.equal(markdown, 'A 😀 &amp;');
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 5, function(error, definitions, map) {
+    harness.tools.runToolCalls(5, [{ id: 'small', name: 'web_fetch', arguments: { url: 'https://example.test', limit: 1 } }], map, function(value) { results = value; });
+  });
+  FakeXMLHttpRequest.last().respond(200, 'long content');
+
+  assert.equal(results[0].result.length, 1);
+});
+
+test('web_fetch rejects malformed and private URLs before creating a request', function() {
+  var harness = createHarness();
+  var results;
+
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 6, function(error, definitions, map) {
+    harness.tools.runToolCalls(6, [
+      { id: 'malformed', name: 'web_fetch', arguments: { url: 'https://?' } },
+      { id: 'private', name: 'web_fetch', arguments: { url: 'http://127.0.0.1/' } }
+    ], map, function(value) { results = value; });
+  });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 0);
+  assert.match(results[0].error, /valid HTTP\(S\)/);
+  assert.match(results[1].error, /valid HTTP\(S\)/);
+});
+
+test('web_fetch reports network and timeout errors', function() {
+  var harness = createHarness();
+  var results;
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', WebSearchEnabled: true }, 4, function(error, definitions, map) {
+    harness.tools.runToolCalls(4, [{ id: 'fetch', name: 'web_fetch', arguments: { url: 'https://example.test' } }], map, function(value) { results = value; });
+  });
+  assert.equal(FakeXMLHttpRequest.last().timeout, 30000);
+  FakeXMLHttpRequest.last().timeOut();
+  assert.match(results[0].error, /timed out/);
 });
 
 test('MCP discovery initializes session and exposes filtered tools', function() {

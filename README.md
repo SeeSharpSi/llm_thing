@@ -92,9 +92,8 @@ shape:
 - `Max Output Tokens` sends the provider-specific output limit when nonzero.
 - `Reasoning Effort` sends a Responses reasoning-effort hint. Thinking display
   remains controlled separately.
-- Web search uses the Responses hosted `web_search` tool. If a compatible
-  endpoint rejects that tool, the request falls back once without it. Returned
-  citation URLs are appended to the watch answer.
+- Web Fetch exposes phone-side `web_fetch` for bounded HTTP(S) page reading.
+  It returns normalized Markdown by character offset and limit.
 
 Requests are single-shot; streaming is not used. Model network errors,
 timeouts, HTTP 408, HTTP 429, and HTTP 5xx responses are retried once as

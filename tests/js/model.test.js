@@ -518,8 +518,12 @@ test('HTTP 401 does not retry', function() {
 function webToolsStub() {
   return {
     discoverPhoneTools: function(currentSettings, id, callback) {
-      callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
-        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      callback(null, [
+        { name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } },
+        { name: 'web_fetch', description: 'Fetch pages in chunks', parameters: { type: 'object', additionalProperties: false, required: ['url'], properties: { url: { type: 'string' }, offset: { type: 'integer' }, limit: { type: 'integer' } } } }
+      ], {
+        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } },
+        web_fetch: { kind: 'builtin', parameters: { type: 'object' } }
       });
     },
     runToolCalls: function() {},
@@ -527,40 +531,29 @@ function webToolsStub() {
   };
 }
 
-test('Responses with WebSearchEnabled adds hosted web_search tool alongside function tools', function() {
+test('WebSearchEnabled adds native web_fetch function alongside function tools', function() {
   var harness = createHarness({ settings: { MaxToolCalls: 2, WebSearchEnabled: true }, tools: webToolsStub() });
   harness.model.requestCompletion(44, 'Hi');
   var body = JSON.parse(FakeXMLHttpRequest.instances[0].body);
-  assert.ok(body.tools.some(function(t) { return t.type === 'web_search'; }));
+  assert.equal(body.tools.filter(function(t) { return t.type === 'web_search'; }).length, 0);
+  assert.ok(body.tools.some(function(t) { return t.type === 'function' && t.name === 'web_fetch'; }));
   assert.ok(body.tools.some(function(t) { return t.type === 'function' && t.name === 'lookup'; }));
+  assert.doesNotMatch(body.input[0].content, /Only tools listed here are enabled/);
 });
 
-test('Chat Completions keeps web search prompt-only (no hosted tool)', function() {
-  var harness = createHarness({ settings: { Endpoint: 'https://api.example.test/v1/chat/completions', MaxToolCalls: 2, WebSearchEnabled: true }, tools: webToolsStub() });
+test('Chat Completions includes native web_fetch function', function() {
+  var harness = createHarness({ settings: { Endpoint: 'https://chat-web-fetch.example.test/v1/chat/completions', ApiMode: 'chat-completions', Model: 'chat-web-fetch-model', MaxToolCalls: 2, WebSearchEnabled: true }, tools: webToolsStub() });
   harness.model.requestCompletion(45, 'Hi');
   var body = JSON.parse(FakeXMLHttpRequest.instances[0].body);
-  assert.equal(body.tools.filter(function(t) { return t.type === 'web_search'; }).length, 0);
-  assert.ok(body.messages[0].content.indexOf('web search') !== -1);
+  assert.equal((body.tools || []).filter(function(t) { return t.type === 'web_search'; }).length, 0);
+  assert.equal(body.messages[0].content.indexOf('Hosted web search'), -1);
 });
 
-test('web search fallback on 400 removes hosted tool but keeps function tools', function() {
+test('web_fetch request has no hosted web_search fallback path', function() {
   var harness = createHarness({ settings: { MaxToolCalls: 2, WebSearchEnabled: true }, tools: webToolsStub() });
   harness.model.requestCompletion(46, 'Hi');
-  FakeXMLHttpRequest.instances[0].respond(400, 'web search unsupported');
-  var retry = JSON.parse(FakeXMLHttpRequest.instances[1].body);
-  assert.equal(retry.tools.filter(function(t) { return t.type === 'web_search'; }).length, 0);
-  assert.ok(retry.tools.some(function(t) { return t.type === 'function' && t.name === 'lookup'; }));
-  FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'done' });
-});
-
-test('Responses web search citations appended to answer', function() {
-  var harness = createHarness({ settings: { WebSearchEnabled: true, MaxToolCalls: 0 } });
-  harness.model.requestCompletion(47, 'Search');
-  FakeXMLHttpRequest.last().respond(200, {
-    output_text: 'The sky is blue.',
-    output: [{ type: 'message', content: [{ type: 'output_text', text: 'The sky is blue.', annotations: [{ type: 'url_citation', url: 'https://example.com/a' }] }] }]
-  });
-  assert.match(harness.watch.responses[0], /The sky is blue\.\n\nSources:\n- https:\/\/example\.com\/a/);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+  assert.ok(JSON.parse(FakeXMLHttpRequest.instances[0].body).tools.some(function(t) { return t.name === 'web_fetch'; }));
 });
 
 test('Responses refusal returns concise refusal text without shape diagnostics', function() {
@@ -840,7 +833,7 @@ test('Messages native tool round trip replays assistant blocks and tool_result u
   assert.deepEqual(harness.watch.responses, ['Final answer']);
 });
 
-test('WebSearchEnabled in Messages mode omits hosted web_search but keeps prompt fallback', function() {
+test('WebSearchEnabled in Messages mode includes native web_fetch', function() {
   var harness = createHarness({ settings: {
     ApiMode: 'messages',
     MaxToolCalls: 2,
@@ -849,11 +842,11 @@ test('WebSearchEnabled in Messages mode omits hosted web_search but keeps prompt
   harness.model.requestCompletion(78, 'Hi');
   var body = JSON.parse(FakeXMLHttpRequest.instances[0].body);
 
-  assert.equal(body.tools.filter(function(t) { return t.type === 'web_search'; }).length, 0);
+  assert.ok(body.tools.some(function(t) { return t.name === 'web_fetch'; }));
   assert.ok(body.tools.every(function(t) {
     return !!t.name && !!t.description && !!t.input_schema && t.parameters === undefined;
   }));
-  assert.ok(body.system.indexOf('web search') !== -1);
+  assert.equal(body.system.indexOf('Hosted web search'), -1);
 });
 
 function toolEchoStub() {

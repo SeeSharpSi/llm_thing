@@ -94,7 +94,7 @@ function buildToolGuidance(toolDefinitions, maxToolCalls) {
   }
 
   text = '\n\nPhone-side tools are available.' +
-    '\nOnly tools listed here are enabled in app settings.' +
+    '\nOnly phone-side tools listed here are enabled in app settings.' +
     '\nYou may use at most ' + maxToolCalls + ' tool call(s) total for this request.';
 
   if (hasTimelineTools(toolDefinitions)) {
@@ -135,11 +135,6 @@ function buildToolInstructions(toolDefinitions, maxToolCalls, nativeTools) {
 
 function buildSystemPrompt(settings, toolInstructions) {
   var prompt = expandSystemPromptVariables(settings.SystemPrompt);
-
-  if (settings.WebSearchEnabled) {
-    prompt += '\nIf web search is available to you, use it when useful and cite sources briefly.';
-  }
-
   return prompt + (toolInstructions || '');
 }
 
@@ -679,9 +674,6 @@ function buildBody(settings, conversation, options) {
   if (options.nativeTools && options.toolDefinitions && options.toolDefinitions.length) {
     tools = buildNativeTools(options.toolDefinitions, 'responses');
   }
-  if (settings.WebSearchEnabled && !options.skipWebSearch) {
-    tools.push({ type: 'web_search' });
-  }
   if (tools.length) {
     body.tools = tools;
   }
@@ -732,7 +724,6 @@ function requestModel(settings, conversation, requestId, options, callback) {
 
   var done = false;
   var reasoningSummarySkipped = false;
-  var webSearchFallbackDone = false;
   var transientRetried = false;
   var plan = buildEndpointPlan(settings);
 
@@ -754,27 +745,21 @@ function requestModel(settings, conversation, requestId, options, callback) {
     }, delayMs);
   }
 
-  function attempt(candidateIndex, skipReasoningSummary, skipWebSearch) {
+  function attempt(candidateIndex, skipReasoningSummary) {
     var candidate = plan.candidates[candidateIndex];
     var attemptSettings = candidate.settings;
     var request = new XMLHttpRequest();
     var requestOptions = copyRequestOptions(options);
     var includeReasoningSummary;
-    var webSearchActive;
     var body;
 
     if (skipReasoningSummary) {
       requestOptions.skipReasoningSummary = true;
     }
-    if (skipWebSearch) {
-      requestOptions.skipWebSearch = true;
-    }
-
     includeReasoningSummary = shouldRequestReasoningSummary(attemptSettings, requestOptions);
-    webSearchActive = !!attemptSettings.WebSearchEnabled && !skipWebSearch && endpointProtocol(attemptSettings) === 'responses';
     body = JSON.stringify(buildBody(attemptSettings, conversation, requestOptions));
 
-    common.logDebug('llm request endpoint=' + attemptSettings.Endpoint + ' model=' + attemptSettings.Model + ' mode=' + endpointProtocol(attemptSettings) + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' webSearch=' + (webSearchActive ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + attemptSettings.RequestTimeoutMs);
+    common.logDebug('llm request endpoint=' + attemptSettings.Endpoint + ' model=' + attemptSettings.Model + ' mode=' + endpointProtocol(attemptSettings) + ' nativeTools=' + (requestOptions.nativeTools ? '1' : '0') + ' tools=' + ((requestOptions.toolDefinitions && requestOptions.toolDefinitions.length) || 0) + ' reasoningSummary=' + (includeReasoningSummary ? '1' : '0') + ' messages=' + conversation.length + ' bytes=' + body.length + ' timeoutMs=' + attemptSettings.RequestTimeoutMs);
 
     request.open('POST', attemptSettings.Endpoint, true);
     request.setRequestHeader('Content-Type', 'application/json');
@@ -804,14 +789,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
         if (includeReasoningSummary && (request.status === 400 || request.status === 422) && !reasoningSummarySkipped) {
           common.logDebug('reasoning summary rejected; retrying without summary');
           reasoningSummarySkipped = true;
-          attempt(candidateIndex, true, skipWebSearch);
-          return;
-        }
-
-        if (webSearchActive && (request.status === 400 || request.status === 404 || request.status === 422) && !webSearchFallbackDone) {
-          common.logDebug('web search hosted tool rejected; retrying without hosted web tool');
-          webSearchFallbackDone = true;
-          attempt(candidateIndex, skipReasoningSummary, true);
+          attempt(candidateIndex, true);
           return;
         }
 
@@ -828,7 +806,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
         if (isTransientHttpStatus(request.status) && !transientRetried) {
           common.logDebug('transient http status=' + request.status + '; retrying once');
           scheduleTransientRetry(function() {
-            attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+            attempt(candidateIndex, skipReasoningSummary);
           }, parseRetryAfterMs(request));
           return;
         }
@@ -859,7 +837,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
       common.logDebug('llm network error');
       if (!transientRetried) {
         scheduleTransientRetry(function() {
-          attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+          attempt(candidateIndex, skipReasoningSummary);
         }, 0);
         return;
       }
@@ -874,7 +852,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
       common.logDebug('llm timeout');
       if (!transientRetried) {
         scheduleTransientRetry(function() {
-          attempt(candidateIndex, skipReasoningSummary, skipWebSearch);
+          attempt(candidateIndex, skipReasoningSummary);
         }, 0);
         return;
       }
@@ -1215,104 +1193,6 @@ function extractIncompleteReason(json) {
   return '';
 }
 
-function collectCitationUrl(value, urls, seen) {
-  var url = '';
-
-  if (!value) {
-    return;
-  }
-
-  if (typeof value === 'string') {
-    url = common.trim(value);
-  } else if (value.url) {
-    url = common.trim(typeof value.url === 'string' ? value.url : (value.url.url || value.url.href || ''));
-  } else if (value.citation) {
-    url = common.trim(typeof value.citation === 'string' ? value.citation : (value.citation.url || ''));
-  }
-
-  if (!url || seen[url] || url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0) {
-    return;
-  }
-
-  seen[url] = true;
-  urls.push(url);
-}
-
-function extractCitationUrls(json) {
-  var urls = [];
-  var seen = {};
-  var message = getChoiceMessage(json);
-  var i;
-  var j;
-  var k;
-  var item;
-  var content;
-  var annotation;
-
-  if (message && message.annotations && message.annotations.length) {
-    for (i = 0; i < message.annotations.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
-      annotation = message.annotations[i] || {};
-      if (annotation.type === 'url_citation') {
-        collectCitationUrl(annotation, urls, seen);
-      }
-    }
-  }
-
-  if (message && message.citations && message.citations.length) {
-    for (i = 0; i < message.citations.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
-      collectCitationUrl(message.citations[i], urls, seen);
-    }
-  }
-
-  if (json.output && json.output.length) {
-    for (i = 0; i < json.output.length && urls.length < common.MAX_SOURCES_URLS; i += 1) {
-      item = json.output[i] || {};
-      if (item.content && item.content.length) {
-        for (j = 0; j < item.content.length && urls.length < common.MAX_SOURCES_URLS; j += 1) {
-          content = item.content[j] || {};
-          if (content.annotations && content.annotations.length) {
-            for (k = 0; k < content.annotations.length && urls.length < common.MAX_SOURCES_URLS; k += 1) {
-              annotation = content.annotations[k] || {};
-              if (annotation.type === 'url_citation') {
-                collectCitationUrl(annotation, urls, seen);
-              }
-            }
-          }
-          if (content.url && content.type === 'url_citation') {
-            collectCitationUrl(content, urls, seen);
-          }
-        }
-      }
-    }
-  }
-
-  return urls;
-}
-
-function appendCitations(json, answer) {
-  var urls = extractCitationUrls(json);
-  var text = String(answer || '');
-  var lines = [];
-  var i;
-
-  if (!urls.length) {
-    return text;
-  }
-
-  for (i = 0; i < urls.length; i += 1) {
-    if (text.indexOf(urls[i]) !== -1) {
-      continue;
-    }
-    lines.push('- ' + urls[i]);
-  }
-
-  if (!lines.length) {
-    return text;
-  }
-
-  return text + '\n\nSources:\n' + lines.join('\n');
-}
-
 function parseResponse(json, showThinking, extraThinking) {
   var answer = extractResponseText(json);
   var refusal;
@@ -1339,8 +1219,6 @@ function parseResponse(json, showThinking, extraThinking) {
     common.logDebug('no response text; shape=' + summarizeResponseShape(json));
     answer = 'No response text.';
   }
-
-  answer = appendCitations(json, answer);
 
   if (!showThinking) {
     return stripThinking(answer);
