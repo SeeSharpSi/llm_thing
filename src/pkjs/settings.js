@@ -14,7 +14,7 @@ var DEFAULT_SETTINGS = {
   ApiKey: '',
   Model: 'gpt-4.1-mini',
   RequestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-  SystemPrompt: 'You are a helpful assistant. Keep answers concise for a watch screen. Use Markdown bold when useful, but do not use italics or strikethrough.',
+  SystemPrompt: 'The current date-time is $DATETIME. You are a helpful assistant. Keep answers concise for a watch screen. Format your responses in markdown, but only use bold text and lists.',
   ShowThinking: false,
   ShowInputContextSize: false,
   ShowOutputContextSize: false,
