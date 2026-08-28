@@ -101,6 +101,7 @@ function buildToolGuidance(toolDefinitions, maxToolCalls) {
     text += '\nTimeline tool rules:' +
       '\n- For reminder requests, alarms, alerts, or phrases like "remind me", call pebble_timeline_create_reminder.' +
       '\n- For non-reminder calendar events, schedule items, or timeline pins, call pebble_timeline_create_or_update_pin.' +
+      '\n- To change an existing pin, first call pebble_timeline_list_pins to find its id, then call pebble_timeline_edit_pin with the same id (same-ID PUT replaces the pin entirely).' +
       '\n- Do not say a reminder, event, or pin was created, updated, or deleted unless the timeline tool result succeeded.' +
       '\n- After a successful timeline tool result, include the title/time when known and the returned pin id.' +
       '\n- If title, time, or target pin is ambiguous, ask one concise clarification instead of calling a tool.';

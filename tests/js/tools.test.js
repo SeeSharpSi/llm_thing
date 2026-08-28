@@ -5,14 +5,17 @@ var assert = require('node:assert/strict');
 var path = require('node:path');
 var common = require('../../src/pkjs/settings');
 var FakeXMLHttpRequest = require('./helpers/fake_xhr');
+var FakeLocalStorage = require('./helpers/fake_local_storage');
 var installFakeTimers = require('./helpers/fake_timers');
 var load = require('./helpers/load_with_stubs');
 
 var toolsPath = path.resolve(__dirname, '../../src/pkjs/tools');
+var timelineStorePath = path.resolve(__dirname, '../../src/pkjs/timeline_store');
 
 function createHarness() {
   FakeXMLHttpRequest.reset();
   global.XMLHttpRequest = FakeXMLHttpRequest;
+  global.localStorage = new FakeLocalStorage();
 
   var watch = {
     progress: [],
@@ -31,14 +34,16 @@ function createHarness() {
     './settings': commonStub,
     './watch': watch
   });
-  return { tools: tools, watch: watch };
+  return { tools: tools, watch: watch, commonStub: commonStub };
 }
 
 test.afterEach(function() {
   delete global.XMLHttpRequest;
   delete global.navigator;
   delete global.Pebble;
+  delete global.localStorage;
   load.clearModule(toolsPath);
+  load.clearModule(timelineStorePath);
 });
 
 test('discoverPhoneTools returns enabled built-ins in stable name order', function() {
@@ -60,7 +65,9 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
     'pebble_get_location',
     'pebble_timeline_create_or_update_pin',
     'pebble_timeline_create_reminder',
-    'pebble_timeline_delete_pin'
+    'pebble_timeline_delete_pin',
+    'pebble_timeline_edit_pin',
+    'pebble_timeline_list_pins'
   ]);
   assert.equal(result.map.pebble_get_location.kind, 'builtin');
 });
@@ -227,7 +234,10 @@ test('Timeline retries one transient PUT using Retry-After', function() {
     assert.equal(FakeXMLHttpRequest.instances.length, 2);
     FakeXMLHttpRequest.instances[1].respond(200, '');
     assert.equal(results[0].error, undefined);
-    assert.match(results[0].result, /saved successfully/);
+    var parsed = JSON.parse(results[0].result);
+    assert.equal(parsed.status, 'success');
+    assert.equal(parsed.id, 'retry-pin');
+    assert.equal(parsed.editable, true);
   } finally {
     timers.restore();
   }
@@ -738,4 +748,251 @@ test('MCP server with insecure non-localhost http url is omitted', function() {
   assert.equal(FakeXMLHttpRequest.instances.length, 0);
   assert.equal(discovered.error, null);
   assert.deepEqual(discovered.definitions, []);
+});
+
+test('Timeline create without id generates ID, returns editable JSON and persists', function() {
+  var harness = createHarness();
+  var results;
+  var listResult;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+  var future = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 50, function(error, definitions, map) {
+    harness.tools.runToolCalls(50, [{
+      id: 'gen1',
+      name: 'pebble_timeline_create_or_update_pin',
+      arguments: { title: 'Generated', time: future, body: 'KeepMe' }
+    }], map, function(value) { results = value; });
+  });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+  var putBody = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+  assert.ok(putBody.id);
+  assert.equal(putBody.layout.title, 'Generated');
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+
+  assert.equal(results[0].error, undefined);
+  var parsed = JSON.parse(results[0].result);
+  assert.equal(parsed.status, 'success');
+  assert.equal(parsed.title, 'Generated');
+  assert.equal(parsed.time, putBody.time);
+  assert.equal(parsed.editable, true);
+  assert.ok(parsed.id);
+  assert.equal(parsed.id, putBody.id);
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 51, function(error, definitions, map) {
+    harness.tools.runToolCalls(51, [{ id: 'list1', name: 'pebble_timeline_list_pins', arguments: {} }], map, function(value) { listResult = value; });
+  });
+  assert.equal(listResult[0].error, undefined);
+  var list = JSON.parse(listResult[0].result);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].id, parsed.id);
+  assert.equal(list[0].title, 'Generated');
+  assert.equal(list[0].kind, 'pin');
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+});
+
+test('Timeline edit with only changed title preserves original time/body and uses same ID', function() {
+  var harness = createHarness();
+  var results;
+  var editResults;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+  var future = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 60, function(error, definitions, map) {
+    harness.tools.runToolCalls(60, [{
+      id: 'c1',
+      name: 'pebble_timeline_create_or_update_pin',
+      arguments: { title: 'Original', time: future, body: 'KeepMe', subtitle: 'Sub' }
+    }], map, function(value) { results = value; });
+  });
+
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+  var firstId = JSON.parse(results[0].result).id;
+  var firstBody = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+  assert.equal(firstBody.layout.body, 'KeepMe');
+  assert.equal(firstBody.layout.subtitle, 'Sub');
+
+  FakeXMLHttpRequest.reset();
+  var map2;
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 61, function(error, definitions, m) { map2 = m; });
+
+  harness.tools.runToolCalls(61, [{ id: 'edit1', name: 'pebble_timeline_edit_pin', arguments: { id: firstId, title: 'Changed' } }], map2, function(value) { editResults = value; });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+  var secondBody = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+  assert.equal(secondBody.id, firstId);
+  assert.equal(secondBody.layout.title, 'Changed');
+  assert.equal(secondBody.layout.body, 'KeepMe');
+  assert.equal(secondBody.layout.subtitle, 'Sub');
+  assert.equal(secondBody.time, firstBody.time);
+
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+  assert.equal(editResults[0].error, undefined);
+  var parsedEdit = JSON.parse(editResults[0].result);
+  assert.equal(parsedEdit.id, firstId);
+  assert.equal(parsedEdit.title, 'Changed');
+  assert.equal(parsedEdit.editable, true);
+});
+
+test('Timeline edit unknown ID fails before token or network', function() {
+  var harness = createHarness();
+  var results;
+  var tokenRequests = 0;
+  global.Pebble = {
+    getTimelineToken: function(callback) {
+      tokenRequests += 1;
+      callback('timeline-token');
+    }
+  };
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 70, function(error, definitions, map) {
+    harness.tools.runToolCalls(70, [{ id: 'e1', name: 'pebble_timeline_edit_pin', arguments: { id: 'unknown123', title: 'NewTitle' } }], map, function(value) { results = value; });
+  });
+
+  assert.match(results[0].error, /Unknown pin id/);
+  assert.match(results[0].error, /pebble_timeline_list_pins/);
+  assert.equal(FakeXMLHttpRequest.instances.length, 0);
+  assert.equal(tokenRequests, 0);
+});
+
+test('Timeline delete removes stored record and returns JSON', function() {
+  var harness = createHarness();
+  var createRes;
+  var deleteRes;
+  var listAfter;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+  var future = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 80, function(error, definitions, map) {
+    harness.tools.runToolCalls(80, [{ id: 'c', name: 'pebble_timeline_create_reminder', arguments: { title: 'ToDelete', time: future } }], map, function(value) { createRes = value; });
+  });
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+  var delId = JSON.parse(createRes[0].result).id;
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 81, function(error, definitions, map) {
+    harness.tools.runToolCalls(81, [{ id: 'd', name: 'pebble_timeline_delete_pin', arguments: { id: delId } }], map, function(value) { deleteRes = value; });
+  });
+  var delReq = FakeXMLHttpRequest.instances[FakeXMLHttpRequest.instances.length - 1];
+  assert.equal(delReq.method, 'DELETE');
+  delReq.respond(200, '');
+  assert.equal(deleteRes[0].error, undefined);
+  var delParsed = JSON.parse(deleteRes[0].result);
+  assert.equal(delParsed.status, 'deleted');
+  assert.equal(delParsed.id, delId);
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 82, function(error, definitions, map) {
+    harness.tools.runToolCalls(82, [{ id: 'l', name: 'pebble_timeline_list_pins', arguments: {} }], map, function(value) { listAfter = value; });
+  });
+  var list = JSON.parse(listAfter[0].result);
+  assert.equal(list.length, 0);
+});
+
+test('Timeline edit preserves stored reminder kind and rebuilds reminder time when changing pin time', function() {
+  var harness = createHarness();
+  var createRes;
+  var editRes;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+  var future = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+  var future2 = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 90, function(error, definitions, map) {
+    harness.tools.runToolCalls(90, [{ id: 'c', name: 'pebble_timeline_create_reminder', arguments: { title: 'Rem', time: future } }], map, function(value) { createRes = value; });
+  });
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+  var remId = JSON.parse(createRes[0].result).id;
+  var firstPin = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+  assert.ok(firstPin.reminders && firstPin.reminders.length === 1);
+  assert.equal(firstPin.reminders[0].time, firstPin.time);
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 91, function(error, definitions, map) {
+    harness.tools.runToolCalls(91, [{ id: 'e', name: 'pebble_timeline_edit_pin', arguments: { id: remId, time: future2 } }], map, function(value) { editRes = value; });
+  });
+  var secondPin = JSON.parse(FakeXMLHttpRequest.instances[FakeXMLHttpRequest.instances.length - 1].body);
+  FakeXMLHttpRequest.instances[FakeXMLHttpRequest.instances.length - 1].respond(200, '');
+  assert.equal(Date.parse(secondPin.time), Date.parse(future2) - (Date.parse(future2) % 1000));
+  assert.ok(secondPin.reminders && secondPin.reminders.length === 1);
+  assert.equal(secondPin.reminders[0].time, secondPin.time);
+});
+
+test('Timeline create with storage failure still succeeds but editable false with warning', function() {
+  var harness = createHarness();
+  var results;
+  global.Pebble = {
+    getTimelineToken: function(callback) { callback('timeline-token'); }
+  };
+  var future = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+  global.localStorage.failWrites = 100;
+
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    GeolocationToolEnabled: false,
+    TimelineToolEnabled: true,
+    HealthToolEnabled: false
+  }, 100, function(error, definitions, map) {
+    harness.tools.runToolCalls(100, [{ id: 'c', name: 'pebble_timeline_create_or_update_pin', arguments: { title: 'FailStore', time: future } }], map, function(value) { results = value; });
+  });
+  FakeXMLHttpRequest.instances[0].respond(200, '');
+  assert.equal(results[0].error, undefined);
+  var parsed = JSON.parse(results[0].result);
+  assert.equal(parsed.editable, false);
+  assert.ok(parsed.warning);
 });

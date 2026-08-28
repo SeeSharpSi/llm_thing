@@ -1,5 +1,6 @@
 var common = require('./settings');
 var watch = require('./watch');
+var timelineStore = require('./timeline_store');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
@@ -1750,10 +1751,65 @@ function extractTimelinePinId(args) {
   return '';
 }
 
+function cloneTimelineValue(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (e) {
+    return null;
+  }
+}
+
+function buildTimelineSuccessResult(pin, editable, warning) {
+  var payload = {
+    status: 'success',
+    id: pin.id,
+    title: pin.layout && pin.layout.title ? String(pin.layout.title) : '',
+    time: pin.time,
+    editable: !!editable
+  };
+  if (warning) {
+    payload.warning = warning;
+  }
+  return common.safeJson(payload);
+}
+
+function buildTimelineDeleteResult(id, warning) {
+  var payload = {
+    status: 'deleted',
+    id: id
+  };
+  if (warning) {
+    payload.warning = warning;
+  }
+  return common.safeJson(payload);
+}
+
+function saveTimelineRecord(kind, pin, args) {
+  var argsClone = cloneTimelineValue(args) || {};
+  argsClone.id = pin.id;
+  try {
+    return timelineStore.saveTimelinePin(pin.id, kind, pin, argsClone);
+  } catch (e) {
+    return false;
+  }
+}
+
+function finishTimelineSave(kind, pin, args, callback) {
+  var editable = saveTimelineRecord(kind, pin, args);
+  var warning = '';
+
+  if (!editable) {
+    warning = 'Pin saved but storage failed; not editable';
+    common.logDebug('timeline store save failed id=' + pin.id);
+  }
+  callback(null, buildTimelineSuccessResult(pin, editable, warning));
+}
+
 function callTimelineUpsertBuiltin(args, requestId, callback) {
   var built = buildTimelinePin(args, { forceReminder: false });
   var pin;
   var validationError;
+  var argsForStore;
 
   if (built.error) {
     callback(built.error);
@@ -1768,13 +1824,23 @@ function callTimelineUpsertBuiltin(args, requestId, callback) {
     return;
   }
 
-  timelinePinRequest('PUT', pin.id, pin, requestId, callback);
+  argsForStore = cloneTimelineValue(args) || {};
+  argsForStore.id = pin.id;
+
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    finishTimelineSave('pin', pin, argsForStore, callback);
+  });
 }
 
 function callTimelineReminderBuiltin(args, requestId, callback) {
   var built = buildTimelinePin(args, { forceReminder: true });
   var pin;
   var validationError;
+  var argsForStore;
 
   if (built.error) {
     callback(built.error);
@@ -1789,11 +1855,21 @@ function callTimelineReminderBuiltin(args, requestId, callback) {
     return;
   }
 
-  timelinePinRequest('PUT', pin.id, pin, requestId, callback);
+  argsForStore = cloneTimelineValue(args) || {};
+  argsForStore.id = pin.id;
+
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    finishTimelineSave('reminder', pin, argsForStore, callback);
+  });
 }
 
 function callTimelineDeleteBuiltin(args, requestId, callback) {
   var id = extractTimelinePinId(args);
+  var stored;
 
   if (!id) {
     callback('Pin id is required');
@@ -1804,7 +1880,109 @@ function callTimelineDeleteBuiltin(args, requestId, callback) {
     return;
   }
 
-  timelinePinRequest('DELETE', id, null, requestId, callback);
+  try {
+    stored = timelineStore.getTimelinePin(id);
+  } catch (e) {
+    stored = null;
+  }
+
+  timelinePinRequest('DELETE', id, null, requestId, function(error) {
+    var removed = false;
+    var warning = '';
+
+    if (error) {
+      callback(error);
+      return;
+    }
+    try {
+      removed = timelineStore.removeTimelinePin(id);
+    } catch (e) {}
+    if (stored && !removed) {
+      warning = 'Pin deleted but stored edit record could not be removed';
+      common.logDebug('timeline store remove failed id=' + id);
+    }
+    callback(null, buildTimelineDeleteResult(id, warning));
+  });
+}
+
+function callTimelineListBuiltin(args, requestId, callback) {
+  var pins = [];
+  try {
+    pins = timelineStore.listTimelinePins();
+  } catch (e) {
+    pins = [];
+  }
+  callback(null, common.safeJson(pins));
+}
+
+function callTimelineEditBuiltin(args, requestId, callback) {
+  var id = common.trim(args && args.id);
+  var stored;
+  var mergedArgs;
+  var allowedFields = ['title', 'time', 'durationMinutes', 'pinType', 'subtitle', 'body', 'locationName', 'icon', 'pinIcon', 'reminderTime', 'remindMinutesBefore', 'reminderTitle', 'reminderIcon', 'createNotificationTitle', 'createNotificationBody'];
+  var i;
+  var key;
+  var forceReminder;
+  var built;
+  var pin;
+  var validationError;
+  var argsForStore;
+
+  if (!id) {
+    callback('Missing required tool argument: id');
+    return;
+  }
+  if (id.length > 64) {
+    callback('Pin id must be 64 characters or fewer');
+    return;
+  }
+
+  try {
+    stored = timelineStore.getTimelinePin(id);
+  } catch (e) {
+    stored = null;
+  }
+  if (!stored) {
+    callback('Unknown pin id: ' + id + '. Use pebble_timeline_list_pins to find editable pins.');
+    return;
+  }
+
+  mergedArgs = cloneTimelineValue(stored.args) || {};
+  for (i = 0; i < allowedFields.length; i += 1) {
+    key = allowedFields[i];
+    if (hasOwn(args, key)) {
+      mergedArgs[key] = cloneTimelineValue(args[key]);
+      if (mergedArgs[key] === null && args[key] !== null) {
+        mergedArgs[key] = args[key];
+      }
+    }
+  }
+  mergedArgs.id = stored.id;
+
+  forceReminder = stored.kind === 'reminder';
+  built = buildTimelinePin(mergedArgs, { forceReminder: forceReminder });
+  if (built.error) {
+    callback(built.error);
+    return;
+  }
+  pin = built.pin;
+  pin.id = stored.id;
+  validationError = validateTimelinePin(pin);
+  if (validationError) {
+    callback(validationError);
+    return;
+  }
+
+  argsForStore = cloneTimelineValue(mergedArgs) || {};
+  argsForStore.id = pin.id;
+
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    finishTimelineSave(stored.kind, pin, argsForStore, callback);
+  });
 }
 
 function parseUnixTimeArg(value) {
@@ -2013,6 +2191,46 @@ function addBuiltinTools(settings, tools, toolMap) {
         required: ['id']
       },
       call: callTimelineDeleteBuiltin
+    });
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_timeline_list_pins',
+      label: 'Timeline',
+      description: 'List LLM-created Pebble timeline pins stored on the phone for editing. Returns compact JSON with id, kind, title, time for editable pins. Use this to find a target before calling pebble_timeline_edit_pin. No network request.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {}
+      },
+      call: callTimelineListBuiltin
+    });
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_timeline_edit_pin',
+      label: 'Timeline',
+      description: 'Edit an existing LLM-created Pebble timeline pin by id. PUTs full pin JSON to the same id, replacing the existing pin entirely. Load the target with pebble_timeline_list_pins first. Only supplied fields change; other fields are preserved from the stored pin. Empty strings clear optional fields.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', maxLength: 64, description: 'Pin id to edit. Must be an existing LLM-created pin. Use pebble_timeline_list_pins to find ids.' },
+          title: { type: 'string', description: 'Pin title shown on the watch.' },
+          time: { type: 'string', description: 'Pin event start time as ISO date-time with timezone, parseable date-time, or Unix seconds.' },
+          durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes.' },
+          pinType: { type: 'string', enum: ['generic', 'calendar', 'sports', 'weather'], description: 'Kind of timeline pin.' },
+          subtitle: { type: 'string', description: 'Optional subtitle.' },
+          body: { type: 'string', maxLength: 512, description: 'Optional pin body text. Empty string clears.' },
+          locationName: { type: 'string', description: 'Optional location. Empty string clears.' },
+          icon: { type: 'string', description: 'Optional Pebble icon name or URI. Empty string clears to default.' },
+          pinIcon: { type: 'string', description: 'Optional Pebble icon name or URI for the pin. Empty string clears.' },
+          reminderTime: { type: 'string', description: 'Optional exact reminder alert time.' },
+          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before time to show reminder.' },
+          reminderTitle: { type: 'string', description: 'Optional title for the single scheduled reminder. Empty string clears.' },
+          reminderIcon: { type: 'string', description: 'Optional icon for scheduled reminder. Empty string clears.' },
+          createNotificationTitle: { type: 'string', description: 'Optional notification title shown when pin is first delivered. Empty string clears.' },
+          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional notification body shown when pin is first delivered. Empty string clears.' }
+        },
+        required: ['id']
+      },
+      call: callTimelineEditBuiltin
     });
   }
 

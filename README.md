@@ -127,6 +127,10 @@ HTTPS; HTTP is accepted only for localhost development.
 Timeline pins are validated against Pebble's supported range of at most two
 days in the past and one year in the future. Idempotent Timeline requests retry
 once after transient network, timeout, HTTP 408, HTTP 429, or HTTP 5xx failures.
+Successful LLM-created pins are persisted phone-side (up to 64) for same-ID
+full-replacement edits through `pebble_timeline_list_pins` and
+`pebble_timeline_edit_pin`. PUT to the same `/v1/user/pins/{id}` replaces the
+pin entirely.
 
 ## Watch Transport
 
@@ -140,8 +144,9 @@ is complete.
 
 ## Data Storage
 
-Settings, API keys, MCP authorization values, custom headers, and optional saved
-chats are stored by PebbleKit JS in phone `localStorage`. That storage is not an
+Settings, API keys, MCP authorization values, custom headers, optional saved
+chats, and LLM-created timeline pin records (for editable same-ID replacement)
+are stored by PebbleKit JS in phone `localStorage`. That storage is not an
 encrypted secrets vault. Do not configure credentials on an untrusted phone,
 and scope API/MCP credentials to the minimum permissions needed.
 
@@ -159,6 +164,8 @@ and scope API/MCP credentials to the minimum permissions needed.
   AppMessage queueing/chunking.
 - `src/pkjs/settings.js`: defaults, normalization, and settings persistence.
 - `src/pkjs/chat_store.js`: saved-chat persistence and limits.
+- `src/pkjs/timeline_store.js`: LLM-created timeline pin persistence for
+  full-replacement edits.
 - `src/pkjs/config.js`: Clay configuration schema.
 - `src/pkjs/mcp_servers_component.js`: custom MCP server configuration UI.
 - `tests/js/`: phone-side unit, regression, contract, and DOM tests.

@@ -62,4 +62,5 @@
 - MCP uses Streamable HTTP protocol `2025-06-18`, paginated discovery, multi-event SSE parsing, bounded schemas/results, HTTPS except localhost, five-minute in-memory discovery/session caching, and one session reinitialization after HTTP 404.
 - Enabled tools execute automatically without confirmation prompts. Preserve built-in toggles, MCP allowed-tool lists, per-server/global call limits, schema validation, and progress visibility as guardrails.
 - Timeline pin times must remain within two days in the past and one year in the future. Timeline PUT/DELETE requests may retry once because they are idempotent; do not add broad retries to non-idempotent mutations.
+- Successful LLM-created timeline pins are persisted phone-side in `src/pkjs/timeline_store.js` (`llm_thing_timeline_pins_v1`, cap 64) for same-ID full-replacement edits via list/edit tools; PUT to the same `/v1/user/pins/{id}` replaces the existing pin entirely.
 - `@rebble/clay` is exact-pinned at `1.0.10`, and Node.js versions are declared in `package.json` `engines`.
