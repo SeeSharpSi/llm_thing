@@ -104,7 +104,9 @@
       "HealthAverageScope",
       "HealthSessionOffset",
       "TouchScrollEnabled",
-      "RequestTimeoutMs"
+      "RequestTimeoutMs",
+      "PebbleMemoryToolEnabled",
+      "MemoriesJson"
     ],
     "resources": {
       "media": []

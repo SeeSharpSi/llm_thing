@@ -142,6 +142,24 @@ test('Health Info setting and watch protocol are declared consistently', functio
   assert.equal(keys.indexOf('HealthIncludeHeartRate'), -1);
 });
 
+test('Pebble Memory is disabled by default and manager follows MCP Servers', function() {
+  var configured = configItems(config);
+  var toggle = configured.filter(function(item) {
+    return item.messageKey === 'PebbleMemoryToolEnabled';
+  })[0];
+  var finalSection = config[config.length - 2];
+
+  assert.equal(toggle.label, 'Pebble Memory');
+  assert.equal(toggle.defaultValue, false);
+  assert.equal(finalSection.type, 'section');
+  assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
+    'McpServersJson',
+    'MemoriesJson'
+  ]);
+  assert.equal(finalSection.items[1].type, 'memory_manager');
+  assert.equal(config[config.length - 1].type, 'submit');
+});
+
 test('generated message-key artifacts are internally consistent', function() {
   var expected = packageJson.pebble.messageKeys.slice().sort();
   var appInfo = JSON.parse(fs.readFileSync(path.join(root, 'build/appinfo.json'), 'utf8'));

@@ -84,7 +84,12 @@ function createHarness(options) {
     './model_selector_component': { name: 'model_selector' },
     './settings': settings,
     './watch': watch,
-    './model': model
+    './model': model,
+    './memory_store': options.memoryStore || {
+      MAX_MEMORIES: 128,
+      listMemories: function() { return []; },
+      replaceMemories: function() {}
+    }
   });
 
   return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery };
@@ -103,6 +108,7 @@ test('registers Clay and handles ready and configuration open', function() {
   assert.deepEqual(harness.clay.options, { autoHandleEvents: false });
   assert.equal(harness.clay.registered[0].name, 'mcp_servers');
   assert.equal(harness.clay.registered[1].name, 'model_selector');
+  assert.equal(harness.clay.registered[2].name, 'memory_manager');
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
@@ -113,6 +119,85 @@ test('registers Clay and handles ready and configuration open', function() {
   assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[0].modelsEncoded)), ['model-a', "$'model-b"]);
   assert.equal(harness.clay.config[0].items[0].modelsStatus, '2 models loaded.');
   assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
+});
+
+test('memory manager visibility follows its toggle after Clay builds', function() {
+  var harness = createHarness();
+  var enabled = false;
+  var toggleListener;
+  var managerCalls = [];
+  var toggle = {
+    get: function() { return enabled; },
+    on: function(event, callback) { assert.equal(event, 'change'); toggleListener = callback; }
+  };
+  var manager = {
+    hide: function() { managerCalls.push('hide'); },
+    show: function() { managerCalls.push('show'); }
+  };
+  var afterBuild;
+  var clayContext = {
+    EVENTS: { AFTER_BUILD: 'after-build' },
+    on: function(event, callback) { assert.equal(event, 'after-build'); afterBuild = callback; },
+    getItemById: function() { return null; },
+    getItemByMessageKey: function(key) {
+      if (key === 'PebbleMemoryToolEnabled') { return toggle; }
+      if (key === 'MemoriesJson') { return manager; }
+      return null;
+    }
+  };
+
+  harness.clay.customFn.call(clayContext);
+  afterBuild();
+  assert.deepEqual(managerCalls, ['hide']);
+  enabled = true;
+  toggleListener();
+  assert.deepEqual(managerCalls, ['hide', 'show']);
+});
+
+test('configuration bridges phone-local memories without persisting transient JSON', function() {
+  var replaced = [];
+  var harness = createHarness({
+    memoryStore: {
+      MAX_MEMORIES: 128,
+      listMemories: function() { return [{ id: 'one', text: 'saved', createdAt: 10, updatedAt: 11 }]; },
+      replaceMemories: function(records) { replaced.push(records); }
+    }
+  });
+
+  global.Pebble.emit('showConfiguration');
+  assert.deepEqual(JSON.parse(harness.clay.currentSettings.MemoriesJson), [{ id: 'one', text: 'saved', createdAt: 10, updatedAt: 11 }]);
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ PebbleMemoryToolEnabled: 1, MemoriesJson: '[{"id":"two","text":"note","createdAt":20,"updatedAt":21}]' }) });
+  assert.deepEqual(replaced, [[{ id: 'two', text: 'note', createdAt: 20, updatedAt: 21 }]]);
+  assert.ok(!('MemoriesJson' in harness.settings.saved[0]));
+});
+
+test('configuration unwraps Clay memory values before replacing the store', function() {
+  var replaced = [];
+  var harness = createHarness({
+    memoryStore: {
+      MAX_MEMORIES: 128,
+      listMemories: function() { return []; },
+      replaceMemories: function(records) { replaced.push(records); return true; }
+    }
+  });
+
+  global.Pebble.emit('webviewclosed', {
+    response: JSON.stringify({
+      MemoriesJson: { value: '[{"id":"one","text":"note","createdAt":20,"updatedAt":21}]' }
+    })
+  });
+
+  assert.deepEqual(replaced, [[{ id: 'one', text: 'note', createdAt: 20, updatedAt: 21 }]]);
+  assert.ok(!('MemoriesJson' in harness.settings.saved[0]));
+});
+
+test('malformed memory payload preserves store and still saves toggle', function() {
+  var replaced = 0;
+  var harness = createHarness({ memoryStore: { MAX_MEMORIES: 128, listMemories: function() { return []; }, replaceMemories: function() { replaced += 1; } } });
+  assert.doesNotThrow(function() { global.Pebble.emit('webviewclosed', { response: JSON.stringify({ PebbleMemoryToolEnabled: 1, MemoriesJson: '{bad' }) }); });
+  assert.equal(replaced, 0);
+  assert.equal(harness.settings.saved[0].PebbleMemoryToolEnabled, 1);
+  assert.ok(!('MemoriesJson' in harness.settings.saved[0]));
 });
 
 test('webview close deletes chats once for the delete action without reloading', function() {

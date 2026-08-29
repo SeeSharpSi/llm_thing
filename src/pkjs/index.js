@@ -1,11 +1,13 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var mcpServersComponent = require('./mcp_servers_component');
+var memoryManagerComponent = require('./memory_manager_component');
 var modelDiscovery = require('./model_discovery');
 var modelSelectorComponent = require('./model_selector_component');
 var settings = require('./settings');
 var watch = require('./watch');
 var model = require('./model');
+var memoryStore = require('./memory_store');
 
 function clayCustomFn() {
   var self = this;
@@ -25,6 +27,29 @@ function clayCustomFn() {
     var resetButton = self.getItemById('ResetWatchDisplay');
     var deleteAllButton = self.getItemById('DeleteAllPastChats');
     var configAction = self.getItemByMessageKey('ConfigAction');
+    var memoryToggle = self.getItemByMessageKey('PebbleMemoryToolEnabled');
+    var memoryManager = self.getItemByMessageKey('MemoriesJson');
+
+    function memoryEnabled() {
+      var value = memoryToggle && memoryToggle.get ? memoryToggle.get() : false;
+      return value === true || value === 1 || value === '1';
+    }
+
+    function updateMemoryVisibility() {
+      if (!memoryManager) {
+        return;
+      }
+      if (memoryEnabled()) {
+        memoryManager.show();
+      } else {
+        memoryManager.hide();
+      }
+    }
+
+    if (memoryToggle) {
+      memoryToggle.on('change', updateMemoryVisibility);
+    }
+    updateMemoryVisibility();
 
     if (configAction) {
       configAction.hide();
@@ -65,6 +90,7 @@ function clayCustomFn() {
 var clay = new Clay(clayConfig, clayCustomFn, { autoHandleEvents: false });
 clay.registerComponent(mcpServersComponent);
 clay.registerComponent(modelSelectorComponent);
+clay.registerComponent(memoryManagerComponent);
 
 function findConfigItem(items, messageKey) {
   var found = null;
@@ -91,7 +117,15 @@ function setDiscoveredModels(result) {
 }
 
 function openConfiguration(currentSettings) {
-  clay.setSettings(currentSettings);
+  var configurationSettings = settings.extend(currentSettings, {});
+  if (memoryStore && memoryStore.listMemories) {
+    try {
+      configurationSettings.MemoriesJson = JSON.stringify(memoryStore.listMemories(memoryStore.MAX_MEMORIES));
+    } catch (error) {
+      settings.logDebug('memory listing failed: ' + String(error && error.message || error));
+    }
+  }
+  clay.setSettings(configurationSettings);
   modelDiscovery.discover(currentSettings, function(result) {
     settings.logDebug('configuration model discovery count=' + result.models.length);
     setDiscoveredModels(result);
@@ -116,6 +150,8 @@ Pebble.addEventListener('webviewclosed', function(e) {
   var savedSettings;
   var normalizedSettings;
   var settingsAction;
+  var memoryJson;
+  var memoryRecords;
 
   if (!e || !e.response) {
     settings.logDebug('configuration closed without response');
@@ -134,6 +170,25 @@ Pebble.addEventListener('webviewclosed', function(e) {
     settingsAction = settingsAction.value;
   }
   delete savedSettings.ConfigAction;
+  if (savedSettings.MemoriesJson !== undefined) {
+    memoryJson = savedSettings.MemoriesJson;
+    if (memoryJson && typeof memoryJson === 'object' && memoryJson.value !== undefined) {
+      memoryJson = memoryJson.value;
+    }
+    try {
+      memoryRecords = JSON.parse(memoryJson);
+      if (Array.isArray(memoryRecords)) {
+        if (memoryStore && memoryStore.replaceMemories) {
+          if (!memoryStore.replaceMemories(memoryRecords)) {
+            settings.logDebug('memory replacement failed');
+          }
+        }
+      }
+    } catch (error) {
+      settings.logDebug('memory replacement failed: ' + String(error && error.message || error));
+    }
+    delete savedSettings.MemoriesJson;
+  }
   normalizedSettings = settings.extend(settings.DEFAULT_SETTINGS, savedSettings);
   if (settingsAction === 'delete_saved_chats') {
     settings.logDebug('delete all saved chats from settings');

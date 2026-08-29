@@ -215,6 +215,13 @@ module.exports = [
         "defaultValue": false
       },
       {
+        "type": "toggle",
+        "messageKey": "PebbleMemoryToolEnabled",
+        "label": "Pebble Memory",
+        "description": "Allow the model to save, search, and delete short intentional notes stored on this phone.",
+        "defaultValue": false
+      },
+      {
         "type": "input",
         "messageKey": "MaxToolCalls",
         "label": "Max Tool Calls",
@@ -349,6 +356,11 @@ module.exports = [
       {
         "type": "mcp_servers",
         "messageKey": "McpServersJson",
+        "defaultValue": "[]"
+      },
+      {
+        "type": "memory_manager",
+        "messageKey": "MemoriesJson",
         "defaultValue": "[]"
       }
     ]

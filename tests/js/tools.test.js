@@ -12,6 +12,7 @@ var load = require('./helpers/load_with_stubs');
 var toolsPath = path.resolve(__dirname, '../../src/pkjs/tools');
 var timelineStorePath = path.resolve(__dirname, '../../src/pkjs/timeline_store');
 var webFetchPath = path.resolve(__dirname, '../../src/pkjs/web_fetch');
+var memoryStorePath = path.resolve(__dirname, '../../src/pkjs/memory_store');
 
 function createHarness() {
   FakeXMLHttpRequest.reset();
@@ -51,6 +52,7 @@ test.afterEach(function() {
   load.clearModule(toolsPath);
   load.clearModule(timelineStorePath);
   load.clearModule(webFetchPath);
+  load.clearModule(memoryStorePath);
 });
 
 test('discoverPhoneTools returns enabled built-ins in stable name order', function() {
@@ -77,6 +79,46 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
     'pebble_timeline_list_pins'
   ]);
   assert.equal(result.map.pebble_get_location.kind, 'builtin');
+});
+
+test('memory built-ins expose bounded schemas and execute locally', function() {
+  var harness = createHarness();
+  var result;
+  var calls;
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', PebbleMemoryToolEnabled: true }, 1, function(error, definitions, map) {
+    result = { error: error, definitions: definitions, map: map };
+  });
+  assert.equal(result.error, null);
+  assert.deepEqual(result.definitions.map(function(tool) { return tool.name; }), [
+    'pebble_memory_delete', 'pebble_memory_save', 'pebble_memory_search'
+  ]);
+  assert.equal(result.map.pebble_memory_save.parameters.additionalProperties, false);
+  assert.equal(result.map.pebble_memory_save.parameters.properties.text.maxLength, 500);
+  assert.deepEqual(result.map.pebble_memory_save.parameters.required, ['text']);
+  assert.equal(result.map.pebble_memory_search.parameters.properties.limit.maximum, 32);
+  assert.equal(result.map.pebble_memory_delete.parameters.properties.id.maxLength, 64);
+
+  harness.tools.runToolCalls(1, [{ id: 'save', name: 'pebble_memory_save', arguments: { text: 'Remember this' } }], result.map, function(value) { calls = value; });
+  assert.equal(JSON.parse(calls[0].result).status, 'saved');
+  var id = JSON.parse(calls[0].result).memory.id;
+  harness.tools.runToolCalls(1, [{ id: 'search', name: 'pebble_memory_search', arguments: { query: 'remember' } }], result.map, function(value) { calls = value; });
+  assert.equal(JSON.parse(calls[0].result).memories[0].id, id);
+  harness.tools.runToolCalls(1, [{ id: 'delete', name: 'pebble_memory_delete', arguments: { id: id } }], result.map, function(value) { calls = value; });
+  assert.equal(JSON.parse(calls[0].result).status, 'deleted');
+  harness.tools.runToolCalls(1, [{ id: 'missing', name: 'pebble_memory_delete', arguments: {} }], result.map, function(value) { calls = value; });
+  assert.match(calls[0].error, /required/);
+});
+
+test('memory built-ins stay hidden unless explicitly enabled', function() {
+  var harness = createHarness();
+  var names;
+
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', PebbleMemoryToolEnabled: false }, 1, function(error, definitions) {
+    assert.equal(error, null);
+    names = definitions.map(function(tool) { return tool.name; });
+  });
+
+  assert.equal(names.some(function(name) { return name.indexOf('pebble_memory_') === 0; }), false);
 });
 
 test('Health Info discovery exposes required metrics schema and label', function() {

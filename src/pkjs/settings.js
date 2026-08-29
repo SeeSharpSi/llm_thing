@@ -23,6 +23,7 @@ var DEFAULT_SETTINGS = {
   GeolocationToolEnabled: false,
   TimelineToolEnabled: false,
   HealthToolEnabled: false,
+  PebbleMemoryToolEnabled: false,
   MaxToolCalls: DEFAULT_MAX_TOOL_CALLS,
   ApiMode: 'auto',
   MaxOutputTokens: 0,
@@ -108,6 +109,7 @@ function extend(base, extra) {
   result.GeolocationToolEnabled = result.GeolocationToolEnabled === true || result.GeolocationToolEnabled === 1 || result.GeolocationToolEnabled === '1';
   result.TimelineToolEnabled = result.TimelineToolEnabled === true || result.TimelineToolEnabled === 1 || result.TimelineToolEnabled === '1';
   result.HealthToolEnabled = result.HealthToolEnabled === true || result.HealthToolEnabled === 1 || result.HealthToolEnabled === '1';
+  result.PebbleMemoryToolEnabled = result.PebbleMemoryToolEnabled === true || result.PebbleMemoryToolEnabled === 1 || result.PebbleMemoryToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
   result.TouchScrollEnabled = result.TouchScrollEnabled === true || result.TouchScrollEnabled === 1 || result.TouchScrollEnabled === '1';
   result.ApiMode = API_MODES.hasOwnProperty(result.ApiMode) ? API_MODES[result.ApiMode] : 'auto';

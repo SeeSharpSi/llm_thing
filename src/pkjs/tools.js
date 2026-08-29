@@ -1,6 +1,7 @@
 var common = require('./settings');
 var watch = require('./watch');
 var timelineStore = require('./timeline_store');
+var memoryStore = require('./memory_store');
 var webFetch = require('./web_fetch');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -2350,6 +2351,25 @@ function callHealthInfoBuiltin(args, requestId, callback) {
   runNext(0);
 }
 
+function callMemorySaveBuiltin(args, requestId, callback) {
+  var memory = memoryStore.addMemory(args.text);
+  if (!memory) { callback('Unable to save memory'); return; }
+  callback(null, JSON.stringify({ status: 'saved', memory: memory }));
+}
+
+function callMemorySearchBuiltin(args, requestId, callback) {
+  var query = args && typeof args.query === 'string' ? args.query : '';
+  var limit = args && typeof args.limit === 'number' ? args.limit : undefined;
+  callback(null, JSON.stringify({ memories: memoryStore.searchMemories(query, limit) }));
+}
+
+function callMemoryDeleteBuiltin(args, requestId, callback) {
+  var id = args && typeof args.id === 'string' ? args.id.trim() : '';
+  if (!id) { callback('Memory id is required'); return; }
+  if (!memoryStore.deleteMemory(id)) { callback('Memory not found or could not be deleted'); return; }
+  callback(null, JSON.stringify({ status: 'deleted', id: id }));
+}
+
 function addBuiltinTool(tools, toolMap, definition) {
   var baseName = definition.name;
   var exposedName = baseName;
@@ -2376,6 +2396,46 @@ while (hasOwn(toolMap, exposedName)) {
 }
 
 function addBuiltinTools(settings, tools, toolMap) {
+  if (settings.PebbleMemoryToolEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_memory_save',
+      label: 'Memory',
+      description: 'Save an intentional user note for later recall. Use only when the user explicitly asks to remember or save something, never for inferred facts or ordinary conversation.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['text'],
+        properties: { text: { type: 'string', maxLength: 500, description: 'Text the user explicitly asked to remember.' } }
+      },
+      call: callMemorySaveBuiltin
+    });
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_memory_search',
+      label: 'Memory',
+      description: 'Search intentional notes saved by the user. Search when a prior intentional note may help answer the request; omit query to list recent notes.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          query: { type: 'string', maxLength: 500, description: 'Optional text to find in saved notes.' },
+          limit: { type: 'integer', minimum: 1, maximum: 32, description: 'Optional maximum result count.' }
+        }
+      },
+      call: callMemorySearchBuiltin
+    });
+    addBuiltinTool(tools, toolMap, {
+      name: 'pebble_memory_delete',
+      label: 'Memory',
+      description: 'Delete one saved intentional note by its exact id.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id'],
+        properties: { id: { type: 'string', maxLength: 64, description: 'Exact saved memory id.' } }
+      },
+      call: callMemoryDeleteBuiltin
+    });
+  }
   if (settings.WebSearchEnabled) {
     addBuiltinTool(tools, toolMap, {
       name: 'web_fetch',

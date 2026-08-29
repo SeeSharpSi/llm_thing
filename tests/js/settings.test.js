@@ -19,6 +19,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.ok(!('DeleteAllPastChats' in settings.DEFAULT_SETTINGS));
   assert.ok(!('ConfigAction' in settings.DEFAULT_SETTINGS));
   assert.equal(settings.DEFAULT_SETTINGS.PreserveChats, false);
+  assert.equal(settings.DEFAULT_SETTINGS.PebbleMemoryToolEnabled, false);
 });
 
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
@@ -27,6 +28,7 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
     ShowThinking: { value: '1' },
     PreserveChats: 1,
     TimelineToolEnabled: 'true',
+    PebbleMemoryToolEnabled: 1,
     TouchScrollEnabled: 0,
     Model: { value: 'custom-model' },
     ApiKey: '[object Object]'
@@ -35,6 +37,7 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
   assert.equal(result.ShowThinking, true);
   assert.equal(result.PreserveChats, true);
   assert.equal(result.TimelineToolEnabled, false);
+  assert.equal(result.PebbleMemoryToolEnabled, true);
   assert.equal(result.TouchScrollEnabled, false);
   assert.equal(result.Model, 'custom-model');
   assert.equal(result.ApiKey, '');
