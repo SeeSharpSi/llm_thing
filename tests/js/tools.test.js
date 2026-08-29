@@ -20,12 +20,17 @@ function createHarness() {
 
   var watch = {
     progress: [],
+    healthQueries: [],
+    healthResponse: function() { return { stepCount: 5 }; },
     isCurrentRequest: function() { return true; },
     trackXhr: function() { return true; },
     untrackXhr: function() {},
     progressToolStart: function(id, name, detail) { watch.progress.push(['start', name, detail]); },
     progressDone: function(id, name, detail) { watch.progress.push(['done', name, detail]); },
-    requestHealthSummary: function(range, id, callback) { callback(null, '{"stepCount":5}'); }
+    requestHealthInfo: function(query, id, callback) {
+      watch.healthQueries.push(query);
+      callback(null, JSON.stringify(watch.healthResponse(query)));
+    }
   };
   var commonStub = {};
   Object.keys(common).forEach(function(key) { commonStub[key] = common[key]; });
@@ -63,8 +68,8 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
 
   assert.equal(result.error, null);
   assert.deepEqual(result.definitions.map(function(tool) { return tool.name; }), [
-    'pebble_get_health_summary',
     'pebble_get_location',
+    'pebble_health_info',
     'pebble_timeline_create_or_update_pin',
     'pebble_timeline_create_reminder',
     'pebble_timeline_delete_pin',
@@ -72,6 +77,138 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
     'pebble_timeline_list_pins'
   ]);
   assert.equal(result.map.pebble_get_location.kind, 'builtin');
+});
+
+test('Health Info discovery exposes required metrics schema and label', function() {
+  var harness = createHarness();
+  var result;
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 1, function(error, definitions, map) {
+    result = { error: error, definitions: definitions, map: map };
+  });
+  assert.equal(result.error, null);
+  assert.equal(result.definitions[0].name, 'pebble_health_info');
+  assert.deepEqual(result.definitions[0].parameters.required, ['metrics']);
+  assert.equal(result.definitions[0].parameters.additionalProperties, false);
+  assert.deepEqual(result.definitions[0].parameters.properties.metrics.items.enum, [
+    'steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories',
+    'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'
+  ]);
+  assert.equal(result.map.pebble_health_info.label, 'Health Info');
+});
+
+test('Health Info selects requested totals and omits unrequested fake data', function() {
+  var harness = createHarness();
+  var results;
+  harness.watch.healthResponse = function() {
+    return { stepCount: 12, activeSeconds: 99, heartRateAverageBPM: 64, distanceMeters: 44 };
+  };
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 101, function(error, definitions, map) {
+    harness.tools.runToolCalls(101, [{ id: 'health', name: 'pebble_health_info', arguments: { metrics: ['heart_rate', 'steps'] } }], map, function(value) { results = value; });
+  });
+  assert.equal(harness.watch.healthQueries[0].queryMask, 129);
+  assert.deepEqual(JSON.parse(results[0].result).totals, { steps: 12, heartRate: { averageBpm: 64 } });
+  assert.equal(JSON.parse(results[0].result).totals.activeSeconds, undefined);
+});
+
+test('Health Info custom hourly range queries contiguous buckets serially', function() {
+  var harness = createHarness();
+  var results;
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 102, function(error, definitions, map) {
+    harness.tools.runToolCalls(102, [{ id: 'health', name: 'pebble_health_info', arguments: {
+      metrics: ['steps'], range: 'custom', startTime: '1970-01-01T01:00:00Z', endTime: '1970-01-01T04:20:00Z', granularity: 'hour'
+    } }], map, function(value) { results = value; });
+  });
+  assert.deepEqual(harness.watch.healthQueries.map(function(query) { return [query.startUnix, query.endUnix]; }), [
+    [3600, 15600], [3600, 7200], [7200, 10800], [10800, 14400], [14400, 15600]
+  ]);
+  assert.equal(JSON.parse(results[0].result).buckets.length, 4);
+});
+
+test('Health Info day granularity uses local calendar boundaries', function() {
+  var harness = createHarness();
+  var start = Math.floor(new Date(2020, 0, 1).getTime() / 1000);
+  var middle = Math.floor(new Date(2020, 0, 2).getTime() / 1000);
+  var end = Math.floor(new Date(2020, 0, 3).getTime() / 1000);
+  var results;
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 105, function(error, definitions, map) {
+    harness.tools.runToolCalls(105, [{ id: 'health', name: 'pebble_health_info', arguments: {
+      metrics: ['steps'], range: 'custom', startTime: String(start), endTime: String(end), granularity: 'day'
+    } }], map, function(value) { results = value; });
+  });
+  assert.deepEqual(harness.watch.healthQueries.map(function(query) { return [query.startUnix, query.endUnix]; }), [
+    [start, end], [start, middle], [middle, end]
+  ]);
+  assert.equal(JSON.parse(results[0].result).buckets.length, 2);
+});
+
+test('Health Info baseline scopes and validation avoid invalid watch calls', function() {
+  var harness = createHarness();
+  var results;
+  var baselineResults = [];
+  harness.watch.healthResponse = function(query) {
+    return query.averageScope === 1 ? { stepCount: 5, uns: 1 } : { stepCount: 5 };
+  };
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 103, function(error, definitions, map) {
+    ['daily', 'weekday_or_weekend', 'same_weekday'].forEach(function(scope) {
+      harness.tools.runToolCalls(103, [{ id: scope, name: 'pebble_health_info', arguments: { metrics: ['steps'], range: 'last_24h', baseline: scope } }], map, function(value) { baselineResults.push(value[0]); });
+    });
+    harness.tools.runToolCalls(103, [
+      { id: 'empty', name: 'pebble_health_info', arguments: { metrics: [] } },
+      { id: 'duplicate', name: 'pebble_health_info', arguments: { metrics: ['steps', 'steps'] } },
+      { id: 'long', name: 'pebble_health_info', arguments: { metrics: ['steps'], range: 'custom', startTime: '1', endTime: String(8 * 86400 + 1) } },
+      { id: 'hour-long', name: 'pebble_health_info', arguments: { metrics: ['steps'], range: 'custom', startTime: '1', endTime: '86402', granularity: 'hour' } },
+      { id: 'too-many', name: 'pebble_health_info', arguments: { metrics: ['steps', 'active_time', 'distance'], range: 'custom', startTime: '1', endTime: '86401', granularity: 'hour' } }
+    ], map, function(value) { results = value; });
+  });
+  assert.deepEqual(harness.watch.healthQueries.map(function(query) { return query.averageScope; }), [0, 1, 0, 2, 0, 3]);
+  assert.deepEqual(baselineResults.map(function(item) { return JSON.parse(item.result).baseline.scope; }), ['daily', 'weekday_or_weekend', 'same_weekday']);
+  assert.deepEqual(JSON.parse(baselineResults[0].result).baseline.unavailable, [{ metric: 'steps', reason: 'not_supported' }]);
+  assert.match(results[0].error, /nonempty/);
+  assert.match(results[1].error, /unique/);
+  assert.match(results[2].error, /cannot exceed 7 days/);
+  assert.match(results[3].error, /cannot exceed 24 hours/);
+  assert.match(results[4].error, /too many bucket values/);
+  assert.equal(harness.watch.healthQueries.length, 6);
+});
+
+test('Health Info sessions page, maps types, and reports unavailable context', function() {
+  var harness = createHarness();
+  var results;
+  harness.watch.healthResponse = function(query) {
+    if (query.queryMask !== 15872) { return { stepCount: 1, currentActivities: 'walking, running' }; }
+    if (query.sessionOffset === 0) { return { sessions: [[4, 10, 20]], hasMore: true, und: 2048 }; }
+    return { sessions: [[8, 30, 50]], hasMore: false, unp: 4096 };
+  };
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 104, function(error, definitions, map) {
+    harness.tools.runToolCalls(104, [{ id: 'health', name: 'pebble_health_info', arguments: { metrics: ['activity_sessions', 'sleep_sessions'] } }], map, function(value) { results = value; });
+  });
+  assert.deepEqual(harness.watch.healthQueries.map(function(query) { return [query.queryMask, query.sessionOffset]; }), [[256, 0], [15872, 0], [15872, 1]]);
+  assert.deepEqual(JSON.parse(results[0].result).sessions.map(function(session) { return session.type; }), ['walk', 'run']);
+  assert.deepEqual(JSON.parse(results[0].result).currentActivities, ['walking', 'running']);
+  assert.deepEqual(JSON.parse(results[0].result).unavailable, [
+    { metric: 'activity_sessions', reason: 'no_data' },
+    { metric: 'activity_sessions', reason: 'permission_denied' }
+  ]);
+});
+
+test('Health Info marks sessions truncated when final page exceeds cap', function() {
+  var harness = createHarness();
+  var results;
+  harness.watch.healthResponse = function(query) {
+    var sessions = [];
+    var i;
+    if (query.queryMask === 256) { return { currentActivities: '' }; }
+    for (i = 0; i < (query.sessionOffset === 30 ? 4 : 5); i += 1) {
+      sessions.push([4, query.sessionOffset + i, query.sessionOffset + i + 1]);
+    }
+    return { sessions: sessions, hasMore: query.sessionOffset < 30 };
+  };
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 106, function(error, definitions, map) {
+    harness.tools.runToolCalls(106, [{ id: 'health', name: 'pebble_health_info', arguments: { metrics: ['activity_sessions'] } }], map, function(value) { results = value; });
+  });
+  assert.equal(JSON.parse(results[0].result).sessions.length, 32);
+  assert.equal(JSON.parse(results[0].result).truncated, true);
+  assert.deepEqual(harness.watch.healthQueries.map(function(query) { return query.sessionOffset; }), [0, 0, 5, 10, 15, 20, 25, 30]);
 });
 
 test('WebSearchEnabled discovers web_fetch with bounded schema', function() {

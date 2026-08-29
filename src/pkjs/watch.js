@@ -11,14 +11,14 @@ var WATCH_PROMPT_ON = '\u0003';
 var WATCH_PROMPT_OFF = '\u0004';
 var WATCH_SMALL_ON = '\u0005';
 var WATCH_SMALL_OFF = '\u0006';
-var HEALTH_SUMMARY_TIMEOUT_MS = 8000;
+var HEALTH_INFO_TIMEOUT_MS = 8000;
 
-var s_health_summary_request_id = 1;
+var s_health_info_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
 var s_latest_request_id = 0;
 var s_active_xhrs = {};
-var s_pending_health_summaries = {};
+var s_pending_health_info = {};
 var s_progress = {
   requestId: 0,
   active: false,
@@ -167,8 +167,8 @@ function abortXhrsForKey(key) {
   delete s_active_xhrs[key];
 }
 
-function clearPendingHealthSummary(key) {
-  var pending = s_pending_health_summaries[key];
+function clearPendingHealthInfo(key) {
+  var pending = s_pending_health_info[key];
 
   if (!pending) {
     return null;
@@ -177,19 +177,19 @@ function clearPendingHealthSummary(key) {
   if (pending.timeout) {
     clearTimeout(pending.timeout);
   }
-  delete s_pending_health_summaries[key];
+  delete s_pending_health_info[key];
   return pending;
 }
 
-function abortStaleHealthSummaries(requestId) {
+function abortStaleHealthInfo(requestId) {
   var key;
   var pending;
 
-  for (key in s_pending_health_summaries) {
-    if (s_pending_health_summaries.hasOwnProperty(key)) {
-      pending = s_pending_health_summaries[key];
+  for (key in s_pending_health_info) {
+    if (s_pending_health_info.hasOwnProperty(key)) {
+      pending = s_pending_health_info[key];
       if (Number(pending.requestId) !== Number(requestId)) {
-        clearPendingHealthSummary(key);
+        clearPendingHealthInfo(key);
       }
     }
   }
@@ -228,7 +228,7 @@ function beginRequestLifecycle(requestId) {
     }
   }
   dropStaleQueuedMessages(requestId);
-  abortStaleHealthSummaries(requestId);
+  abortStaleHealthInfo(requestId);
   if (!s_active_xhrs[requestKey(requestId)]) {
     s_active_xhrs[requestKey(requestId)] = [];
   }
@@ -802,68 +802,70 @@ function sendResponse(requestId, settings, text, onDone) {
   sendWatchText(requestId, value, true, onDone);
 }
 
-function requestHealthSummary(range, requestId, callback) {
+function requestHealthInfo(query, requestId, callback) {
   var healthRequestId;
   var key;
   var dict;
 
   if (!Pebble.sendAppMessage) {
-    callback('Health summary requires AppMessage');
+    callback('Health Info requires AppMessage');
     return;
   }
   if (!isCurrentRequest(requestId)) {
     return;
   }
 
-  healthRequestId = s_health_summary_request_id;
-  s_health_summary_request_id += 1;
-  if (s_health_summary_request_id > 2147480000) {
-    s_health_summary_request_id = 1;
+  healthRequestId = s_health_info_request_id;
+  s_health_info_request_id += 1;
+  if (s_health_info_request_id > 2147480000) {
+    s_health_info_request_id = 1;
   }
 
   key = String(healthRequestId);
-  s_pending_health_summaries[key] = {
+  s_pending_health_info[key] = {
     requestId: requestId,
     callback: callback,
     timeout: setTimeout(function() {
-      var pending = clearPendingHealthSummary(key);
+      var pending = clearPendingHealthInfo(key);
       if (pending && isCurrentRequest(pending.requestId)) {
-        pending.callback('Health summary request timed out');
+        pending.callback('Health Info request timed out');
       }
-    }, HEALTH_SUMMARY_TIMEOUT_MS)
+    }, HEALTH_INFO_TIMEOUT_MS)
   };
 
   dict = {
     RequestId: requestId,
     HealthSummaryRequest: healthRequestId,
-    HealthStartUnix: range.startUnix,
-    HealthEndUnix: range.endUnix,
-    HealthIncludeHeartRate: range.includeHeartRate ? 1 : 0
+    HealthStartUnix: query.startUnix,
+    HealthEndUnix: query.endUnix,
+    HealthQueryMask: query.queryMask,
+    HealthAverageScope: query.averageScope || 0,
+    HealthSessionOffset: query.sessionOffset || 0
   };
 
-  common.logDebug('health summary request token=' + healthRequestId + ' start=' + range.startUnix + ' end=' + range.endUnix + ' hr=' + (range.includeHeartRate ? 1 : 0));
+  common.logDebug('health info request token=' + healthRequestId + ' start=' + query.startUnix + ' end=' + query.endUnix + ' mask=' + query.queryMask + ' scope=' + (query.averageScope || 0) + ' offset=' + (query.sessionOffset || 0));
   sendMessage(dict, null, function(e) {
-    var pending = clearPendingHealthSummary(key);
+    var pending = clearPendingHealthInfo(key);
     if (pending && isCurrentRequest(pending.requestId)) {
-      pending.callback('Health summary send failed: ' + ((e && (e.error || e.message)) || 'AppMessage failed'));
+      pending.callback('Health Info send failed: ' + ((e && (e.error || e.message)) || 'AppMessage failed'));
     }
   });
 }
 
-function handleHealthSummaryResponse(dict) {
+function handleHealthInfoResponse(dict) {
   var key = String(dict.HealthSummaryRequest || 0);
-  var pending = s_pending_health_summaries[key];
+  var pending = s_pending_health_info[key];
   var callback;
 
   if (!pending) {
-    common.logDebug('unexpected health summary response token=' + key);
+    common.logDebug('unexpected health info response token=' + key);
     return;
   }
 
   if (dictHasRequestId(dict) && Number(dict.RequestId) !== Number(pending.requestId)) {
     return;
   }
-  pending = clearPendingHealthSummary(key);
+  pending = clearPendingHealthInfo(key);
   callback = pending.callback;
   if (!isCurrentRequest(pending.requestId)) {
     return;
@@ -878,7 +880,7 @@ function handleHealthSummaryResponse(dict) {
     return;
   }
 
-  callback('Health summary response missing data');
+  callback('Health Info response missing data');
 }
 
 module.exports = {
@@ -902,6 +904,6 @@ module.exports = {
   sendPastChatsError: sendPastChatsError,
   sendPastChatDeleted: sendPastChatDeleted,
   sendPastChatTranscript: sendPastChatTranscript,
-  requestHealthSummary: requestHealthSummary,
-  handleHealthSummaryResponse: handleHealthSummaryResponse
+  requestHealthInfo: requestHealthInfo,
+  handleHealthInfoResponse: handleHealthInfoResponse
 };

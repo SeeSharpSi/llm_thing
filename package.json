@@ -100,7 +100,9 @@
       "HealthSummaryError",
       "HealthStartUnix",
       "HealthEndUnix",
-      "HealthIncludeHeartRate",
+      "HealthQueryMask",
+      "HealthAverageScope",
+      "HealthSessionOffset",
       "TouchScrollEnabled",
       "RequestTimeoutMs"
     ],

@@ -49,4 +49,5 @@ test('built PebbleKit bundle loads and registers runtime handlers', function() {
 
   assert.ok(componentEnd > 0, 'model selector source missing');
   assert.ok(componentEnd < firstScriptEnd, 'model selector source escaped its script');
+  assert.match(configHtml, /Health Info/);
 });

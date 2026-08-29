@@ -156,7 +156,7 @@ Pebble.addEventListener('appmessage', function(e) {
   var requestId = dict.RequestId || 0;
 
   if (dict.HealthSummaryRequest) {
-    watch.handleHealthSummaryResponse(dict);
+    watch.handleHealthInfoResponse(dict);
     return;
   }
 

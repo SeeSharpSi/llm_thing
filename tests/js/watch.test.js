@@ -124,14 +124,14 @@ test('progress messages track tools, history, and context for current request', 
   assert.equal(global.Pebble.messages.some(function(message) { return message.ProgressText === 'stale'; }), false);
 });
 
-test('health summary request handles response and timeout', function() {
+test('Health Info request handles response and timeout', function() {
   var timers = installFakeTimers();
   var watch = freshWatch();
   var result;
 
   try {
     watch.beginRequestLifecycle(9);
-    watch.requestHealthSummary({ startUnix: 10, endUnix: 20, includeHeartRate: true }, 9, function(error, json) {
+    watch.requestHealthInfo({ startUnix: 10, endUnix: 20, queryMask: 129, averageScope: 2, sessionOffset: 3 }, 9, function(error, json) {
       result = { error: error, json: json };
     });
     assert.deepEqual(global.Pebble.messages[0], {
@@ -139,9 +139,11 @@ test('health summary request handles response and timeout', function() {
       HealthSummaryRequest: 1,
       HealthStartUnix: 10,
       HealthEndUnix: 20,
-      HealthIncludeHeartRate: 1
+      HealthQueryMask: 129,
+      HealthAverageScope: 2,
+      HealthSessionOffset: 3
     });
-    watch.handleHealthSummaryResponse({
+    watch.handleHealthInfoResponse({
       RequestId: 9,
       HealthSummaryRequest: 1,
       HealthSummaryJson: '{"stepCount":12}'
@@ -149,11 +151,11 @@ test('health summary request handles response and timeout', function() {
     assert.deepEqual(result, { error: null, json: '{"stepCount":12}' });
 
     result = null;
-    watch.requestHealthSummary({ startUnix: 20, endUnix: 30 }, 9, function(error) {
+    watch.requestHealthInfo({ startUnix: 20, endUnix: 30, queryMask: 1 }, 9, function(error) {
       result = error;
     });
     timers.runAll();
-    assert.equal(result, 'Health summary request timed out');
+    assert.equal(result, 'Health Info request timed out');
   } finally {
     timers.restore();
   }
@@ -206,26 +208,49 @@ test('AppMessage failure terminates completion lifecycle exactly once', function
   }
 });
 
-test('mismatched health RequestId leaves matching pending request active', function() {
+test('mismatched Health Info RequestId leaves matching pending request active', function() {
   var watch = freshWatch();
   var result;
 
   watch.beginRequestLifecycle(13);
-  watch.requestHealthSummary({ startUnix: 10, endUnix: 20 }, 13, function(error, json) {
+  watch.requestHealthInfo({ startUnix: 10, endUnix: 20, queryMask: 1 }, 13, function(error, json) {
     result = { error: error, json: json };
   });
-  watch.handleHealthSummaryResponse({
+  watch.handleHealthInfoResponse({
     RequestId: 99,
     HealthSummaryRequest: 1,
     HealthSummaryJson: '{"wrong":true}'
   });
   assert.equal(result, undefined);
-  watch.handleHealthSummaryResponse({
+  watch.handleHealthInfoResponse({
     RequestId: 13,
     HealthSummaryRequest: 1,
     HealthSummaryJson: '{"stepCount":5}'
   });
   assert.deepEqual(result, { error: null, json: '{"stepCount":5}' });
+});
+
+test('Health Info response error and AppMessage send failure reach callback', function() {
+  var timers = installFakeTimers();
+  var watch = freshWatch();
+  var error;
+  try {
+    global.Pebble.queueSendFailure({ error: 'no route' });
+    global.Pebble.queueSendFailure({ error: 'no route' });
+    global.Pebble.queueSendFailure({ error: 'no route' });
+    watch.beginRequestLifecycle(14);
+    watch.requestHealthInfo({ startUnix: 10, endUnix: 20, queryMask: 1 }, 14, function(value) { error = value; });
+    timers.timers.filter(function(timer) { return timer.delay === 100; }).forEach(function(timer) { timers.run(timer.id); });
+    timers.timers.filter(function(timer) { return timer.delay === 100; }).forEach(function(timer) { timers.run(timer.id); });
+    timers.timers.filter(function(timer) { return timer.delay === 100; }).forEach(function(timer) { timers.run(timer.id); });
+    assert.equal(error, 'Health Info send failed: no route');
+
+    watch.requestHealthInfo({ startUnix: 10, endUnix: 20, queryMask: 1 }, 14, function(value) { error = value; });
+    watch.handleHealthInfoResponse({ RequestId: 14, HealthSummaryRequest: 2, HealthSummaryError: 'permission denied' });
+    assert.equal(error, 'permission denied');
+  } finally {
+    timers.restore();
+  }
 });
 
 test('saved transcript transfers multibyte text in byte-safe sequential chunks', function() {

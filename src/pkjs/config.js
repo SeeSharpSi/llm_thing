@@ -210,8 +210,8 @@ module.exports = [
       {
         "type": "toggle",
         "messageKey": "HealthToolEnabled",
-        "label": "Health Summary Tool",
-        "description": "Allow the model to request a summary of Pebble Health activity from the watch.",
+        "label": "Health Info",
+        "description": "Allow the model to query relevant Pebble Health statistics and activity sessions from the watch.",
         "defaultValue": false
       },
       {

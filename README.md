@@ -141,6 +141,18 @@ an error instead of leaving progress active. The watch debounces full text
 measurement while chunks arrive and performs a final layout when the response
 is complete.
 
+## Health Info
+
+The optional Health Info tool lets the model request only health data relevant
+to a question. It supports totals, hourly or daily values, personal baselines,
+heart-rate statistics, and recorded activity or sleep sessions for ranges up
+to seven days. Heart-rate minimum and maximum values depend on recent data the
+Pebble Health API makes available.
+
+Health Info stays disabled by default. Enabling it allows requested health data
+to be sent to the configured model provider. Raw per-minute movement,
+orientation, and light records are not exposed.
+
 ## Data Storage
 
 Settings, API keys, MCP authorization values, custom headers, optional saved

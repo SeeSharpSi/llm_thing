@@ -19,6 +19,30 @@ var TIMELINE_RAW_PIN_ARG_KEYS = {
   actions: true
 };
 var MAX_HEALTH_RANGE_SECONDS = 7 * 24 * 60 * 60;
+var MAX_HEALTH_HOUR_RANGE_SECONDS = 24 * 60 * 60;
+var MAX_HEALTH_SESSIONS = 32;
+var MAX_HEALTH_BUCKET_VALUES = 64;
+var HEALTH_METRIC_BITS = {
+  steps: 1,
+  active_time: 2,
+  distance: 4,
+  sleep: 8,
+  restful_sleep: 16,
+  resting_calories: 32,
+  active_calories: 64,
+  heart_rate: 128
+};
+var HEALTH_SESSION_BITS = {
+  sleep_sessions: 512 | 1024,
+  activity_sessions: 2048 | 4096 | 8192
+};
+var HEALTH_ACTIVITY_TYPES = {
+  1: 'sleep',
+  2: 'restful_sleep',
+  4: 'walk',
+  8: 'run',
+  16: 'open_workout'
+};
 var TIMELINE_MAX_PAST_MS = 2 * 24 * 60 * 60 * 1000;
 var TIMELINE_MAX_FUTURE_MS = 365 * 24 * 60 * 60 * 1000;
 var TIMELINE_RETRY_DELAY_MS = 250;
@@ -2024,7 +2048,7 @@ function localDayStartUnix(offsetDays) {
   return Math.floor(date.getTime() / 1000);
 }
 
-function buildHealthSummaryWindow(args) {
+function buildHealthInfoWindow(args) {
   var now = Math.floor(new Date().getTime() / 1000);
   var range;
   var startUnix;
@@ -2065,25 +2089,265 @@ function buildHealthSummaryWindow(args) {
     return { error: 'Invalid health time range' };
   }
   if (endUnix - startUnix > MAX_HEALTH_RANGE_SECONDS) {
-    startUnix = endUnix - MAX_HEALTH_RANGE_SECONDS;
+    return { error: 'Health range cannot exceed 7 days' };
   }
 
   return {
     startUnix: startUnix,
-    endUnix: endUnix,
-    includeHeartRate: boolArg(args.includeHeartRate, false)
+    endUnix: endUnix
   };
 }
 
-function callHealthSummaryBuiltin(args, requestId, callback) {
-  var range = buildHealthSummaryWindow(args);
+function healthMetricValue(response, metric) {
+  var values = {
+    steps: response.stepCount,
+    active_time: response.activeSeconds,
+    distance: response.walkedDistanceMeters,
+    sleep: response.sleepSeconds,
+    restful_sleep: response.sleepRestfulSeconds,
+    resting_calories: response.restingKCalories,
+    active_calories: response.activeKCalories
+  };
+  var result = {};
 
-  if (range.error) {
-    callback(range.error);
+  if (metric === 'heart_rate') {
+    if (response.heartRateCurrentBPM !== undefined) { result.currentBpm = response.heartRateCurrentBPM; }
+    if (response.heartRateAverageBPM !== undefined) { result.averageBpm = response.heartRateAverageBPM; }
+    if (response.heartRateMinBPM !== undefined) { result.minBpm = response.heartRateMinBPM; }
+    if (response.heartRateMaxBPM !== undefined) { result.maxBpm = response.heartRateMaxBPM; }
+    return Object.keys(result).length ? result : undefined;
+  }
+  if (values[metric] !== undefined && values[metric] !== null) {
+    return values[metric];
+  }
+  return undefined;
+}
+
+function healthFriendlyMetricName(metric) {
+  var names = {
+    steps: 'steps', active_time: 'activeSeconds', distance: 'distanceMeters',
+    sleep: 'sleepSeconds', restful_sleep: 'restfulSleepSeconds',
+    resting_calories: 'restingCaloriesKcal', active_calories: 'activeCaloriesKcal'
+  };
+  return names[metric];
+}
+
+function healthValues(response, metrics) {
+  var values = {};
+  var metric;
+  var value;
+  var heartRate;
+  var i;
+
+  for (i = 0; i < metrics.length; i += 1) {
+    metric = metrics[i];
+    value = healthMetricValue(response, metric);
+    if (value === undefined) { continue; }
+    if (metric === 'heart_rate') {
+      heartRate = value;
+    } else {
+      values[healthFriendlyMetricName(metric)] = value;
+    }
+  }
+  if (heartRate) { values.heartRate = heartRate; }
+  return values;
+}
+
+function healthUnavailable(response, metrics, scope) {
+  var result = [];
+  var metric;
+  var bit;
+  var reason;
+  var i;
+
+  for (i = 0; i < metrics.length; i += 1) {
+    metric = metrics[i];
+    bit = HEALTH_METRIC_BITS[metric] || HEALTH_SESSION_BITS[metric];
+    reason = '';
+    if (bit && (Number(response.unp) & bit)) { reason = 'permission_denied'; }
+    else if (bit && (Number(response.uns) & bit)) { reason = 'not_supported'; }
+    else if (bit && (Number(response.und) & bit)) { reason = 'no_data'; }
+    if (reason) {
+      result.push({ metric: metric, reason: reason, scope: scope });
+    }
+  }
+  return result;
+}
+
+function healthDayBuckets(startUnix, endUnix) {
+  var start = new Date(startUnix * 1000);
+  var cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  var result = [];
+  var next;
+
+  while (cursor.getTime() / 1000 < endUnix) {
+    next = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
+    result.push({
+      startUnix: Math.max(startUnix, Math.floor(cursor.getTime() / 1000)),
+      endUnix: Math.min(endUnix, Math.floor(next.getTime() / 1000))
+    });
+    cursor = next;
+  }
+  return result;
+}
+
+function healthHourBuckets(startUnix, endUnix) {
+  var result = [];
+  var cursor = startUnix;
+  while (cursor < endUnix) {
+    result.push({ startUnix: cursor, endUnix: Math.min(endUnix, cursor + 60 * 60) });
+    cursor += 60 * 60;
+  }
+  return result;
+}
+
+function callHealthInfoBuiltin(args, requestId, callback) {
+  var metricNames = ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'];
+  var scalarMetrics = [];
+  var sessionMetrics = [];
+  var range;
+  var granularity;
+  var baseline;
+  var buckets;
+  var queries = [];
+  var responses = [];
+  var sessions = [];
+  var truncated = false;
+  var totalMask = 0;
+  var sessionMask = 0;
+  var i;
+  var j;
+  var metric;
+  var query;
+
+  args = args || {};
+  if (!isArrayValue(args.metrics) || !args.metrics.length) {
+    callback('metrics must be a nonempty array');
+    return;
+  }
+  for (i = 0; i < args.metrics.length; i += 1) {
+    metric = args.metrics[i];
+    if (typeof metric !== 'string' || metricNames.indexOf(metric) < 0) {
+      callback('metrics must contain supported metric strings');
+      return;
+    }
+    if (args.metrics.indexOf(metric) !== i) {
+      callback('metrics must contain unique values');
+      return;
+    }
+    if (metric === 'activity_sessions' || metric === 'sleep_sessions') { sessionMetrics.push(metric); }
+    else { scalarMetrics.push(metric); totalMask |= HEALTH_METRIC_BITS[metric]; }
+  }
+  range = buildHealthInfoWindow(args);
+  if (range.error) { callback(range.error); return; }
+  granularity = args.granularity || 'total';
+  if (['total', 'hour', 'day'].indexOf(granularity) < 0) { callback('granularity must be total, hour, or day'); return; }
+  baseline = args.baseline || 'none';
+  if (['none', 'daily', 'weekday_or_weekend', 'same_weekday'].indexOf(baseline) < 0) { callback('baseline must be none, daily, weekday_or_weekend, or same_weekday'); return; }
+  if (granularity === 'hour' && range.endUnix - range.startUnix > MAX_HEALTH_HOUR_RANGE_SECONDS) {
+    callback('Hour granularity cannot exceed 24 hours');
     return;
   }
 
-  watch.requestHealthSummary(range, requestId, callback);
+  for (i = 0; i < sessionMetrics.length; i += 1) { sessionMask |= HEALTH_SESSION_BITS[sessionMetrics[i]]; }
+  if (scalarMetrics.length) { queries.push({ kind: 'total', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: totalMask, averageScope: 0 }); }
+  if (sessionMetrics.length) { queries.push({ kind: 'current', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: 256, averageScope: 0 }); }
+  if (granularity !== 'total' && scalarMetrics.length) {
+    buckets = granularity === 'hour' ? healthHourBuckets(range.startUnix, range.endUnix) : healthDayBuckets(range.startUnix, range.endUnix);
+    if (buckets.length * scalarMetrics.length > MAX_HEALTH_BUCKET_VALUES) {
+      callback('Health Info request has too many bucket values; request fewer metrics or coarser granularity');
+      return;
+    }
+    for (i = 0; i < buckets.length; i += 1) {
+      queries.push({ kind: 'bucket', bucket: buckets[i], startUnix: buckets[i].startUnix, endUnix: buckets[i].endUnix, queryMask: totalMask, averageScope: 0 });
+    }
+  }
+  if (baseline !== 'none' && scalarMetrics.length) {
+    queries.push({ kind: 'baseline', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: totalMask, averageScope: { daily: 1, weekday_or_weekend: 2, same_weekday: 3 }[baseline] });
+  }
+  if (sessionMetrics.length) {
+    queries.push({ kind: 'sessions', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: sessionMask, averageScope: 0, sessionOffset: 0 });
+  }
+
+  function finish() {
+    var result = {
+      startTime: new Date(range.startUnix * 1000).toISOString(),
+      endTime: new Date(range.endUnix * 1000).toISOString(),
+      timezoneOffsetMinutes: -new Date(range.startUnix * 1000).getTimezoneOffset(),
+      granularity: granularity,
+      totals: {},
+      unavailable: []
+    };
+    var response;
+    var item;
+    var values;
+    for (i = 0; i < responses.length; i += 1) {
+      response = responses[i].response;
+      values = healthValues(response, scalarMetrics);
+      if (responses[i].kind === 'total') { result.totals = values; }
+      if (responses[i].kind === 'baseline') {
+        result.baseline = { scope: baseline, values: values };
+        item = healthUnavailable(response, responses[i].metrics);
+        if (item.length) { result.baseline.unavailable = item; }
+      }
+      if (responses[i].kind === 'bucket') {
+        if (!result.buckets) { result.buckets = []; }
+        item = { startTime: new Date(responses[i].startUnix * 1000).toISOString(), endTime: new Date(responses[i].endUnix * 1000).toISOString(), values: values };
+        item.unavailable = healthUnavailable(response, responses[i].metrics);
+        if (!item.unavailable.length) { delete item.unavailable; }
+        result.buckets.push(item);
+      }
+      if (responses[i].kind === 'total' || responses[i].kind === 'current' || responses[i].kind === 'sessions') {
+        result.unavailable = result.unavailable.concat(healthUnavailable(response, responses[i].metrics));
+      }
+      if ((responses[i].kind === 'total' || responses[i].kind === 'current') && response.currentActivities !== undefined && response.currentActivities !== null) {
+        result.currentActivities = String(response.currentActivities).split(',').filter(function(name) { return common.trim(name); }).map(function(name) { return common.trim(name); });
+      }
+    }
+    if (sessions.length) {
+      result.sessions = [];
+      for (i = 0; i < sessions.length; i += 1) {
+        item = sessions[i];
+        result.sessions.push({ type: HEALTH_ACTIVITY_TYPES[item[0]] || 'unknown', startTime: new Date(item[1] * 1000).toISOString(), endTime: new Date(item[2] * 1000).toISOString(), durationSeconds: item[2] - item[1] });
+      }
+    }
+    if (truncated) { result.truncated = true; }
+    while (JSON.stringify(result).length > 5800 && result.sessions && result.sessions.length) { result.sessions.pop(); result.truncated = true; }
+    if (!scalarMetrics.length) { delete result.totals; }
+    if (!result.unavailable.length) { delete result.unavailable; }
+    if (JSON.stringify(result).length > 5800) {
+      callback('Health Info result exceeds tool result limit');
+      return;
+    }
+    callback(null, JSON.stringify(result));
+  }
+
+  function runNext(index) {
+    if (!watch.isCurrentRequest(requestId)) { return; }
+    if (index >= queries.length) { finish(); return; }
+    query = queries[index];
+    watch.requestHealthInfo({ startUnix: query.startUnix, endUnix: query.endUnix, queryMask: query.queryMask, averageScope: query.averageScope, sessionOffset: query.sessionOffset || 0 }, requestId, function(error, jsonString) {
+      var parsed;
+      var page;
+      if (!watch.isCurrentRequest(requestId)) { return; }
+      if (error) { callback(error); return; }
+      try { parsed = JSON.parse(jsonString); } catch (e) { callback('Malformed health info response JSON'); return; }
+      if (!parsed || typeof parsed !== 'object') { callback('Malformed health info response JSON'); return; }
+      if (query.kind === 'sessions') {
+        page = isArrayValue(parsed.sessions) ? parsed.sessions : [];
+        responses.push({ kind: query.kind, metrics: sessionMetrics, startUnix: query.startUnix, endUnix: query.endUnix, response: parsed });
+        for (j = 0; j < page.length && sessions.length < MAX_HEALTH_SESSIONS; j += 1) { if (isArrayValue(page[j]) && page[j].length >= 3) { sessions.push(page[j]); } }
+        if (j < page.length) { truncated = true; }
+        if (parsed.hasMore && sessions.length < MAX_HEALTH_SESSIONS && page.length) { query.sessionOffset += page.length; runNext(index); return; }
+        if (parsed.hasMore) { truncated = true; }
+      } else {
+        responses.push({ kind: query.kind, metrics: scalarMetrics, startUnix: query.startUnix, endUnix: query.endUnix, response: parsed });
+      }
+      runNext(index + 1);
+    });
+  }
+
+  runNext(0);
 }
 
 function addBuiltinTool(tools, toolMap, definition) {
@@ -2255,19 +2519,23 @@ function addBuiltinTools(settings, tools, toolMap) {
 
   if (settings.HealthToolEnabled) {
     addBuiltinTool(tools, toolMap, {
-      name: 'pebble_get_health_summary',
-      label: 'Health',
-      description: 'Get a compact Pebble Health summary from the watch. Use only when the user asks about steps, activity, distance, sleep, calories, workouts, or heart rate. Heart rate is only included when includeHeartRate is true.',
+      name: 'pebble_health_info',
+      label: 'Health Info',
+      description: 'Request only health metrics relevant to the user question. Supports totals, hourly or daily buckets, historical activity and sleep sessions, heart-rate statistics, and an optional personal baseline.',
       parameters: {
         type: 'object',
+        additionalProperties: false,
+        required: ['metrics'],
         properties: {
+          metrics: { type: 'array', minItems: 1, uniqueItems: true, description: 'Nonempty unique health metrics to request.', items: { type: 'string', enum: ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'] } },
           range: { type: 'string', enum: ['today', 'yesterday', 'last_24h', 'last_7d', 'custom'], description: 'Health time range. Default today.' },
           startTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range start.' },
           endTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range end. Default now.' },
-          includeHeartRate: { type: 'boolean', description: 'Include current heart rate when relevant. Default false.' }
+          granularity: { type: 'string', enum: ['total', 'hour', 'day'], description: 'Aggregation granularity. Default total.' },
+          baseline: { type: 'string', enum: ['none', 'daily', 'weekday_or_weekend', 'same_weekday'], description: 'Optional personal baseline scope. Default none.' }
         }
       },
-      call: callHealthSummaryBuiltin
+      call: callHealthInfoBuiltin
     });
   }
 }

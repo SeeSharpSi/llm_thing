@@ -127,6 +127,21 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   assert.equal(global.Pebble.messages[0].ConfigAction, undefined);
 });
 
+test('Health Info setting and watch protocol are declared consistently', function() {
+  var healthItem = configItems(config).filter(function(item) {
+    return item.messageKey === 'HealthToolEnabled';
+  })[0];
+  var keys = packageJson.pebble.messageKeys;
+
+  assert.equal(healthItem.label, 'Health Info');
+  assert.equal(healthItem.defaultValue, false);
+  assert.ok(packageJson.pebble.capabilities.indexOf('health') !== -1);
+  ['HealthQueryMask', 'HealthAverageScope', 'HealthSessionOffset'].forEach(function(key) {
+    assert.ok(keys.indexOf(key) !== -1, key + ' missing from package.json');
+  });
+  assert.equal(keys.indexOf('HealthIncludeHeartRate'), -1);
+});
+
 test('generated message-key artifacts are internally consistent', function() {
   var expected = packageJson.pebble.messageKeys.slice().sort();
   var appInfo = JSON.parse(fs.readFileSync(path.join(root, 'build/appinfo.json'), 'utf8'));

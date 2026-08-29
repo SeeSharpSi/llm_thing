@@ -49,7 +49,7 @@ function createHarness(options) {
   var watch = {
     calls: [],
     syncWatchSettings: function(value) { watch.calls.push(['sync', value]); },
-    handleHealthSummaryResponse: function(value) { watch.calls.push(['health', value]); },
+    handleHealthInfoResponse: function(value) { watch.calls.push(['health', value]); },
     sendPastChatsError: function(value) { watch.calls.push(['list-error', value]); },
     sendPastChats: function(value) { watch.calls.push(['list', value]); },
     sendPastChatTranscript: function(value) { watch.calls.push(['transcript', value]); },
