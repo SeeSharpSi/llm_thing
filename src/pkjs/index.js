@@ -1,5 +1,6 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
+var builtinToolsComponent = require('./builtin_tools_component');
 var mcpServersComponent = require('./mcp_servers_component');
 var memoryManagerComponent = require('./memory_manager_component');
 var modelDiscovery = require('./model_discovery');
@@ -29,6 +30,16 @@ function clayCustomFn() {
     var configAction = self.getItemByMessageKey('ConfigAction');
     var memoryToggle = self.getItemByMessageKey('PebbleMemoryToolEnabled');
     var memoryManager = self.getItemByMessageKey('MemoriesJson');
+    var builtinTools = self.getItemById('BuiltinTools');
+    var builtinToolKeys = [
+      'WebSearchEnabled',
+      'GeolocationToolEnabled',
+      'TimelineToolEnabled',
+      'HealthToolEnabled',
+      'PebbleMemoryToolEnabled',
+      'MaxToolCalls'
+    ];
+    var toolRoots = [];
 
     function memoryEnabled() {
       var value = memoryToggle && memoryToggle.get ? memoryToggle.get() : false;
@@ -72,6 +83,16 @@ function clayCustomFn() {
       });
     }
 
+    if (builtinTools && typeof builtinTools.appendItems === 'function') {
+      builtinToolKeys.forEach(function(key) {
+        var toolItem = self.getItemByMessageKey(key);
+        if (toolItem && toolItem.$element && toolItem.$element[0]) {
+          toolRoots.push(toolItem.$element[0]);
+        }
+      });
+      builtinTools.appendItems(toolRoots);
+    }
+
     if (!resetButton) {
       return;
     }
@@ -91,6 +112,7 @@ var clay = new Clay(clayConfig, clayCustomFn, { autoHandleEvents: false });
 clay.registerComponent(mcpServersComponent);
 clay.registerComponent(modelSelectorComponent);
 clay.registerComponent(memoryManagerComponent);
+clay.registerComponent(builtinToolsComponent);
 
 function findConfigItem(items, messageKey) {
   var found = null;

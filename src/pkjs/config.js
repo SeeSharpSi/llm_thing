@@ -187,6 +187,11 @@ module.exports = [
         }
       },
       {
+        "type": "builtin_tools",
+        "id": "BuiltinTools",
+        "defaultValue": ""
+      },
+      {
         "type": "toggle",
         "messageKey": "WebSearchEnabled",
         "label": "Web Fetch",

@@ -80,6 +80,7 @@ function createHarness(options) {
     '@rebble/clay': FakeClay,
     './config': config,
     './mcp_servers_component': { name: 'mcp_servers' },
+    './builtin_tools_component': { name: 'builtin_tools' },
     './model_discovery': modelDiscovery,
     './model_selector_component': { name: 'model_selector' },
     './settings': settings,
@@ -109,6 +110,7 @@ test('registers Clay and handles ready and configuration open', function() {
   assert.equal(harness.clay.registered[0].name, 'mcp_servers');
   assert.equal(harness.clay.registered[1].name, 'model_selector');
   assert.equal(harness.clay.registered[2].name, 'memory_manager');
+  assert.equal(harness.clay.registered[3].name, 'builtin_tools');
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
@@ -152,6 +154,50 @@ test('memory manager visibility follows its toggle after Clay builds', function(
   enabled = true;
   toggleListener();
   assert.deepEqual(managerCalls, ['hide', 'show']);
+});
+
+test('after build appends the six built-in tool roots into the expander', function() {
+  var harness = createHarness();
+  var afterBuild;
+  var appended = [];
+  var roots = {};
+  var toolKeys = [
+    'WebSearchEnabled',
+    'GeolocationToolEnabled',
+    'TimelineToolEnabled',
+    'HealthToolEnabled',
+    'PebbleMemoryToolEnabled',
+    'MaxToolCalls'
+  ];
+  var expander = {
+    appendItems: function(elements) { appended.push(elements.slice()); }
+  };
+  var manager = { hide: function() {}, show: function() {} };
+  var clayContext = {
+    EVENTS: { AFTER_BUILD: 'after-build' },
+    on: function(event, callback) { assert.equal(event, 'after-build'); afterBuild = callback; },
+    getItemById: function(id) { return id === 'BuiltinTools' ? expander : null; },
+    getItemByMessageKey: function(key) {
+      if (key === 'MemoriesJson') { return manager; }
+      if (toolKeys.indexOf(key) !== -1) {
+        if (!roots[key]) {
+          roots[key] = { $element: [key] };
+          if (key === 'PebbleMemoryToolEnabled') {
+            roots[key].get = function() { return false; };
+            roots[key].on = function() {};
+          }
+        }
+        return roots[key];
+      }
+      return null;
+    }
+  };
+
+  harness.clay.customFn.call(clayContext);
+  afterBuild();
+
+  assert.equal(appended.length, 1);
+  assert.deepEqual(appended[0], toolKeys);
 });
 
 test('configuration bridges phone-local memories without persisting transient JSON', function() {
