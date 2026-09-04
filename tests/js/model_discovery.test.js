@@ -4,14 +4,17 @@ var test = require('node:test');
 var assert = require('node:assert/strict');
 var FakeXMLHttpRequest = require('./helpers/fake_xhr');
 var discovery = require('../../src/pkjs/model_discovery');
+var opencodeSession = require('../../src/pkjs/opencode_session');
 
 test.beforeEach(function() {
   FakeXMLHttpRequest.reset();
+  opencodeSession.resetForTests();
   global.XMLHttpRequest = FakeXMLHttpRequest;
 });
 
 test.afterEach(function() {
   delete global.XMLHttpRequest;
+  opencodeSession.resetForTests();
 });
 
 test('derives model URLs and normalizes OpenAI model lists', function() {
@@ -62,11 +65,32 @@ test('discovers models through phone-side XHR', function() {
   assert.equal(request.method, 'GET');
   assert.equal(request.url, 'https://example.test/v1/models');
   assert.equal(request.headers.Authorization, 'Bearer test-secret');
+  assert.equal(request.headers[opencodeSession.SESSION_HEADER], undefined);
   assert.equal(request.timeout, 15000);
   request.respond(200, { data: [{ id: 'model-b' }, { id: 'model-a' }] });
 
   assert.deepEqual(result.models, ['model-a', 'model-b']);
   assert.equal(result.status, '2 models loaded.');
+});
+
+test('OpenCode Go model discovery sends the session header', function() {
+  var result;
+
+  discovery.discover({
+    Endpoint: 'https://opencode.ai/zen/go/v1/responses',
+    ApiKey: 'test-secret'
+  }, function(value) {
+    result = value;
+  });
+  var request = FakeXMLHttpRequest.last();
+
+  assert.equal(request.method, 'GET');
+  assert.equal(request.url, 'https://opencode.ai/zen/go/v1/models');
+  assert.equal(request.headers.Authorization, 'Bearer test-secret');
+  assert.equal(request.headers[opencodeSession.SESSION_HEADER], opencodeSession.getConversationSessionId());
+  request.respond(200, { data: [{ id: 'model-a' }] });
+
+  assert.deepEqual(result.models, ['model-a']);
 });
 
 test('returns manual-entry status for missing settings and provider failures', function() {

@@ -6,6 +6,7 @@ var path = require('node:path');
 var common = require('../../src/pkjs/settings');
 var FakeXMLHttpRequest = require('./helpers/fake_xhr');
 var load = require('./helpers/load_with_stubs');
+var opencodeSession = require('../../src/pkjs/opencode_session');
 
 var modelPath = path.resolve(__dirname, '../../src/pkjs/model');
 var originalSetTimeout = global.setTimeout;
@@ -13,6 +14,7 @@ var originalSetTimeout = global.setTimeout;
 function createHarness(overrides) {
   overrides = overrides || {};
   FakeXMLHttpRequest.reset();
+  opencodeSession.resetForTests();
   global.XMLHttpRequest = FakeXMLHttpRequest;
   global.setTimeout = function(callback) { callback(); };
 
@@ -106,6 +108,7 @@ function createHarness(overrides) {
 test.afterEach(function() {
   delete global.XMLHttpRequest;
   global.setTimeout = originalSetTimeout;
+  opencodeSession.resetForTests();
   load.clearModule(modelPath);
 });
 
@@ -128,6 +131,64 @@ test('Responses request uses input shape, timeout, auth, and parsed output', fun
 
   request.respond(200, { output_text: 'Watch answer' });
   assert.deepEqual(harness.watch.responses, ['Watch answer']);
+});
+
+test('non-OpenCode endpoints omit the OpenCode session header', function() {
+  var harness = createHarness();
+
+  harness.model.requestCompletion(1, 'Hello');
+  var request = FakeXMLHttpRequest.last();
+
+  assert.equal(request.headers.Authorization, 'Bearer test-key');
+  assert.equal(request.headers[opencodeSession.SESSION_HEADER], undefined);
+
+  request.respond(200, { output_text: 'Watch answer' });
+  assert.deepEqual(harness.watch.responses, ['Watch answer']);
+});
+
+test('OpenCode Go requests send a stable per-conversation session header', function() {
+  var harness = createHarness({ settings: {
+    Endpoint: 'https://opencode.ai/zen/go/v1/responses',
+    MaxToolCalls: 0
+  } });
+
+  harness.model.requestCompletion(1, 'Hello');
+  var first = FakeXMLHttpRequest.last();
+  var sessionId = first.headers[opencodeSession.SESSION_HEADER];
+
+  assert.match(sessionId, /^[0-9a-f-]{36}$/);
+  assert.equal(first.headers.Authorization, 'Bearer test-key');
+  first.respond(200, { output_text: 'One' });
+
+  harness.model.requestCompletion(2, 'Again');
+  var second = FakeXMLHttpRequest.last();
+
+  assert.equal(second.headers[opencodeSession.SESSION_HEADER], sessionId);
+  second.respond(200, { output_text: 'Two' });
+  assert.deepEqual(harness.watch.responses, ['One', 'Two']);
+});
+
+test('OpenCode Go session header is stable across retries and rotates on chat reset', function() {
+  var harness = createHarness({ settings: {
+    Endpoint: 'https://opencode.ai/zen/go/v1/responses',
+    MaxToolCalls: 0
+  } });
+
+  harness.model.requestCompletion(40, 'Hi');
+  var firstId = FakeXMLHttpRequest.instances[0].headers[opencodeSession.SESSION_HEADER];
+  assert.ok(firstId);
+  FakeXMLHttpRequest.instances[0].respond(429, 'rate limited', { 'Retry-After': '0' });
+  assert.equal(FakeXMLHttpRequest.instances[1].headers[opencodeSession.SESSION_HEADER], firstId);
+  FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'OK' });
+  assert.deepEqual(harness.watch.responses, ['OK']);
+
+  harness.model.resetChatHistory();
+  harness.model.requestCompletion(41, 'Fresh');
+  var rotatedId = FakeXMLHttpRequest.last().headers[opencodeSession.SESSION_HEADER];
+  assert.ok(rotatedId);
+  assert.notEqual(rotatedId, firstId);
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'New' });
+  assert.deepEqual(harness.watch.responses, ['OK', 'New']);
 });
 
 test('Responses multi-turn history uses input_text and output_text blocks', function() {

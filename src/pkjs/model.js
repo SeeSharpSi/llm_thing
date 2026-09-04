@@ -3,6 +3,7 @@ var watch = require('./watch');
 var tools = require('./tools');
 var chatStore = require('./chat_store');
 var endpointCache = require('./endpoint_cache');
+var opencodeSession = require('./opencode_session');
 
 var CANDIDATE_PROTOCOL_ORDER = ['responses', 'chat', 'messages'];
 var CANONICAL_SUFFIX_BY_PROTOCOL = {
@@ -485,6 +486,7 @@ function resetChatHistory() {
   s_chat_history = [];
   s_saved_chat_history = [];
   s_active_chat_id = null;
+  opencodeSession.rotateConversationSessionId();
 }
 
 function listSavedChats() {
@@ -501,6 +503,7 @@ function loadSavedChat(chatId) {
   s_chat_history = copyChatHistory(chat.messages);
   s_saved_chat_history = copyChatHistory(chat.messages);
   s_active_chat_id = chat.id;
+  opencodeSession.rotateConversationSessionId();
   return chat;
 }
 
@@ -510,6 +513,7 @@ function deleteSavedChat(chatId) {
   if (deleted && s_active_chat_id === String(chatId || '')) {
     s_active_chat_id = null;
     s_saved_chat_history = [];
+    opencodeSession.rotateConversationSessionId();
   }
 
   return deleted;
@@ -519,6 +523,7 @@ function deleteAllSavedChats() {
   chatStore.deleteAllChats();
   s_active_chat_id = null;
   s_saved_chat_history = [];
+  opencodeSession.rotateConversationSessionId();
 }
 
 function normalizeToolParameters(parameters) {
@@ -831,6 +836,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
     } else {
       request.setRequestHeader('Authorization', 'Bearer ' + attemptSettings.ApiKey);
     }
+    opencodeSession.applySessionHeader(request, attemptSettings.Endpoint);
     request.timeout = attemptSettings.RequestTimeoutMs;
 
     if (!watch.trackXhr(requestId, request)) {

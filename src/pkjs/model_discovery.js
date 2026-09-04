@@ -1,3 +1,5 @@
+var opencodeSession = require('./opencode_session');
+
 var MAX_MODELS = 500;
 var MAX_MODEL_ID_CHARS = 256;
 var MAX_TOTAL_MODEL_CHARS = 30000;
@@ -99,6 +101,7 @@ function discover(settings, callback) {
   request.open('GET', modelsUrl, true);
   request.timeout = DISCOVERY_TIMEOUT_MS;
   request.setRequestHeader('Authorization', 'Bearer ' + apiKey);
+  opencodeSession.applySessionHeader(request, modelsUrl);
   request.onload = function() {
     var models;
 
