@@ -122,10 +122,28 @@ test('Responses request uses input shape, timeout, auth, and parsed output', fun
   assert.equal(request.headers.Authorization, 'Bearer test-key');
   assert.equal(body.model, 'test-model');
   assert.deepEqual(body.input.map(function(message) { return message.role; }), ['system', 'user']);
+  assert.deepEqual(body.input[0].content, [{ type: 'input_text', text: body.input[0].content[0].text }]);
+  assert.deepEqual(body.input[1].content, [{ type: 'input_text', text: 'Hello' }]);
   assert.equal(body.messages, undefined);
 
   request.respond(200, { output_text: 'Watch answer' });
   assert.deepEqual(harness.watch.responses, ['Watch answer']);
+});
+
+test('Responses multi-turn history uses input_text and output_text blocks', function() {
+  var harness = createHarness();
+
+  harness.model.requestCompletion(90, 'First');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'One' });
+  harness.model.requestCompletion(91, 'Second');
+
+  var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
+  assert.equal(input[0].role, 'system');
+  assert.equal(input[0].content[0].type, 'input_text');
+  assert.equal(input[1].content[0].type, 'input_text');
+  assert.equal(input[2].content[0].type, 'output_text');
+  assert.equal(input[2].content[0].text, 'One');
+  assert.equal(input[3].content[0].type, 'input_text');
 });
 
 test('Chat Completions endpoint uses messages and never requests reasoning summary', function() {
@@ -188,9 +206,9 @@ test('successful turns are included in following request history', function() {
 
   var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
   assert.deepEqual(input.slice(1), [
-    { role: 'user', content: 'First' },
-    { role: 'assistant', content: 'One' },
-    { role: 'user', content: 'Second' }
+    { role: 'user', content: [{ type: 'input_text', text: 'First' }] },
+    { role: 'assistant', content: [{ type: 'output_text', text: 'One' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Second' }] }
   ]);
 });
 
@@ -538,7 +556,7 @@ test('WebSearchEnabled adds native web_fetch function alongside function tools',
   assert.equal(body.tools.filter(function(t) { return t.type === 'web_search'; }).length, 0);
   assert.ok(body.tools.some(function(t) { return t.type === 'function' && t.name === 'web_fetch'; }));
   assert.ok(body.tools.some(function(t) { return t.type === 'function' && t.name === 'lookup'; }));
-  assert.doesNotMatch(body.input[0].content, /Only tools listed here are enabled/);
+  assert.doesNotMatch(JSON.stringify(body.input[0].content), /Only tools listed here are enabled/);
 });
 
 test('Chat Completions includes native web_fetch function', function() {
@@ -598,9 +616,9 @@ test('ShowThinking live history stores answer-only representation', function() {
   harness.model.requestCompletion(53, 'Q2');
   var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
   assert.deepEqual(input.slice(1), [
-    { role: 'user', content: 'Q1' },
-    { role: 'assistant', content: 'A1' },
-    { role: 'user', content: 'Q2' }
+    { role: 'user', content: [{ type: 'input_text', text: 'Q1' }] },
+    { role: 'assistant', content: [{ type: 'output_text', text: 'A1' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Q2' }] }
   ]);
 });
 
@@ -615,7 +633,7 @@ test('history character budget evicts oldest user/assistant pairs', function() {
   var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
   var history = input.slice(1, input.length - 1);
   assert.equal(history.length, 6, 'three pairs remain after budget eviction');
-  assert.equal(history[0].content, 'q2', 'oldest pair evicted');
+  assert.equal(history[0].content[0].text, 'q2', 'oldest pair evicted');
 });
 
 function nativeToolsStub(runCalls) {

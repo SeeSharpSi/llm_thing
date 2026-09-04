@@ -592,12 +592,74 @@ function buildReasoningObject(settings, options) {
   return Object.keys(reasoning).length ? reasoning : null;
 }
 
+function responsesTextFromContent(content) {
+  var text = '';
+  var i;
+
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!content || !content.length) {
+    return '';
+  }
+  for (i = 0; i < content.length; i += 1) {
+    if (content[i] && typeof content[i].text === 'string') {
+      text += content[i].text;
+    } else if (typeof content[i] === 'string') {
+      text += content[i];
+    }
+  }
+  return text;
+}
+
 function extractSystemPrompt(conversation) {
   if (conversation.length && conversation[0] && conversation[0].role === 'system') {
-    return String(conversation[0].content || '');
+    return responsesTextFromContent(conversation[0].content);
   }
 
   return '';
+}
+
+function toResponsesInput(conversation) {
+  var input = [];
+  var i;
+  var item;
+  var j;
+  var part;
+  var content;
+
+  for (i = 0; i < conversation.length; i += 1) {
+    item = conversation[i] || {};
+    if (item.type) {
+      input.push(item);
+      continue;
+    }
+    if (item.role !== 'system' && item.role !== 'developer' && item.role !== 'user' && item.role !== 'assistant') {
+      continue;
+    }
+    if (typeof item.content === 'string') {
+      content = [{ type: item.role === 'assistant' ? 'output_text' : 'input_text', text: item.content }];
+      input.push({ role: item.role, content: content });
+      continue;
+    }
+    if (item.content && item.content.length) {
+      content = [];
+      for (j = 0; j < item.content.length; j += 1) {
+        part = item.content[j] || {};
+        if (part.type === 'text') {
+          content.push({ type: item.role === 'assistant' ? 'output_text' : 'input_text', text: String(part.text || '') });
+        } else {
+          content.push(part);
+        }
+      }
+      input.push({ role: item.role, content: content });
+      continue;
+    }
+    content = [{ type: item.role === 'assistant' ? 'output_text' : 'input_text', text: '' }];
+    input.push({ role: item.role, content: content });
+  }
+
+  return input;
 }
 
 function collectRoleTurns(conversation) {
@@ -659,7 +721,7 @@ function buildBody(settings, conversation, options) {
 
   body = {
     model: settings.Model,
-    input: conversation
+    input: toResponsesInput(conversation)
   };
 
   reasoning = buildReasoningObject(settings, options);
