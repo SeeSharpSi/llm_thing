@@ -16,7 +16,8 @@ var HEALTH_INFO_TIMEOUT_MS = 8000;
 var s_health_info_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
-var s_latest_request_id = 0;
+var s_in_flight_send = null;
+var s_latest_request_id = null;
 var s_active_xhrs = {};
 var s_pending_health_info = {};
 var s_progress = {
@@ -40,11 +41,36 @@ function dictHasRequestId(dict) {
 }
 
 function isCurrentRequest(requestId) {
-  return Number(requestId) === Number(s_latest_request_id);
+  return requestId !== null && requestId !== undefined && s_latest_request_id !== null &&
+    !isNaN(Number(requestId)) && Number(requestId) === Number(s_latest_request_id);
 }
 
 function isCurrentMessage(dict) {
   return !dictHasRequestId(dict) || isCurrentRequest(dict.RequestId);
+}
+
+function failSendItem(item, error) {
+  if (!item || item.settled) {
+    return;
+  }
+  item.settled = true;
+  if (item.retryTimer !== null && item.retryTimer !== undefined) {
+    clearTimeout(item.retryTimer);
+    item.retryTimer = null;
+  }
+  if (item.onFailure) {
+    item.onFailure(error || { error: 'AppMessage failed' });
+  }
+}
+
+function succeedSendItem(item) {
+  if (!item || item.settled) {
+    return;
+  }
+  item.settled = true;
+  if (item.onSuccess) {
+    item.onSuccess();
+  }
 }
 
 function utf8BytesForCodePoint(codePoint) {
@@ -58,19 +84,6 @@ function utf8BytesForCodePoint(codePoint) {
     return 3;
   }
   return 4;
-}
-
-function truncateAtCodePointBoundary(text, maxLength) {
-  var value = String(text || '');
-  var end = value.length > maxLength ? maxLength : value.length;
-
-  if (end > 0 && end < value.length &&
-      value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff &&
-      value.charCodeAt(end) >= 0xdc00 && value.charCodeAt(end) <= 0xdfff) {
-    end -= 1;
-  }
-
-  return value.substring(0, end);
 }
 
 function nextUtf8Chunk(text, start, maxBytes) {
@@ -155,8 +168,10 @@ function sendUtf8ChunkSequence(spec) {
 }
 
 function abortXhrsForKey(key) {
-  var requests = s_active_xhrs[key] || [];
+  var requests = (s_active_xhrs[key] || []).slice();
   var i;
+
+  delete s_active_xhrs[key];
 
   for (i = 0; i < requests.length; i += 1) {
     try {
@@ -164,7 +179,6 @@ function abortXhrsForKey(key) {
     } catch (e) {}
   }
 
-  delete s_active_xhrs[key];
 }
 
 function clearPendingHealthInfo(key) {
@@ -174,7 +188,7 @@ function clearPendingHealthInfo(key) {
     return null;
   }
 
-  if (pending.timeout) {
+  if (pending.timeout !== null && pending.timeout !== undefined) {
     clearTimeout(pending.timeout);
   }
   delete s_pending_health_info[key];
@@ -195,26 +209,64 @@ function abortStaleHealthInfo(requestId) {
   }
 }
 
+function cancelHealthInfoForRequest(requestId) {
+  var key;
+  var pending;
+
+  for (key in s_pending_health_info) {
+    if (s_pending_health_info.hasOwnProperty(key)) {
+      pending = s_pending_health_info[key];
+      if (Number(pending.requestId) === Number(requestId)) {
+        clearPendingHealthInfo(key);
+      }
+    }
+  }
+}
+
+function dropQueuedMessagesForRequest(requestId) {
+  var kept = [];
+  var dropped = [];
+  var i;
+  var item;
+
+  for (i = 0; i < s_send_queue.length; i += 1) {
+    item = s_send_queue[i];
+    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) === Number(requestId)) {
+      dropped.push(item);
+    } else {
+      kept.push(item);
+    }
+  }
+  s_send_queue = kept;
+
+  for (i = 0; i < dropped.length; i += 1) {
+    failSendItem(dropped[i], { error: 'Request canceled' });
+  }
+}
+
 function dropStaleQueuedMessages(requestId) {
   var kept = [];
-  var dropped = 0;
+  var dropped = [];
   var i;
   var item;
 
   for (i = 0; i < s_send_queue.length; i += 1) {
     item = s_send_queue[i];
     if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) !== Number(requestId)) {
-      dropped += 1;
+      dropped.push(item);
     } else {
       kept.push(item);
     }
   }
 
-  if (dropped) {
-    common.logDebug('dropped stale queued messages count=' + dropped);
+  if (dropped.length) {
+    common.logDebug('dropped stale queued messages count=' + dropped.length);
   }
 
   s_send_queue = kept;
+  for (i = 0; i < dropped.length; i += 1) {
+    failSendItem(dropped[i], { error: 'Stale request' });
+  }
 }
 
 function beginRequestLifecycle(requestId) {
@@ -236,6 +288,27 @@ function beginRequestLifecycle(requestId) {
 
 function finishRequestLifecycle(requestId) {
   delete s_active_xhrs[requestKey(requestId)];
+}
+
+function cancelRequestLifecycle(requestId) {
+  var key;
+
+  if (!isCurrentRequest(requestId)) {
+    return false;
+  }
+
+  key = requestKey(requestId);
+  s_latest_request_id = null;
+  abortXhrsForKey(key);
+  cancelHealthInfoForRequest(requestId);
+  dropQueuedMessagesForRequest(requestId);
+  if (s_in_flight_send && dictHasRequestId(s_in_flight_send.dict) &&
+      Number(s_in_flight_send.dict.RequestId) === Number(requestId)) {
+    failSendItem(s_in_flight_send, { error: 'Request canceled' });
+  }
+  progressStop(requestId);
+  processSendQueue();
+  return true;
 }
 
 function trackXhr(requestId, request) {
@@ -278,10 +351,14 @@ function processSendQueue() {
   if (s_send_busy || !s_send_queue.length) {
     return;
   }
+  if (s_send_queue[0].retryTimer !== null && s_send_queue[0].retryTimer !== undefined) {
+    return;
+  }
 
   item = s_send_queue.shift();
   while (item && !isCurrentMessage(item.dict)) {
     common.logDebug('skipping stale message request=' + item.dict.RequestId);
+    failSendItem(item, { error: 'Stale request' });
     if (!s_send_queue.length) {
       return;
     }
@@ -289,25 +366,43 @@ function processSendQueue() {
   }
 
   s_send_busy = true;
+  s_in_flight_send = item;
   Pebble.sendAppMessage(item.dict, function() {
+    if (s_in_flight_send !== item) {
+      return;
+    }
+    s_in_flight_send = null;
     s_send_busy = false;
-    if (item.onSuccess) {
-      item.onSuccess();
+    if (!item.settled) {
+      if (!isCurrentMessage(item.dict)) {
+        failSendItem(item, { error: 'Request canceled' });
+      } else {
+        succeedSendItem(item);
+      }
     }
     processSendQueue();
   }, function(e) {
+    if (s_in_flight_send !== item) {
+      return;
+    }
+    s_in_flight_send = null;
     s_send_busy = false;
-    if (item.attempts < MAX_SEND_ATTEMPTS && isCurrentMessage(item.dict)) {
+    if (item.settled) {
+      processSendQueue();
+      return;
+    }
+    if (!item.settled && item.attempts < MAX_SEND_ATTEMPTS && isCurrentMessage(item.dict)) {
       item.attempts += 1;
       common.logDebug('sendAppMessage retry=' + item.attempts + ' error=' + JSON.stringify(e));
       s_send_queue.unshift(item);
-      setTimeout(processSendQueue, SEND_RETRY_DELAY_MS);
+      item.retryTimer = setTimeout(function() {
+        item.retryTimer = null;
+        processSendQueue();
+      }, SEND_RETRY_DELAY_MS);
       return;
     }
     common.logDebug('sendAppMessage failed attempts=' + item.attempts + ': ' + JSON.stringify(e));
-    if (item.onFailure) {
-      item.onFailure(e || { error: 'AppMessage failed' });
-    }
+    failSendItem(item, e || { error: 'AppMessage failed' });
     processSendQueue();
   });
 }
@@ -325,7 +420,9 @@ function sendMessage(dict, onSuccess, onFailure) {
     dict: dict,
     onSuccess: onSuccess,
     onFailure: onFailure,
-    attempts: 1
+    attempts: 1,
+    retryTimer: null,
+    settled: false
   });
   processSendQueue();
   return true;
@@ -335,6 +432,7 @@ function syncWatchSettings(settings) {
   sendMessage({
     FontSize: settings.FontSize,
     BuzzStrength: settings.BuzzStrength,
+    SpeakerFeedbackEnabled: settings.SpeakerFeedbackEnabled ? 1 : 0,
     ScrollLines: settings.ScrollLines,
     TouchScrollEnabled: settings.TouchScrollEnabled ? 1 : 0,
     ShowInputContextSize: settings.ShowInputContextSize ? 1 : 0,
@@ -354,7 +452,7 @@ function sendReset(requestId, onSuccess, onFailure) {
 
 function sendWatchText(requestId, text, includeDone, onDone) {
   var completed = false;
-  var value = truncateAtCodePointBoundary(text, MAX_RESPONSE_CHARS);
+  var value = String(text || '');
 
   function complete(error) {
     if (completed) {
@@ -437,110 +535,6 @@ function stripWatchMarkers(text) {
   return String(text || '').replace(/[\u0001-\u0006]/g, '');
 }
 
-function appendTruncatedNotice(text, limit) {
-  var suffix = '\n\n[Truncated]';
-  var value = String(text || '');
-
-  if (value.length + suffix.length <= limit) {
-    return value + suffix;
-  }
-  if (limit <= suffix.length) {
-    return value.substring(0, limit);
-  }
-
-  return value.substring(0, limit - suffix.length) + suffix;
-}
-
-function formatSavedPromptContent(content, maxLength) {
-  if (maxLength <= 2) {
-    return '';
-  }
-
-  return WATCH_PROMPT_ON + formatMarkdownBoldForWatch(content, maxLength - 2) + WATCH_PROMPT_OFF;
-}
-
-function formatSavedAssistantContent(content, maxLength) {
-  if (maxLength <= 0) {
-    return '';
-  }
-
-  return wrapThinkingSmallForWatch(formatMarkdownBoldForWatch(content, maxLength));
-}
-
-function formatSavedChatTranscript(chat, settings) {
-  var messages = chat && chat.messages ? chat.messages : [];
-  var text = '';
-  var i;
-  var message;
-  var content;
-  var segment;
-  var limit = maxResponseCharsForFontSize(settings);
-  var available;
-  var separator;
-  var truncated = false;
-
-  if (limit > MAX_RESPONSE_CHARS) {
-    limit = MAX_RESPONSE_CHARS;
-  }
-
-  for (i = 0; i < messages.length; i += 1) {
-    message = messages[i] || {};
-    content = stripWatchMarkers(message.content || '');
-    if (!content) {
-      continue;
-    }
-
-    separator = text ? '\n\n' : '';
-    available = limit - text.length - separator.length;
-    if (available <= 0) {
-      truncated = true;
-      break;
-    }
-
-    if (message.role === 'user') {
-      segment = formatSavedPromptContent(content, available);
-    } else if (message.role === 'assistant') {
-      segment = formatSavedAssistantContent(content, available);
-    } else {
-      continue;
-    }
-
-    if (segment.length > available) {
-      segment = segment.substring(0, available);
-      truncated = true;
-    }
-
-    if (!segment) {
-      truncated = true;
-      break;
-    }
-
-    text += separator + segment;
-  }
-
-  if (truncated || i < messages.length) {
-    return appendTruncatedNotice(text, limit);
-  }
-
-  return text;
-}
-
-function sendPastChatTranscript(chat, settings, onDone) {
-  sendUtf8ChunkSequence({
-    text: formatSavedChatTranscript(chat, settings),
-    resetDict: function() {
-      return { PastChatTextReset: 1 };
-    },
-    chunkDict: function(chunkText) {
-      return { PastChatTextChunk: chunkText };
-    },
-    doneDict: function() {
-      return { PastChatTextDone: 1 };
-    },
-    onSuccess: onDone
-  });
-}
-
 function maxResponseCharsForFontSize(settings) {
   var fontSize = parseInt(settings && settings.FontSize, 10);
 
@@ -554,94 +548,268 @@ function maxResponseCharsForFontSize(settings) {
   return MAX_RESPONSE_CHARS;
 }
 
-function truncateResponseForWatch(text, limit) {
-  var value = String(text || '');
-  var suffix = '\n\n[Truncated]';
+function codePointAt(value, index) {
+  var first = value.charCodeAt(index);
+  var second;
 
-  if (value.length <= limit) {
-    return value;
-  }
-  if (limit <= suffix.length) {
-    return value.substring(0, limit);
+  if (first >= 0xd800 && first <= 0xdbff && index + 1 < value.length) {
+    second = value.charCodeAt(index + 1);
+    if (second >= 0xdc00 && second <= 0xdfff) {
+      return { text: value.substring(index, index + 2), width: 2 };
+    }
   }
 
-  return value.substring(0, limit - suffix.length) + suffix;
+  if ((first >= 0xd800 && first <= 0xdfff)) {
+    return { text: '\ufffd', width: 1 };
+  }
+
+  return { text: value.charAt(index), width: 1 };
 }
 
-function formatMarkdownBoldForWatch(text, maxLength) {
-  var value = String(text || '');
-  var output = '';
-  var i = 0;
-  var close;
+function markerForStyle(style, enabled) {
+  if (style === 'bold') {
+    return enabled ? WATCH_BOLD_ON : WATCH_BOLD_OFF;
+  }
+  if (style === 'prompt') {
+    return enabled ? WATCH_PROMPT_ON : WATCH_PROMPT_OFF;
+  }
+  return enabled ? WATCH_SMALL_ON : WATCH_SMALL_OFF;
+}
+
+function readOutputStyles(text) {
+  var state = { bold: false, prompt: false, small: false };
+  var i;
   var ch;
 
-  function appendChar(value) {
-    if (output.length >= maxLength) {
+  for (i = 0; i < text.length; i += 1) {
+    ch = text.charAt(i);
+    if (ch === WATCH_BOLD_ON) {
+      state.bold = true;
+    } else if (ch === WATCH_BOLD_OFF) {
+      state.bold = false;
+    } else if (ch === WATCH_PROMPT_ON) {
+      state.prompt = true;
+    } else if (ch === WATCH_PROMPT_OFF) {
+      state.prompt = false;
+    } else if (ch === WATCH_SMALL_ON) {
+      state.small = true;
+    } else if (ch === WATCH_SMALL_OFF) {
+      state.small = false;
+    }
+  }
+
+  return state;
+}
+
+function createBoundedOutput(limit) {
+  var text = '';
+  var truncated = false;
+  var styles = { bold: false, prompt: false, small: false };
+
+  limit = Math.min(limit, MAX_RESPONSE_CHARS);
+
+  function append(value) {
+    if (truncated) {
       return false;
     }
-    if (value !== WATCH_BOLD_ON && value !== WATCH_BOLD_OFF &&
-        value !== WATCH_SMALL_ON && value !== WATCH_SMALL_OFF) {
-      output += value;
+    if (text.length + value.length > limit) {
+      truncated = true;
+      return false;
+    }
+    text += value;
+    return true;
+  }
+
+  function appendText(value) {
+    var i = 0;
+    var point;
+
+    while (i < value.length) {
+      point = codePointAt(value, i);
+      if (!append(point.text)) {
+        return false;
+      }
+      i += point.width;
     }
     return true;
   }
 
-  while (i < value.length && output.length < maxLength) {
-    if (value.substring(i, i + 2) === '**') {
-      close = value.indexOf('**', i + 2);
-      if (close !== -1) {
-        if (output.length + 2 > maxLength) {
-          break;
-        }
+  function setStyle(style, enabled) {
+    var marker;
 
-        output += WATCH_BOLD_ON;
-        i += 2;
-        while (i < close && output.length < maxLength - 1) {
-          appendChar(value.charAt(i));
-          i += 1;
-        }
-        output += WATCH_BOLD_OFF;
-        i = close + 2;
-        continue;
-      }
+    if (truncated || styles[style] === enabled) {
+      return !truncated;
+    }
+    marker = markerForStyle(style, enabled);
+    if (!append(marker)) {
+      return false;
+    }
+    styles[style] = enabled;
+    return true;
+  }
+
+  function finish() {
+    var notice = '\n\n[Truncated]';
+    var prefix = text;
+    var state;
+    var closers;
+    var end;
+
+    if (!truncated) {
+      return { text: text, truncated: false };
     }
 
-    ch = value.charAt(i);
-    appendChar(ch);
-    i += 1;
+    while (true) {
+      state = readOutputStyles(prefix);
+      closers = (state.bold ? WATCH_BOLD_OFF : '') +
+        (state.prompt ? WATCH_PROMPT_OFF : '') +
+        (state.small ? WATCH_SMALL_OFF : '');
+      end = prefix.length;
+      while (end > limit - notice.length - closers.length) {
+        end -= 1;
+      }
+      if (end > 0 && end < prefix.length &&
+          prefix.charCodeAt(end - 1) >= 0xd800 && prefix.charCodeAt(end - 1) <= 0xdbff &&
+          prefix.charCodeAt(end) >= 0xdc00 && prefix.charCodeAt(end) <= 0xdfff) {
+        end -= 1;
+      }
+      if (end === prefix.length) {
+        return { text: prefix + closers + notice, truncated: true };
+      }
+      prefix = prefix.substring(0, end);
+    }
   }
 
-  return output;
+  return {
+    appendText: appendText,
+    setStyle: setStyle,
+    length: function() { return text.length; },
+    getText: function() { return text; },
+    isTruncated: function() { return truncated; },
+    finish: finish
+  };
 }
 
-function wrapThinkingSmallForWatch(text) {
-  var value = String(text || '');
-  var thinkingPrefix = 'Thinking:\n';
+function formatSegment(rawText, role, output, separator) {
+  var value = stripWatchMarkers(rawText);
+  var start;
+  var prefix = 'Thinking:\n';
   var answerMarker = '\n\nAnswer:\n';
-  var answerIndex;
+  var answerIndex = -1;
+  var thinkingEnd;
+  var i = 0;
+  var close;
 
-  if (value.substring(0, thinkingPrefix.length) !== thinkingPrefix) {
-    return value;
+  if (!value) {
+    return { text: '', truncated: false };
   }
 
-  answerIndex = value.indexOf(answerMarker, thinkingPrefix.length);
-  if (answerIndex === -1) {
-    return WATCH_SMALL_ON + value + WATCH_SMALL_OFF;
+  if (separator && output.length() && !output.appendText(separator)) {
+    return { text: '', truncated: true };
+  }
+  start = output.length();
+
+  if (role === 'prompt') {
+    output.setStyle('prompt', true);
+  } else if (value.substring(0, prefix.length) === prefix) {
+    answerIndex = value.indexOf(answerMarker, prefix.length);
   }
 
-  return WATCH_SMALL_ON + value.substring(0, answerIndex) + WATCH_SMALL_OFF + value.substring(answerIndex);
+  thinkingEnd = role === 'assistant' && value.substring(0, prefix.length) === prefix ?
+    (answerIndex === -1 ? value.length : answerIndex) : -1;
+  if (thinkingEnd >= 0) {
+    output.setStyle('small', true);
+  }
+
+  while (i < value.length && !output.isTruncated()) {
+    if (value.substring(i, i + 2) === '**' && (close = value.indexOf('**', i + 2)) !== -1) {
+      output.setStyle('bold', true);
+      i += 2;
+      while (i < close && !output.isTruncated()) {
+        if (thinkingEnd >= 0 && i === thinkingEnd) {
+          output.setStyle('small', false);
+        }
+        var point = codePointAt(value, i);
+        output.appendText(point.text);
+        i += point.width;
+      }
+      if (thinkingEnd >= 0 && i === thinkingEnd) {
+        output.setStyle('small', false);
+      }
+      output.setStyle('bold', false);
+      i = close + 2;
+      continue;
+    }
+
+    if (thinkingEnd >= 0 && i === thinkingEnd) {
+      output.setStyle('small', false);
+      thinkingEnd = -1;
+    }
+    if (value.substring(i, i + 2) === '**') {
+      output.appendText('**');
+      i += 2;
+    } else {
+      var rawPoint = codePointAt(value, i);
+      output.appendText(rawPoint.text);
+      i += rawPoint.width;
+    }
+  }
+
+  if (thinkingEnd >= 0 && !output.isTruncated()) {
+    output.setStyle('small', false);
+  }
+  if (role === 'prompt' && !output.isTruncated()) {
+    output.setStyle('prompt', false);
+  }
+
+  return {
+    text: output.getText().substring(start),
+    truncated: output.isTruncated()
+  };
 }
 
-function formatResponseForWatch(text, maxLength) {
-  var value = formatMarkdownBoldForWatch(text, maxLength);
-  var wrapped = wrapThinkingSmallForWatch(value);
+function formatResponseForWatch(text, limit) {
+  var output = createBoundedOutput(limit);
 
-  if (wrapped.length <= maxLength) {
-    return wrapped;
+  formatSegment(text, 'assistant', output, '');
+  return output.finish();
+}
+
+function formatSavedChatTranscript(chat, settings) {
+  var messages = chat && chat.messages ? chat.messages : [];
+  var output = createBoundedOutput(maxResponseCharsForFontSize(settings));
+  var i;
+  var message;
+  var segment;
+
+  for (i = 0; i < messages.length && !output.isTruncated(); i += 1) {
+    message = messages[i] || {};
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue;
+    }
+    segment = formatSegment(message.content || '', message.role === 'user' ? 'prompt' : 'assistant', output, '\n\n');
+    if (segment.truncated) {
+      break;
+    }
   }
 
-  value = formatMarkdownBoldForWatch(text, maxLength - 2);
-  return wrapThinkingSmallForWatch(value);
+  return output.finish();
+}
+
+function sendPastChatTranscript(chat, settings, onDone) {
+  sendUtf8ChunkSequence({
+    text: formatSavedChatTranscript(chat, settings).text,
+    resetDict: function() {
+      return { PastChatTextReset: 1 };
+    },
+    chunkDict: function(chunkText) {
+      return { PastChatTextChunk: chunkText };
+    },
+    doneDict: function() {
+      return { PastChatTextDone: 1 };
+    },
+    onSuccess: onDone
+  });
 }
 
 function formatProgressHistory(items) {
@@ -699,6 +867,10 @@ function sendProgressState(requestId, current, detail, reset, onDone) {
 }
 
 function progressStart(requestId, current, detail) {
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
+
   s_progress.requestId = requestId;
   s_progress.active = true;
   s_progress.current = current || 'thinking';
@@ -712,6 +884,10 @@ function progressStart(requestId, current, detail) {
 }
 
 function progressToolStart(requestId, current, detail) {
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
+
   if (!s_progress.active || s_progress.requestId !== requestId) {
     progressStart(requestId, current, detail);
   }
@@ -722,6 +898,10 @@ function progressToolStart(requestId, current, detail) {
 }
 
 function progressSet(requestId, current, detail) {
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
+
   current = current || 'thinking';
   detail = detail || '';
 
@@ -740,6 +920,10 @@ function progressSet(requestId, current, detail) {
 }
 
 function progressSetContextSizes(requestId, inputText, outputText) {
+  if (!isCurrentRequest(requestId)) {
+    return;
+  }
+
   inputText = inputText || '';
   outputText = outputText || '';
 
@@ -759,7 +943,7 @@ function progressSetContextSizes(requestId, inputText, outputText) {
 function progressDone(requestId) {
   var toolName;
 
-  if (!s_progress.active || s_progress.requestId !== requestId) {
+  if (!isCurrentRequest(requestId) || !s_progress.active || s_progress.requestId !== requestId) {
     return;
   }
 
@@ -771,7 +955,7 @@ function progressDone(requestId) {
 }
 
 function progressStop(requestId) {
-  if (s_progress.requestId !== requestId) {
+  if (Number(s_progress.requestId) !== Number(requestId)) {
     return;
   }
 
@@ -785,20 +969,34 @@ function progressStop(requestId) {
   s_progress.outputContextSize = '';
 }
 
-function sendError(requestId, message) {
+function sendError(requestId, message, onDone) {
+  var completed = false;
+
+  function complete(error) {
+    if (completed) {
+      return;
+    }
+    completed = true;
+    if (onDone) {
+      onDone(error || null);
+    }
+  }
+
   progressStop(requestId);
   common.logDebug('watch error request=' + requestId + ' message=' + String(message).substring(0, 160));
   sendReset(requestId, function() {
-    sendMessage({ ResponseError: String(message).substring(0, CHUNK_SIZE), RequestId: requestId });
-  });
+    sendMessage({ ResponseError: String(message).substring(0, CHUNK_SIZE), RequestId: requestId }, function() {
+      complete(null);
+    }, complete);
+  }, complete);
 }
 
 function sendResponse(requestId, settings, text, onDone) {
-  var limit = maxResponseCharsForFontSize(settings);
-  var value = formatResponseForWatch(truncateResponseForWatch(text, limit), MAX_RESPONSE_CHARS);
+  var formatted = formatResponseForWatch(text, maxResponseCharsForFontSize(settings));
+  var value = formatted.text;
 
   progressStop(requestId);
-  common.logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + limit);
+  common.logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + maxResponseCharsForFontSize(settings) + ' truncated=' + (formatted.truncated ? 1 : 0));
   sendWatchText(requestId, value, true, onDone);
 }
 
@@ -888,6 +1086,7 @@ module.exports = {
   isCurrentRequest: isCurrentRequest,
   beginRequestLifecycle: beginRequestLifecycle,
   finishRequestLifecycle: finishRequestLifecycle,
+  cancelRequestLifecycle: cancelRequestLifecycle,
   trackXhr: trackXhr,
   untrackXhr: untrackXhr,
   sendMessage: sendMessage,

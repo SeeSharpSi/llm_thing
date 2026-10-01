@@ -141,6 +141,18 @@ an error instead of leaving progress active. The watch debounces full text
 measurement while chunks arrive and performs a final layout when the response
 is complete.
 
+## Response Sound
+
+Enable **Response Sound** under **Watch Display** in the app's settings to play
+Herdr's completion sound when a successful response finishes. The toggle is
+off by default and is saved on both the phone and watch. Playback respects
+Quiet Time and system speaker mute, and stops when dictation starts or the app
+closes. Duplicate or stale response messages do not replay the sound.
+
+Speaker playback is supported on `emery` and `flint`. The 1.08-second sound is
+bundled as a raw PCM resource and streamed through a small buffer. Its source,
+conversion instructions, and upstream license are in `resources/audio/`.
+
 ## Health Info
 
 The optional Health Info tool lets the model request only health data relevant
@@ -167,6 +179,7 @@ and scope API/MCP credentials to the minimum permissions needed.
   saved-chat menus, vibration, and AppMessage handling.
 - `src/c/llm_core.c`: Pebble-independent watch algorithms shared with host-C
   unit tests.
+- `src/c/speaker_feedback.c`: optional completion sound playback and cleanup.
 - `src/pkjs/index.js`: Pebble event and configuration entrypoint.
 - `src/pkjs/model.js`: API request shaping, response parsing, chat history,
   reasoning, and tool-call orchestration.

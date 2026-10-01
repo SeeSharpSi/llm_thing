@@ -20,6 +20,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.ok(!('ConfigAction' in settings.DEFAULT_SETTINGS));
   assert.equal(settings.DEFAULT_SETTINGS.PreserveChats, false);
   assert.equal(settings.DEFAULT_SETTINGS.PebbleMemoryToolEnabled, false);
+  assert.equal(settings.DEFAULT_SETTINGS.SpeakerFeedbackEnabled, false);
 });
 
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
@@ -29,6 +30,7 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
     PreserveChats: 1,
     TimelineToolEnabled: 'true',
     PebbleMemoryToolEnabled: 1,
+    SpeakerFeedbackEnabled: { value: '1' },
     TouchScrollEnabled: 0,
     Model: { value: 'custom-model' },
     ApiKey: '[object Object]'
@@ -38,10 +40,37 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
   assert.equal(result.PreserveChats, true);
   assert.equal(result.TimelineToolEnabled, false);
   assert.equal(result.PebbleMemoryToolEnabled, true);
+  assert.equal(result.SpeakerFeedbackEnabled, true);
   assert.equal(result.TouchScrollEnabled, false);
   assert.equal(result.Model, 'custom-model');
   assert.equal(result.ApiKey, '');
   assert.equal(result.Endpoint, settings.DEFAULT_SETTINGS.Endpoint);
+});
+
+test('SpeakerFeedbackEnabled normalizes boolean and Clay toggle values', function() {
+  var settings = require(settingsPath);
+  var values = [
+    [true, true],
+    [1, true],
+    ['1', true],
+    [{ value: true }, true],
+    [{ value: '1' }, true],
+    [false, false],
+    [0, false],
+    ['0', false],
+    [{ value: false }, false],
+    [{ value: '0' }, false],
+    ['true', false],
+    ['false', false]
+  ];
+
+  values.forEach(function(entry) {
+    assert.equal(
+      settings.extend(settings.DEFAULT_SETTINGS, { SpeakerFeedbackEnabled: entry[0] }).SpeakerFeedbackEnabled,
+      entry[1],
+      JSON.stringify(entry[0]) + ' normalizes to ' + entry[1]
+    );
+  });
 });
 
 test('extend clamps numeric settings and enforces font choices', function() {
@@ -67,6 +96,7 @@ test('loadSettings falls back after missing or corrupt storage', function() {
   global.localStorage.setItem('llm_thing_settings', JSON.stringify({ Model: 'stored', ShowThinking: '1' }));
   assert.equal(settings.loadSettings().Model, 'stored');
   assert.equal(settings.loadSettings().ShowThinking, true);
+  assert.equal(settings.loadSettings().SpeakerFeedbackEnabled, false, 'old settings migrate to sound disabled');
 });
 
 test('saveSettings stores normalized settings', function() {
@@ -82,6 +112,21 @@ test('saveSettings stores normalized settings', function() {
   assert.equal(stored.TouchScrollEnabled, false);
   assert.equal(stored.MaxToolCalls, 0);
   assert.equal(stored.Endpoint, settings.DEFAULT_SETTINGS.Endpoint);
+});
+
+test('saveSettings and loadSettings persist SpeakerFeedbackEnabled on and off', function() {
+  var settings;
+
+  global.localStorage = new FakeLocalStorage();
+  settings = require(settingsPath);
+
+  settings.saveSettings({ SpeakerFeedbackEnabled: { value: '1' } });
+  assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).SpeakerFeedbackEnabled, true);
+  assert.equal(settings.loadSettings().SpeakerFeedbackEnabled, true);
+
+  settings.saveSettings({ SpeakerFeedbackEnabled: { value: '0' } });
+  assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).SpeakerFeedbackEnabled, false);
+  assert.equal(settings.loadSettings().SpeakerFeedbackEnabled, false);
 });
 
 test('text and JSON helpers handle nested provider content', function() {

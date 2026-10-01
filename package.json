@@ -106,10 +106,21 @@
       "TouchScrollEnabled",
       "RequestTimeoutMs",
       "PebbleMemoryToolEnabled",
-      "MemoriesJson"
+      "MemoriesJson",
+      "SpeakerFeedbackEnabled"
     ],
     "resources": {
-      "media": []
+      "media": [
+        {
+          "name": "SOUND_HERDR_DONE",
+          "file": "audio/herdr_done.pcm",
+          "type": "raw",
+          "targetPlatforms": [
+            "emery",
+            "flint"
+          ]
+        }
+      ]
     }
   },
   "devDependencies": {

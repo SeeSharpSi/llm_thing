@@ -5,18 +5,22 @@ var assert = require('node:assert/strict');
 var path = require('node:path');
 var common = require('../../src/pkjs/settings');
 var FakeXMLHttpRequest = require('./helpers/fake_xhr');
+var installFakeTimers = require('./helpers/fake_timers');
 var load = require('./helpers/load_with_stubs');
 var opencodeSession = require('../../src/pkjs/opencode_session');
 
 var modelPath = path.resolve(__dirname, '../../src/pkjs/model');
 var originalSetTimeout = global.setTimeout;
+var originalClearTimeout = global.clearTimeout;
 
 function createHarness(overrides) {
   overrides = overrides || {};
   FakeXMLHttpRequest.reset();
   opencodeSession.resetForTests();
   global.XMLHttpRequest = FakeXMLHttpRequest;
-  global.setTimeout = function(callback) { callback(); };
+  if (!overrides.useGlobalTimers) {
+    global.setTimeout = function(callback) { callback(); };
+  }
 
   var settings = common.extend(common.DEFAULT_SETTINGS, {
     Endpoint: 'https://api.example.test/v1/responses',
@@ -33,23 +37,49 @@ function createHarness(overrides) {
   commonStub.loadSettings = function() { return settings; };
   commonStub.logDebug = function() {};
 
-  var currentRequest = 0;
+  var currentRequest = null;
+  var trackedXhrs = {};
   var watch = {
     errors: [],
     responses: [],
     progress: [],
-    beginRequestLifecycle: function(id) { currentRequest = id; },
-    finishRequestLifecycle: function() {},
-    isCurrentRequest: function(id) { return id === currentRequest; },
-    trackXhr: function(id) { return id === currentRequest; },
-    untrackXhr: function() {},
+    canceledRequestIds: [],
+    finishedRequestIds: [],
+    beginRequestLifecycle: function(id) { currentRequest = id; trackedXhrs[id] = trackedXhrs[id] || []; },
+    finishRequestLifecycle: function(id) { watch.finishedRequestIds.push(id); },
+    cancelRequestLifecycle: function(id) {
+      var requests;
+      var i;
+      if (id !== currentRequest) { return false; }
+      currentRequest = null;
+      watch.canceledRequestIds.push(id);
+      requests = (trackedXhrs[id] || []).slice();
+      delete trackedXhrs[id];
+      for (i = 0; i < requests.length; i += 1) { requests[i].abort(); }
+      return true;
+    },
+    isCurrentRequest: function(id) { return currentRequest !== null && id === currentRequest; },
+    trackXhr: function(id, request) {
+      if (id !== currentRequest) { request.abort(); return false; }
+      trackedXhrs[id] = trackedXhrs[id] || [];
+      trackedXhrs[id].push(request);
+      return true;
+    },
+    untrackXhr: function(id, request) {
+      var requests = trackedXhrs[id] || [];
+      var index = requests.indexOf(request);
+      if (index !== -1) { requests.splice(index, 1); }
+    },
     syncWatchSettings: function() {},
     progressStart: function() {},
     progressSet: function(id, title, detail) { watch.progress.push([title, detail]); },
     progressDone: function() {},
     progressToolStart: function() {},
     progressSetContextSizes: function() {},
-    sendError: function(id, message) { watch.errors.push(message); },
+    sendError: function(id, message, callback) {
+      watch.errors.push(message);
+      if (callback) { callback(null); }
+    },
     sendResponse: function(id, currentSettings, text, callback) {
       watch.responses.push(text);
       if (callback) {
@@ -108,6 +138,7 @@ function createHarness(overrides) {
 test.afterEach(function() {
   delete global.XMLHttpRequest;
   global.setTimeout = originalSetTimeout;
+  global.clearTimeout = originalClearTimeout;
   opencodeSession.resetForTests();
   load.clearModule(modelPath);
 });
@@ -1320,4 +1351,240 @@ test('root-level https://host/messages rotates across three candidates without a
   assert.deepEqual(harness.endpointCache.rememberCalls, [
     { endpoint: 'https://api.example.test/messages', model: 'test-model', protocol: 'chat-completions' }
   ]);
+});
+
+test('reset, successful load, and delete-all cancel held model requests', function() {
+  var scenarios = [
+    {
+      name: 'reset',
+      run: function(model) { model.resetChatHistory(); }
+    },
+    {
+      name: 'load',
+      chatStore: {
+        listChats: function() { return []; },
+        getChat: function(id) { return { id: id, messages: [{ role: 'user', content: 'loaded' }] }; },
+        deleteChat: function() { return false; },
+        deleteAllChats: function() {},
+        saveChatHistory: function() { return null; }
+      },
+      run: function(model) { assert.ok(model.loadSavedChat('saved')); }
+    },
+    {
+      name: 'delete-all',
+      run: function(model) { model.deleteAllSavedChats(); }
+    }
+  ];
+  var i;
+  var harness;
+  var xhr;
+
+  for (i = 0; i < scenarios.length; i += 1) {
+    harness = createHarness({
+      settings: { Endpoint: 'https://opencode.ai/zen/go/v1/responses', MaxToolCalls: 0 },
+      chatStore: scenarios[i].chatStore
+    });
+    harness.model.requestCompletion(600 + i, 'held ' + scenarios[i].name);
+    xhr = FakeXMLHttpRequest.last();
+    scenarios[i].run(harness.model);
+
+    assert.equal(xhr.aborted, true, scenarios[i].name + ' aborts held request');
+    xhr.respond(200, { output_text: 'late answer' });
+    assert.deepEqual(harness.watch.responses, [], scenarios[i].name + ' suppresses late answer');
+    assert.deepEqual(harness.watch.canceledRequestIds, [600 + i]);
+  }
+});
+
+test('active saved-chat deletion cancels completion, rotates session, and keeps live history', function() {
+  var chatStore = {
+    saved: [],
+    listChats: function() { return []; },
+    getChat: function() { return null; },
+    deleteChat: function() { return true; },
+    deleteAllChats: function() {},
+    saveChatHistory: function(id, messages) {
+      this.saved.push(messages);
+      return { id: 'active-chat', title: 'Saved' };
+    }
+  };
+  var harness = createHarness({
+    settings: {
+      Endpoint: 'https://opencode.ai/zen/go/v1/responses',
+      MaxToolCalls: 0,
+      PreserveChats: true
+    },
+    chatStore: chatStore
+  });
+
+  harness.model.requestCompletion(610, 'live prompt');
+  var firstSession = FakeXMLHttpRequest.last().headers[opencodeSession.SESSION_HEADER];
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'live answer' });
+  harness.model.requestCompletion(611, 'must not commit');
+  var held = FakeXMLHttpRequest.last();
+
+  assert.equal(harness.model.deleteSavedChat('active-chat'), true);
+  assert.equal(held.aborted, true);
+  held.respond(200, { output_text: 'stale answer' });
+
+  harness.model.requestCompletion(612, 'after deletion');
+  var next = FakeXMLHttpRequest.last();
+  var body = JSON.parse(next.body);
+  var session = next.headers[opencodeSession.SESSION_HEADER];
+  var texts = body.input.slice(1).map(function(message) { return message.content[0].text; });
+
+  assert.notEqual(session, firstSession);
+  assert.deepEqual(texts, ['live prompt', 'live answer', 'after deletion']);
+  assert.equal(chatStore.saved.length, 1, 'late completion never saves deleted-chat turn');
+});
+
+test('missing load and inactive-chat deletion leave active completion untouched', function() {
+  var harness = createHarness({ settings: { MaxToolCalls: 0 } });
+
+  harness.model.requestCompletion(620, 'kept prompt');
+  var pending = FakeXMLHttpRequest.last();
+  assert.equal(harness.model.loadSavedChat('missing'), null);
+  assert.equal(harness.model.deleteSavedChat('inactive'), false);
+  assert.equal(pending.aborted, false);
+
+  pending.respond(200, { output_text: 'kept answer' });
+  harness.model.requestCompletion(621, 'next');
+  var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
+
+  assert.deepEqual(harness.watch.canceledRequestIds, []);
+  assert.deepEqual(input.slice(1).map(function(message) { return message.content[0].text; }), [
+    'kept prompt', 'kept answer', 'next'
+  ]);
+});
+
+test('delayed discovery and tool callbacks cannot advance after reset', function() {
+  var discoveryCallback;
+  var discoveryTools = {
+    discoverPhoneTools: function(settings, id, callback) { discoveryCallback = callback; },
+    runToolCalls: function() {},
+    formatToolCallLabel: function() { return 'Lookup'; }
+  };
+  var discoveryHarness = createHarness({ settings: { MaxToolCalls: 2 }, tools: discoveryTools });
+
+  discoveryHarness.model.requestCompletion(630, 'discover');
+  discoveryHarness.model.resetChatHistory();
+  discoveryCallback(null, [], {});
+  assert.equal(FakeXMLHttpRequest.instances.length, 0, 'stale discovery starts no model request');
+
+  var runCallback;
+  var runTools = {
+    discoverPhoneTools: function(settings, id, callback) {
+      callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
+        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      });
+    },
+    runToolCalls: function(id, calls, map, callback) { runCallback = callback; },
+    formatToolCallLabel: function() { return 'Lookup'; }
+  };
+  var runHarness = createHarness({ settings: { MaxToolCalls: 2 }, tools: runTools });
+
+  runHarness.model.requestCompletion(631, 'run tool');
+  FakeXMLHttpRequest.last().respond(200, {
+    output: [{ type: 'function_call', call_id: 'call-1', name: 'lookup', arguments: '{}' }]
+  });
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+  runHarness.model.resetChatHistory();
+  runCallback([{ id: 'call-1', call_id: 'call-1', name: 'lookup', result: 'late' }]);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'stale tool result starts no follow-up');
+  assert.deepEqual(runHarness.watch.responses, []);
+});
+
+test('late watch send acknowledgement cannot commit history after reset', function() {
+  var chatStore = {
+    saved: [],
+    listChats: function() { return []; },
+    getChat: function() { return null; },
+    deleteChat: function() { return false; },
+    deleteAllChats: function() {},
+    saveChatHistory: function(id, messages) { this.saved.push(messages); return { id: 'saved' }; }
+  };
+  var acknowledgement;
+  var harness = createHarness({
+    settings: { MaxToolCalls: 0, PreserveChats: true },
+    chatStore: chatStore
+  });
+
+  harness.watch.sendResponse = function(id, settings, text, callback) { acknowledgement = callback; };
+  harness.model.requestCompletion(640, 'unacked prompt');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'unacked answer' });
+  assert.equal(chatStore.saved.length, 0);
+
+  harness.model.resetChatHistory();
+  acknowledgement(null);
+  assert.equal(chatStore.saved.length, 0);
+
+  harness.model.requestCompletion(641, 'fresh prompt');
+  var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
+  assert.deepEqual(input.slice(1).map(function(message) { return message.content[0].text; }), ['fresh prompt']);
+});
+
+test('model error completion remains active through watch acknowledgement and reset invalidates it', function() {
+  var harness = createHarness({ settings: { MaxToolCalls: 0 } });
+  var errorAcknowledgement;
+
+  harness.watch.sendError = function(id, message, callback) {
+    harness.watch.errors.push(message);
+    errorAcknowledgement = callback;
+  };
+  harness.model.requestCompletion(645, 'unauthorized');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+
+  assert.deepEqual(harness.watch.errors, ['HTTP 401: unauthorized']);
+  assert.deepEqual(harness.watch.finishedRequestIds, [], 'error lifecycle waits for watch transfer');
+  assert.equal(harness.watch.isCurrentRequest(645), true);
+
+  harness.model.resetChatHistory();
+  assert.deepEqual(harness.watch.canceledRequestIds, [645]);
+  errorAcknowledgement(null);
+  assert.deepEqual(harness.watch.finishedRequestIds, [], 'late error ACK cannot finish a later lifecycle');
+
+  harness.model.requestCompletion(646, 'fresh');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'fresh answer' });
+  assert.deepEqual(harness.watch.responses, ['fresh answer']);
+  assert.deepEqual(harness.watch.finishedRequestIds, [646]);
+});
+
+test('delivered model error finishes lifecycle without retaining active context', function() {
+  var harness = createHarness({ settings: { MaxToolCalls: 0 } });
+
+  harness.model.requestCompletion(647, 'unauthorized');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  assert.deepEqual(harness.watch.finishedRequestIds, [647]);
+
+  harness.model.requestCompletion(648, 'next');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'answer' });
+  assert.deepEqual(harness.watch.finishedRequestIds, [647, 648]);
+});
+
+test('reset clears transient retry timer and next OpenCode request uses rotated session', function() {
+  var timers = installFakeTimers();
+  var harness;
+  var firstSession;
+  var nextSession;
+
+  try {
+    harness = createHarness({
+      useGlobalTimers: true,
+      settings: { Endpoint: 'https://opencode.ai/zen/go/v1/responses', MaxToolCalls: 0 }
+    });
+    harness.model.requestCompletion(650, 'retry later');
+    firstSession = FakeXMLHttpRequest.last().headers[opencodeSession.SESSION_HEADER];
+    FakeXMLHttpRequest.last().respond(429, 'rate limited', { 'Retry-After': '5' });
+    assert.equal(timers.timers.length, 1);
+    harness.model.resetChatHistory();
+    assert.equal(timers.timers[0].cleared, true);
+    timers.runAll();
+    assert.equal(FakeXMLHttpRequest.instances.length, 1, 'canceled retry sends no XHR');
+
+    harness.model.requestCompletion(651, 'fresh session');
+    nextSession = FakeXMLHttpRequest.last().headers[opencodeSession.SESSION_HEADER];
+    assert.notEqual(nextSession, firstSession);
+    assert.equal(FakeXMLHttpRequest.instances.length, 2);
+  } finally {
+    timers.restore();
+  }
 });

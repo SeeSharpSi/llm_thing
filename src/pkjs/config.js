@@ -297,6 +297,13 @@ module.exports = [
         ]
       },
       {
+        "type": "toggle",
+        "messageKey": "SpeakerFeedbackEnabled",
+        "label": "Response Sound",
+        "description": "Play Herdr's completion sound on speaker-equipped watches. Quiet Time and system mute suppress playback.",
+        "defaultValue": false
+      },
+      {
         "type": "input",
         "messageKey": "ScrollLines",
         "label": "Scroll Lines",

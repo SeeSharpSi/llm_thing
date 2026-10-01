@@ -118,13 +118,33 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   assert.deepEqual(Object.keys(global.Pebble.messages[0]).sort(), [
     'BackgroundColor', 'BoldTextColor', 'BuzzStrength', 'FontSize',
     'PreserveChats', 'PromptBackgroundColor', 'ScrollLines',
-    'ShowInputContextSize', 'ShowOutputContextSize', 'StartDictationQuickLaunch',
+    'ShowInputContextSize', 'ShowOutputContextSize', 'SpeakerFeedbackEnabled', 'StartDictationQuickLaunch',
     'TextColor', 'TouchScrollEnabled'
   ].sort());
+  assert.equal(global.Pebble.messages[0].SpeakerFeedbackEnabled, 0);
   assert.equal(global.Pebble.messages[0].ApiKey, undefined);
   assert.equal(global.Pebble.messages[0].McpServersJson, undefined);
   assert.equal(global.Pebble.messages[0].DeleteAllPastChats, undefined);
   assert.equal(global.Pebble.messages[0].ConfigAction, undefined);
+});
+
+test('Response Sound is a default-off Watch Display toggle with a declared key', function() {
+  var configured = configItems(config);
+  var soundToggle = configured.filter(function(item) {
+    return item.messageKey === 'SpeakerFeedbackEnabled';
+  })[0];
+  var watchDisplay = config.filter(function(item) {
+    return item.type === 'section' && item.items.some(function(sectionItem) {
+      return sectionItem.type === 'heading' && sectionItem.defaultValue === 'Watch Display';
+    });
+  })[0];
+
+  assert.ok(soundToggle);
+  assert.ok(watchDisplay.items.indexOf(soundToggle) !== -1);
+  assert.equal(soundToggle.type, 'toggle');
+  assert.equal(soundToggle.label, 'Response Sound');
+  assert.equal(soundToggle.defaultValue, false);
+  assert.ok(packageJson.pebble.messageKeys.indexOf('SpeakerFeedbackEnabled') !== -1);
 });
 
 test('Health Info setting and watch protocol are declared consistently', function() {

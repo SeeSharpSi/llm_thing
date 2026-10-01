@@ -16,6 +16,8 @@ var CACHE_PROTOCOL_NAMES = { 'responses': true, 'chat-completions': true, 'messa
 var s_chat_history = [];
 var s_saved_chat_history = [];
 var s_active_chat_id = null;
+var s_conversation_generation = 0;
+var s_active_completion = null;
 var s_native_unsupported_keys = {};
 var MAX_TOOL_RESULT_CHARS = 6000;
 var MAX_TOOL_RESULTS_TOTAL_CHARS = 12000;
@@ -482,7 +484,88 @@ function rememberChatTurn(settings, userText, assistantText) {
   }
 }
 
+function clearCompletionTimers(context) {
+  var timers;
+  var i;
+
+  if (!context || !context.timers) {
+    return;
+  }
+
+  timers = context.timers.slice();
+  context.timers = [];
+  for (i = 0; i < timers.length; i += 1) {
+    clearTimeout(timers[i].id);
+  }
+}
+
+function removeCompletionTimer(context, timer) {
+  var i;
+
+  if (!context || !context.timers) {
+    return;
+  }
+  for (i = context.timers.length - 1; i >= 0; i -= 1) {
+    if (context.timers[i] === timer) {
+      context.timers.splice(i, 1);
+      return;
+    }
+  }
+}
+
+function scheduleCompletionTimer(context, callback, delayMs) {
+  var timer = { id: null };
+  var fired = false;
+
+  timer.id = setTimeout(function() {
+    fired = true;
+    removeCompletionTimer(context, timer);
+    if (isCurrentCompletion(context)) {
+      callback();
+    }
+  }, delayMs);
+  if (!fired) {
+    context.timers.push(timer);
+  }
+}
+
+function isCurrentCompletion(context) {
+  return !!context && s_active_completion === context &&
+    context.generation === s_conversation_generation &&
+    watch.isCurrentRequest(context.requestId);
+}
+
+function finishCompletionContext(context) {
+  clearCompletionTimers(context);
+  if (s_active_completion !== context) {
+    return;
+  }
+  s_active_completion = null;
+  watch.finishRequestLifecycle(context.requestId);
+}
+
+function failCompletionContext(context, message) {
+  if (!isCurrentCompletion(context)) {
+    return;
+  }
+  watch.sendError(context.requestId, message, function() {
+    finishCompletionContext(context);
+  });
+}
+
+function invalidateConversationGeneration() {
+  var context = s_active_completion;
+
+  s_conversation_generation += 1;
+  s_active_completion = null;
+  if (context) {
+    clearCompletionTimers(context);
+    watch.cancelRequestLifecycle(context.requestId);
+  }
+}
+
 function resetChatHistory() {
+  invalidateConversationGeneration();
   s_chat_history = [];
   s_saved_chat_history = [];
   s_active_chat_id = null;
@@ -500,6 +583,7 @@ function loadSavedChat(chatId) {
     return null;
   }
 
+  invalidateConversationGeneration();
   s_chat_history = copyChatHistory(chat.messages);
   s_saved_chat_history = copyChatHistory(chat.messages);
   s_active_chat_id = chat.id;
@@ -511,6 +595,7 @@ function deleteSavedChat(chatId) {
   var deleted = chatStore.deleteChat(chatId);
 
   if (deleted && s_active_chat_id === String(chatId || '')) {
+    invalidateConversationGeneration();
     s_active_chat_id = null;
     s_saved_chat_history = [];
     opencodeSession.rotateConversationSessionId();
@@ -520,6 +605,7 @@ function deleteSavedChat(chatId) {
 }
 
 function deleteAllSavedChats() {
+  invalidateConversationGeneration();
   chatStore.deleteAllChats();
   s_active_chat_id = null;
   s_saved_chat_history = [];
@@ -793,19 +879,23 @@ function requestModel(settings, conversation, requestId, options, callback) {
   var reasoningSummarySkipped = false;
   var transientRetried = false;
   var plan = buildEndpointPlan(settings);
+  var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
   function finishOnce(error, json, meta) {
     if (done) {
       return;
     }
     done = true;
+    if (!isCurrentCompletion(completionContext)) {
+      return;
+    }
     callback(error, json, meta);
   }
 
   function scheduleTransientRetry(runAttempt, delayMs) {
     transientRetried = true;
-    setTimeout(function() {
-      if (done || !watch.isCurrentRequest(requestId)) {
+    scheduleCompletionTimer(completionContext, function() {
+      if (done) {
         return;
       }
       runAttempt();
@@ -819,6 +909,10 @@ function requestModel(settings, conversation, requestId, options, callback) {
     var requestOptions = copyRequestOptions(options);
     var includeReasoningSummary;
     var body;
+
+    if (!isCurrentCompletion(completionContext)) {
+      return;
+    }
 
     if (skipReasoningSummary) {
       requestOptions.skipReasoningSummary = true;
@@ -847,7 +941,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
       var json;
 
       watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
 
@@ -899,7 +993,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
 
     request.onerror = function() {
       watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
       common.logDebug('llm network error');
@@ -914,7 +1008,7 @@ function requestModel(settings, conversation, requestId, options, callback) {
 
     request.ontimeout = function() {
       watch.untrackXhr(requestId, request);
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
       common.logDebug('llm timeout');
@@ -1875,12 +1969,16 @@ function isNativeToolRequestError(error) {
 
 function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
+  var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
+  if (!isCurrentCompletion(completionContext)) {
+    return;
+  }
   watch.progressSet(requestId, 'thinking', 'tool call limit reached');
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
     var batch;
-    if (!watch.isCurrentRequest(requestId)) {
+    if (!isCurrentCompletion(completionContext)) {
       return;
     }
     if (error) {
@@ -1900,7 +1998,11 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
 
 function completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
+  var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
+  if (!isCurrentCompletion(completionContext)) {
+    return;
+  }
   mcpToolCallCounts = mcpToolCallCounts || {};
   thinkingTrace = thinkingTrace || '';
   remainingToolResultChars = typeof remainingToolResultChars === 'number' ? remainingToolResultChars : MAX_TOOL_RESULTS_TOTAL_CHARS;
@@ -1918,7 +2020,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     var skippedResults;
     var budgetPlan;
 
-    if (!watch.isCurrentRequest(requestId)) {
+    if (!isCurrentCompletion(completionContext)) {
       return;
     }
     if (error) {
@@ -1962,7 +2064,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       common.logDebug('tool loop budget skipped=' + skippedCount + ' runnable=' + toolCalls.length + ' requested=' + originalToolCalls.length + ' remaining=' + remainingToolCalls);
     }
     tools.runToolCalls(requestId, toolCalls, toolMap, function(results) {
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
       results = mergePlannedToolResults(budgetPlan.plan, results);
@@ -1981,21 +2083,28 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
 function requestCompletion(requestId, userText) {
   var settings = common.loadSettings();
   var conversation;
+  var previousContext = s_active_completion;
+  var completionContext;
 
   common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + s_chat_history.length);
+  clearCompletionTimers(previousContext);
   watch.beginRequestLifecycle(requestId);
+  completionContext = {
+    generation: s_conversation_generation,
+    requestId: requestId,
+    timers: []
+  };
+  s_active_completion = completionContext;
   watch.syncWatchSettings(settings);
   watch.progressStart(requestId, 'thinking', '');
 
   if (!settings.Endpoint) {
-    watch.sendError(requestId, 'Endpoint missing. Open settings on phone.');
-    watch.finishRequestLifecycle(requestId);
+    failCompletionContext(completionContext, 'Endpoint missing. Open settings on phone.');
     return;
   }
 
   if (!settings.ApiKey) {
-    watch.sendError(requestId, 'API key missing. Open settings on phone.');
-    watch.finishRequestLifecycle(requestId);
+    failCompletionContext(completionContext, 'API key missing. Open settings on phone.');
     return;
   }
 
@@ -2003,20 +2112,19 @@ function requestCompletion(requestId, userText) {
     common.logDebug('tools disabled maxToolCalls=0');
     conversation = buildConversation(settings, userText, '');
     completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text) {
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
       if (completionError) {
-        watch.sendError(requestId, completionError);
-        watch.finishRequestLifecycle(requestId);
+        failCompletionContext(completionContext, completionError);
         return;
       }
 
       watch.sendResponse(requestId, settings, text, function(sendError) {
-        if (!sendError && watch.isCurrentRequest(requestId)) {
+        if (!sendError && isCurrentCompletion(completionContext)) {
           rememberChatTurn(settings, userText, text);
         }
-        watch.finishRequestLifecycle(requestId);
+        finishCompletionContext(completionContext);
       });
     });
     return;
@@ -2024,12 +2132,11 @@ function requestCompletion(requestId, userText) {
 
   watch.progressSet(requestId, 'Loading tools', 'discovering phone tools');
   tools.discoverPhoneTools(settings, requestId, function(error, discoveredTools, toolMap) {
-    if (!watch.isCurrentRequest(requestId)) {
+    if (!isCurrentCompletion(completionContext)) {
       return;
     }
     if (error) {
-      watch.sendError(requestId, error);
-      watch.finishRequestLifecycle(requestId);
+      failCompletionContext(completionContext, error);
       return;
     }
 
@@ -2038,25 +2145,24 @@ function requestCompletion(requestId, userText) {
     watch.progressDone(requestId, 'Tools loaded', discoveredTools.length + ' tools');
 
     function finishCompletion(completionError, text) {
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
       if (completionError) {
-        watch.sendError(requestId, completionError);
-        watch.finishRequestLifecycle(requestId);
+        failCompletionContext(completionContext, completionError);
         return;
       }
 
       watch.sendResponse(requestId, settings, text, function(sendError) {
-        if (!sendError && watch.isCurrentRequest(requestId)) {
+        if (!sendError && isCurrentCompletion(completionContext)) {
           rememberChatTurn(settings, userText, text);
         }
-        watch.finishRequestLifecycle(requestId);
+        finishCompletionContext(completionContext);
       });
     }
 
     completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, isNativeToolsUnsupported(settings) ? 'text' : 'native', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text, meta) {
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentCompletion(completionContext)) {
         return;
       }
 

@@ -156,6 +156,35 @@ test('memory manager visibility follows its toggle after Clay builds', function(
   assert.deepEqual(managerCalls, ['hide', 'show']);
 });
 
+test('Reset Watch Display restores Response Sound default to disabled', function() {
+  var harness = createHarness();
+  var afterBuild;
+  var resetClick;
+  var values = {};
+  var resetButton = {
+    on: function(event, callback) {
+      assert.equal(event, 'click');
+      resetClick = callback;
+    }
+  };
+  var soundToggle = {
+    config: { defaultValue: false },
+    set: function(value) { values.SpeakerFeedbackEnabled = value; }
+  };
+  var clayContext = {
+    EVENTS: { AFTER_BUILD: 'after-build' },
+    on: function(event, callback) { assert.equal(event, 'after-build'); afterBuild = callback; },
+    getItemById: function(id) { return id === 'ResetWatchDisplay' ? resetButton : null; },
+    getItemByMessageKey: function(key) { return key === 'SpeakerFeedbackEnabled' ? soundToggle : null; }
+  };
+
+  harness.clay.customFn.call(clayContext);
+  afterBuild();
+  resetClick();
+
+  assert.equal(values.SpeakerFeedbackEnabled, false);
+});
+
 test('after build appends the six built-in tool roots into the expander', function() {
   var harness = createHarness();
   var afterBuild;

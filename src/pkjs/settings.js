@@ -30,6 +30,7 @@ var DEFAULT_SETTINGS = {
   ReasoningEffort: '',
   FontSize: 18,
   BuzzStrength: 1,
+  SpeakerFeedbackEnabled: false,
   ScrollLines: 3,
   TouchScrollEnabled: true,
   StartDictationQuickLaunch: false,
@@ -111,6 +112,7 @@ function extend(base, extra) {
   result.HealthToolEnabled = result.HealthToolEnabled === true || result.HealthToolEnabled === 1 || result.HealthToolEnabled === '1';
   result.PebbleMemoryToolEnabled = result.PebbleMemoryToolEnabled === true || result.PebbleMemoryToolEnabled === 1 || result.PebbleMemoryToolEnabled === '1';
   result.StartDictationQuickLaunch = result.StartDictationQuickLaunch === true || result.StartDictationQuickLaunch === 1 || result.StartDictationQuickLaunch === '1';
+  result.SpeakerFeedbackEnabled = result.SpeakerFeedbackEnabled === true || result.SpeakerFeedbackEnabled === 1 || result.SpeakerFeedbackEnabled === '1';
   result.TouchScrollEnabled = result.TouchScrollEnabled === true || result.TouchScrollEnabled === 1 || result.TouchScrollEnabled === '1';
   result.ApiMode = API_MODES.hasOwnProperty(result.ApiMode) ? API_MODES[result.ApiMode] : 'auto';
   result.MaxOutputTokens = clampNumber(result.MaxOutputTokens, 0, 100000, 0);

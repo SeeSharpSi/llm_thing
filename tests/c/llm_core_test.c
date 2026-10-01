@@ -110,6 +110,52 @@ static void test_response_trim(void) {
   EXPECT_TRUE(!llm_response_trim_oldest_turn(buffer, &truncated, '\x03'));
 }
 
+static void test_response_transfer_chunks(void) {
+  LlmResponseTransfer transfer = {0};
+
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_IGNORED);
+  llm_response_transfer_reset(&transfer);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+  EXPECT_EQ_INT(transfer.next_index, 1);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_DUPLICATE);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 2),
+      LLM_RESPONSE_CHUNK_OUT_OF_ORDER);
+  EXPECT_EQ_INT(transfer.next_index, 1);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 1),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+  EXPECT_EQ_INT(transfer.next_index, 2);
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+  EXPECT_EQ_INT(transfer.phase, LLM_RESPONSE_TRANSFER_TERMINAL);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 2),
+      LLM_RESPONSE_CHUNK_IGNORED);
+  EXPECT_TRUE(!llm_response_transfer_finish(&transfer));
+}
+
+static void test_response_transfer_reset_and_finish(void) {
+  LlmResponseTransfer transfer = {0};
+
+  llm_response_transfer_reset(&transfer);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+
+  llm_response_transfer_reset(&transfer);
+  EXPECT_EQ_INT(transfer.phase, LLM_RESPONSE_TRANSFER_RECEIVING);
+  EXPECT_EQ_INT(transfer.next_index, 0);
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+  EXPECT_TRUE(!llm_response_transfer_finish(&transfer));
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_IGNORED);
+
+  llm_response_transfer_reset(&transfer);
+  EXPECT_EQ_INT(transfer.next_index, 0);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+}
+
 static void test_scroll_bounds(void) {
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 100, 32000), 0);
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 500, 32000), -332);
@@ -126,6 +172,8 @@ int main(void) {
   test_response_turn_eviction();
   test_response_truncation();
   test_response_trim();
+  test_response_transfer_chunks();
+  test_response_transfer_reset_and_finish();
   test_scroll_bounds();
 
   if (s_failures != 0) {

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 
 #include "llm_core.h"
+#include "speaker_feedback.h"
 
 #define DICTATION_BUFFER_SIZE 384
 #define RESPONSE_BUFFER_SIZE 8192
@@ -20,6 +21,7 @@
 #define PERSIST_KEY_BACKGROUND_COLOR 11
 #define PERSIST_KEY_PROMPT_BACKGROUND_COLOR 12
 #define PERSIST_KEY_BOLD_TEXT_COLOR 13
+#define PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED 14
 #define TEXT_COLOR_DEFAULT 0x000000
 #define BACKGROUND_COLOR_DEFAULT 0xFFFFFF
 #define PROMPT_BACKGROUND_COLOR_DEFAULT 0xAAAAAA
@@ -169,8 +171,7 @@ static GColor s_background_color;
 static GColor s_prompt_background_color;
 static GColor s_bold_text_color;
 static uint32_t s_request_id;
-static uint32_t s_response_chunk_index;
-static bool s_response_done;
+static LlmResponseTransfer s_response_transfer;
 static uint16_t s_progress_loading_frame;
 static bool s_start_dictation_quick_launch;
 static bool s_launched_from_quick_launch;
@@ -180,6 +181,7 @@ static bool s_progress_mode;
 static bool s_show_input_context_size;
 static bool s_show_output_context_size;
 static bool s_preserve_chats;
+static bool s_speaker_feedback_enabled;
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
 static bool s_home_screen_visible;
@@ -335,6 +337,15 @@ static void prv_apply_buzz_strength(int strength, bool should_persist) {
 
   if (should_persist) {
     persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, s_buzz_strength);
+  }
+}
+
+static void prv_apply_speaker_feedback_enabled(int enabled, bool should_persist) {
+  s_speaker_feedback_enabled = enabled != 0;
+  speaker_feedback_set_enabled(s_speaker_feedback_enabled);
+
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED, s_speaker_feedback_enabled ? 1 : 0);
   }
 }
 
@@ -1836,6 +1847,7 @@ static void prv_send_request(const char *text) {
   }
 
   s_request_id = next_request_id;
+  llm_response_transfer_reset(&s_response_transfer);
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
   s_chat_reset_pending = false;
   prv_append_prompt(text);
@@ -1912,6 +1924,7 @@ static void prv_start_dictation(void) {
   }
 
   prv_set_status("Listening");
+  speaker_feedback_stop();
   DictationSessionStatus status = dictation_session_start(s_dictation_session);
   if (status != DictationSessionStatusSuccess) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "dictation start failed status=%d", status);
@@ -2251,6 +2264,13 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_apply_buzz_strength(prv_int_from_tuple(buzz_strength_t, s_buzz_strength), true);
   }
 
+  Tuple *speaker_feedback_enabled_t = dict_find(iter, MESSAGE_KEY_SpeakerFeedbackEnabled);
+  if (speaker_feedback_enabled_t) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "speaker feedback setting update");
+    prv_apply_speaker_feedback_enabled(prv_int_from_tuple(speaker_feedback_enabled_t,
+        s_speaker_feedback_enabled ? 1 : 0), true);
+  }
+
   Tuple *scroll_lines_t = dict_find(iter, MESSAGE_KEY_ScrollLines);
   if (scroll_lines_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "scroll lines update");
@@ -2421,8 +2441,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_set_status("Receiving");
     prv_show_response_view();
     s_response_truncated = false;
-    s_response_chunk_index = 0;
-    s_response_done = false;
+    llm_response_transfer_reset(&s_response_transfer);
     prv_update_scroll_text();
     prv_scroll_to_latest_prompt(false);
   }
@@ -2482,18 +2501,20 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 
   Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
-  if (chunk_t && !s_response_done) {
+  if (chunk_t) {
     Tuple *chunk_index_t = dict_find(iter, MESSAGE_KEY_ResponseChunkIndex);
-    uint32_t chunk_index = prv_uint32_from_tuple(chunk_index_t, s_response_chunk_index);
+    uint32_t chunk_index = prv_uint32_from_tuple(chunk_index_t,
+        s_response_transfer.next_index);
+    LlmResponseChunkResult chunk_result = llm_response_transfer_accept_chunk(
+        &s_response_transfer, chunk_index);
 
-    if (chunk_index < s_response_chunk_index) {
+    if (chunk_result == LLM_RESPONSE_CHUNK_DUPLICATE) {
       APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored duplicate response chunk index=%lu expected=%lu",
-          (unsigned long)chunk_index, (unsigned long)s_response_chunk_index);
-    } else if (chunk_index > s_response_chunk_index) {
+          (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
+    } else if (chunk_result == LLM_RESPONSE_CHUNK_OUT_OF_ORDER) {
       APP_LOG(APP_LOG_LEVEL_ERROR, "ignored out-of-order response chunk index=%lu expected=%lu",
-          (unsigned long)chunk_index, (unsigned long)s_response_chunk_index);
-    } else {
-      s_response_chunk_index += 1;
+          (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
+    } else if (chunk_result == LLM_RESPONSE_CHUNK_ACCEPTED) {
       APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk index=%lu len=%u",
           (unsigned long)chunk_index, (unsigned int)strlen(chunk_t->value->cstring));
       prv_append_response(chunk_t->value->cstring);
@@ -2501,8 +2522,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 
   Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
-  if (error_t && !s_response_done) {
-    s_response_done = true;
+  if (error_t && llm_response_transfer_finish(&s_response_transfer)) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
     prv_set_status("Error");
     prv_append_response(error_t->value->cstring);
@@ -2510,8 +2530,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 
   Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
-  if (done_t && !s_response_done) {
-    s_response_done = true;
+  if (done_t && llm_response_transfer_finish(&s_response_transfer)) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
     prv_set_status("Done");
     if (s_response[0] == '\0') {
@@ -2521,6 +2540,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
       prv_scroll_to_latest_prompt(false);
     }
     prv_buzz_response_done();
+    speaker_feedback_play_response_done();
   }
 }
 
@@ -2641,6 +2661,7 @@ static void prv_window_load(Window *window) {
 }
 
 static void prv_window_unload(Window *window) {
+  speaker_feedback_stop();
 #if defined(PBL_TOUCH)
   prv_stop_touch_momentum();
   touch_service_unsubscribe();
@@ -2680,6 +2701,8 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_BUZZ_STRENGTH)) {
     s_buzz_strength = prv_normalize_buzz_strength(persist_read_int(PERSIST_KEY_BUZZ_STRENGTH));
   }
+  prv_apply_speaker_feedback_enabled(persist_exists(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) ?
+      persist_read_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) : 0, false);
   if (persist_exists(PERSIST_KEY_SCROLL_LINES)) {
     s_scroll_lines = prv_normalize_scroll_lines(persist_read_int(PERSIST_KEY_SCROLL_LINES));
   }
@@ -2734,6 +2757,7 @@ static void prv_init(void) {
 }
 
 static void prv_deinit(void) {
+  speaker_feedback_stop();
   if (s_quick_launch_dictation_timer) {
     app_timer_cancel(s_quick_launch_dictation_timer);
     s_quick_launch_dictation_timer = NULL;

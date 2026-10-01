@@ -42,6 +42,40 @@ int llm_normalize_scroll_lines(int lines) {
   return LLM_SCROLL_LINES_DEFAULT;
 }
 
+void llm_response_transfer_reset(LlmResponseTransfer *transfer) {
+  if (!transfer) {
+    return;
+  }
+
+  transfer->phase = LLM_RESPONSE_TRANSFER_RECEIVING;
+  transfer->next_index = 0;
+}
+
+LlmResponseChunkResult llm_response_transfer_accept_chunk(LlmResponseTransfer *transfer,
+                                                           uint32_t chunk_index) {
+  if (!transfer || transfer->phase != LLM_RESPONSE_TRANSFER_RECEIVING) {
+    return LLM_RESPONSE_CHUNK_IGNORED;
+  }
+  if (chunk_index < transfer->next_index) {
+    return LLM_RESPONSE_CHUNK_DUPLICATE;
+  }
+  if (chunk_index > transfer->next_index) {
+    return LLM_RESPONSE_CHUNK_OUT_OF_ORDER;
+  }
+
+  transfer->next_index += 1;
+  return LLM_RESPONSE_CHUNK_ACCEPTED;
+}
+
+bool llm_response_transfer_finish(LlmResponseTransfer *transfer) {
+  if (!transfer || transfer->phase != LLM_RESPONSE_TRANSFER_RECEIVING) {
+    return false;
+  }
+
+  transfer->phase = LLM_RESPONSE_TRANSFER_TERMINAL;
+  return true;
+}
+
 size_t llm_safe_utf8_prefix_length(const char *text, size_t length, size_t max_length) {
   size_t prefix_length = length < max_length ? length : max_length;
 

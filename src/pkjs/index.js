@@ -15,6 +15,7 @@ function clayCustomFn() {
   var watchDisplayKeys = [
     'FontSize',
     'BuzzStrength',
+    'SpeakerFeedbackEnabled',
     'ScrollLines',
     'TouchScrollEnabled',
     'TextColor',
