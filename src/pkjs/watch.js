@@ -17,6 +17,10 @@ var s_health_info_request_id = 1;
 var s_send_queue = [];
 var s_send_busy = false;
 var s_in_flight_send = null;
+var s_last_watch_settings = null;
+var s_pending_watch_settings = null;
+var s_pending_watch_settings_force = false;
+var s_sending_watch_settings = null;
 var s_latest_request_id = null;
 var s_active_xhrs = {};
 var s_pending_health_info = {};
@@ -28,6 +32,9 @@ var s_progress = {
   toolHistory: [],
   currentTool: '',
   currentToolRemembered: false,
+  toolExecutions: Object.create(null),
+  activeToolExecutionIds: [],
+  currentToolExecutionId: '',
   inputContextSize: '',
   outputContextSize: ''
 };
@@ -428,29 +435,123 @@ function sendMessage(dict, onSuccess, onFailure) {
   return true;
 }
 
-function syncWatchSettings(settings) {
-  sendMessage({
-    FontSize: settings.FontSize,
-    BuzzStrength: settings.BuzzStrength,
-    SpeakerFeedbackEnabled: settings.SpeakerFeedbackEnabled ? 1 : 0,
-    ScrollLines: settings.ScrollLines,
-    TouchScrollEnabled: settings.TouchScrollEnabled ? 1 : 0,
-    ShowInputContextSize: settings.ShowInputContextSize ? 1 : 0,
-    ShowOutputContextSize: settings.ShowOutputContextSize ? 1 : 0,
-    PreserveChats: settings.PreserveChats ? 1 : 0,
-    StartDictationQuickLaunch: settings.StartDictationQuickLaunch ? 1 : 0,
-    TextColor: settings.TextColor,
-    BackgroundColor: settings.BackgroundColor,
-    PromptBackgroundColor: settings.PromptBackgroundColor,
-    BoldTextColor: settings.BoldTextColor
+function buildWatchSettings(settings) {
+  var normalized = common.extend(common.DEFAULT_SETTINGS, settings || {});
+
+  function colorValue(value, fallback) {
+    var number = parseInt(value, 10);
+    return isNaN(number) || number < 0 ? fallback : number;
+  }
+
+  return {
+    FontSize: normalized.FontSize,
+    BuzzStrength: normalized.BuzzStrength,
+    SpeakerFeedbackEnabled: normalized.SpeakerFeedbackEnabled ? 1 : 0,
+    ScrollLines: normalized.ScrollLines,
+    TouchScrollEnabled: normalized.TouchScrollEnabled ? 1 : 0,
+    ShowInputContextSize: normalized.ShowInputContextSize ? 1 : 0,
+    ShowOutputContextSize: normalized.ShowOutputContextSize ? 1 : 0,
+    PreserveChats: normalized.PreserveChats ? 1 : 0,
+    StartDictationQuickLaunch: normalized.StartDictationQuickLaunch ? 1 : 0,
+    TextColor: colorValue(normalized.TextColor, common.DEFAULT_SETTINGS.TextColor),
+    BackgroundColor: colorValue(normalized.BackgroundColor, common.DEFAULT_SETTINGS.BackgroundColor),
+    PromptBackgroundColor: colorValue(normalized.PromptBackgroundColor, common.DEFAULT_SETTINGS.PromptBackgroundColor),
+    BoldTextColor: colorValue(normalized.BoldTextColor, common.DEFAULT_SETTINGS.BoldTextColor)
+  };
+}
+
+function sameWatchSettings(left, right) {
+  var key;
+
+  if (!left || !right) {
+    return false;
+  }
+  for (key in left) {
+    if (Object.prototype.hasOwnProperty.call(left, key) && left[key] !== right[key]) {
+      return false;
+    }
+  }
+  for (key in right) {
+    if (Object.prototype.hasOwnProperty.call(right, key) && left[key] !== right[key]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sendPendingWatchSettings() {
+  var snapshot;
+  var force;
+
+  if (s_sending_watch_settings || !s_pending_watch_settings) {
+    return;
+  }
+
+  snapshot = s_pending_watch_settings;
+  force = s_pending_watch_settings_force;
+  s_pending_watch_settings = null;
+  s_pending_watch_settings_force = false;
+  if (!force && sameWatchSettings(snapshot, s_last_watch_settings)) {
+    sendPendingWatchSettings();
+    return;
+  }
+
+  s_sending_watch_settings = snapshot;
+  sendMessage(snapshot, function() {
+    s_last_watch_settings = snapshot;
+    s_sending_watch_settings = null;
+    sendPendingWatchSettings();
+  }, function() {
+    s_last_watch_settings = null;
+    s_sending_watch_settings = null;
+    sendPendingWatchSettings();
   });
+}
+
+function syncWatchSettings(settings, force) {
+  var snapshot = buildWatchSettings(settings);
+
+  if (force) {
+    if (!s_pending_watch_settings || !sameWatchSettings(snapshot, s_pending_watch_settings)) {
+      s_pending_watch_settings = snapshot;
+    }
+    s_pending_watch_settings_force = true;
+    sendPendingWatchSettings();
+    return true;
+  }
+
+  if (s_sending_watch_settings && sameWatchSettings(snapshot, s_sending_watch_settings)) {
+    if (s_pending_watch_settings_force) {
+      s_pending_watch_settings = snapshot;
+    } else {
+      s_pending_watch_settings = null;
+    }
+    return true;
+  }
+  if (s_pending_watch_settings && sameWatchSettings(snapshot, s_pending_watch_settings)) {
+    return true;
+  }
+  if (s_pending_watch_settings_force) {
+    s_pending_watch_settings = snapshot;
+    sendPendingWatchSettings();
+    return true;
+  }
+  if (!s_sending_watch_settings && !s_pending_watch_settings &&
+      sameWatchSettings(snapshot, s_last_watch_settings)) {
+    return false;
+  }
+
+  s_pending_watch_settings = snapshot;
+  s_pending_watch_settings_force = false;
+  sendPendingWatchSettings();
+  return true;
 }
 
 function sendReset(requestId, onSuccess, onFailure) {
   sendMessage({ ResponseReset: 1, RequestId: requestId }, onSuccess, onFailure);
 }
 
-function sendWatchText(requestId, text, includeDone, onDone) {
+function sendWatchText(requestId, text, includeDone, onDone, onTransferFailure) {
   var completed = false;
   var value = String(text || '');
 
@@ -466,12 +567,20 @@ function sendWatchText(requestId, text, includeDone, onDone) {
 
   function fail(error) {
     var message = 'Response transfer failed. Try again.';
+    var retryAvailable = false;
 
     if (!isCurrentRequest(requestId)) {
       complete(error || new Error(message));
       return;
     }
-    sendMessage({ ResponseError: message, RequestId: requestId }, function() {
+    if (onTransferFailure) {
+      retryAvailable = onTransferFailure(error || new Error(message), value) === true;
+    }
+    sendMessage({
+      ResponseError: message,
+      RetryAvailable: retryAvailable ? 1 : 0,
+      RequestId: requestId
+    }, function() {
       complete(error || new Error(message));
     }, function() {
       complete(error || new Error(message));
@@ -496,6 +605,7 @@ function sendWatchText(requestId, text, includeDone, onDone) {
     onSuccess: function() {
       complete(null);
     },
+    onTransferFailure: onTransferFailure,
     onFailure: fail
   });
 }
@@ -878,12 +988,42 @@ function progressStart(requestId, current, detail) {
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
   s_progress.currentToolRemembered = false;
+  s_progress.toolExecutions = Object.create(null);
+  s_progress.activeToolExecutionIds = [];
+  s_progress.currentToolExecutionId = '';
   s_progress.inputContextSize = '';
   s_progress.outputContextSize = '';
   sendProgressState(requestId, s_progress.current, s_progress.detail, true);
 }
 
-function progressToolStart(requestId, current, detail) {
+function findActiveToolExecution() {
+  var entry;
+  var i;
+
+  for (i = s_progress.activeToolExecutionIds.length - 1; i >= 0; i -= 1) {
+    entry = s_progress.toolExecutions[s_progress.activeToolExecutionIds[i]];
+    if (entry && !entry.completed) {
+      return { id: s_progress.activeToolExecutionIds[i], entry: entry };
+    }
+  }
+  return null;
+}
+
+function removeActiveToolExecution(executionId) {
+  var i;
+
+  for (i = s_progress.activeToolExecutionIds.length - 1; i >= 0; i -= 1) {
+    if (s_progress.activeToolExecutionIds[i] === executionId) {
+      s_progress.activeToolExecutionIds.splice(i, 1);
+      return;
+    }
+  }
+}
+
+function progressToolStart(requestId, current, detail, toolExecutionId) {
+  var executionKey;
+  var entry;
+
   if (!isCurrentRequest(requestId)) {
     return;
   }
@@ -892,8 +1032,27 @@ function progressToolStart(requestId, current, detail) {
     progressStart(requestId, current, detail);
   }
 
-  s_progress.currentTool = current || 'thinking';
-  s_progress.currentToolRemembered = false;
+  if (toolExecutionId !== undefined && toolExecutionId !== null && String(toolExecutionId)) {
+    executionKey = String(toolExecutionId);
+    entry = s_progress.toolExecutions[executionKey];
+    if (entry && entry.completed) {
+      return;
+    }
+    s_progress.currentTool = current || 'thinking';
+    if (!entry) {
+      entry = { label: s_progress.currentTool, detail: detail || '', completed: false };
+      s_progress.toolExecutions[executionKey] = entry;
+      s_progress.activeToolExecutionIds.push(executionKey);
+    } else {
+      entry.label = s_progress.currentTool;
+      entry.detail = detail || '';
+    }
+    s_progress.currentToolExecutionId = executionKey;
+  } else {
+    s_progress.currentTool = current || 'thinking';
+    s_progress.currentToolExecutionId = '';
+    s_progress.currentToolRemembered = false;
+  }
   progressSet(requestId, current, detail);
 }
 
@@ -940,13 +1099,45 @@ function progressSetContextSizes(requestId, inputText, outputText) {
   sendProgressState(requestId, s_progress.current, s_progress.detail, false);
 }
 
-function progressDone(requestId) {
+function progressDone(requestId, current, detail, toolExecutionId) {
   var toolName;
+  var executionKey;
+  var entry;
+  var active;
 
   if (!isCurrentRequest(requestId) || !s_progress.active || s_progress.requestId !== requestId) {
     return;
   }
 
+  if (toolExecutionId !== undefined && toolExecutionId !== null && String(toolExecutionId)) {
+    executionKey = String(toolExecutionId);
+    entry = s_progress.toolExecutions[executionKey];
+    if (!entry || entry.completed) {
+      return;
+    }
+    entry.completed = true;
+    s_progress.toolHistory.push(entry.label);
+    removeActiveToolExecution(executionKey);
+
+    if (s_progress.currentToolExecutionId === executionKey) {
+      active = findActiveToolExecution();
+      if (active) {
+        s_progress.currentToolExecutionId = active.id;
+        s_progress.currentTool = active.entry.label;
+        s_progress.current = active.entry.label;
+        s_progress.detail = active.entry.detail;
+      } else {
+        s_progress.currentToolExecutionId = executionKey;
+      }
+    }
+    sendProgressState(requestId, s_progress.current, s_progress.detail, false);
+    return;
+  }
+
+  // Preserve the legacy single-tool path without recounting identified runs.
+  if (s_progress.currentToolExecutionId && s_progress.toolExecutions[s_progress.currentToolExecutionId]) {
+    return;
+  }
   toolName = s_progress.currentTool;
   if (toolName && !s_progress.currentToolRemembered) {
     s_progress.toolHistory.push(toolName);
@@ -965,11 +1156,14 @@ function progressStop(requestId) {
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
   s_progress.currentToolRemembered = false;
+  s_progress.toolExecutions = Object.create(null);
+  s_progress.activeToolExecutionIds = [];
+  s_progress.currentToolExecutionId = '';
   s_progress.inputContextSize = '';
   s_progress.outputContextSize = '';
 }
 
-function sendError(requestId, message, onDone) {
+function sendError(requestId, message, onDone, retryAvailable) {
   var completed = false;
 
   function complete(error) {
@@ -985,19 +1179,27 @@ function sendError(requestId, message, onDone) {
   progressStop(requestId);
   common.logDebug('watch error request=' + requestId + ' message=' + String(message).substring(0, 160));
   sendReset(requestId, function() {
-    sendMessage({ ResponseError: String(message).substring(0, CHUNK_SIZE), RequestId: requestId }, function() {
+    sendMessage({
+      ResponseError: String(message).substring(0, CHUNK_SIZE),
+      RetryAvailable: retryAvailable ? 1 : 0,
+      RequestId: requestId
+    }, function() {
       complete(null);
     }, complete);
   }, complete);
 }
 
-function sendResponse(requestId, settings, text, onDone) {
+function sendResponse(requestId, settings, text, onDone, onTransferFailure) {
   var formatted = formatResponseForWatch(text, maxResponseCharsForFontSize(settings));
-  var value = formatted.text;
 
+  common.logDebug('send response request=' + requestId + ' chars=' + formatted.text.length + ' limit=' + maxResponseCharsForFontSize(settings) + ' truncated=' + (formatted.truncated ? 1 : 0));
+  sendPreparedResponse(requestId, formatted.text, onDone, onTransferFailure);
+}
+
+function sendPreparedResponse(requestId, text, onDone, onTransferFailure) {
   progressStop(requestId);
-  common.logDebug('send response request=' + requestId + ' chars=' + value.length + ' limit=' + maxResponseCharsForFontSize(settings) + ' truncated=' + (formatted.truncated ? 1 : 0));
-  sendWatchText(requestId, value, true, onDone);
+  common.logDebug('send prepared response request=' + requestId + ' chars=' + String(text || '').length);
+  sendWatchText(requestId, text, true, onDone, onTransferFailure);
 }
 
 function requestHealthInfo(query, requestId, callback) {
@@ -1099,6 +1301,7 @@ module.exports = {
   progressStop: progressStop,
   sendError: sendError,
   sendResponse: sendResponse,
+  sendPreparedResponse: sendPreparedResponse,
   sendPastChats: sendPastChats,
   sendPastChatsError: sendPastChatsError,
   sendPastChatDeleted: sendPastChatDeleted,

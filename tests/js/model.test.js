@@ -10,6 +10,7 @@ var load = require('./helpers/load_with_stubs');
 var opencodeSession = require('../../src/pkjs/opencode_session');
 
 var modelPath = path.resolve(__dirname, '../../src/pkjs/model');
+var toolsPath = path.resolve(__dirname, '../../src/pkjs/tools');
 var originalSetTimeout = global.setTimeout;
 var originalClearTimeout = global.clearTimeout;
 
@@ -41,8 +42,11 @@ function createHarness(overrides) {
   var trackedXhrs = {};
   var watch = {
     errors: [],
+    retryAvailableErrors: [],
     responses: [],
+    preparedResponses: [],
     progress: [],
+    syncSettings: [],
     canceledRequestIds: [],
     finishedRequestIds: [],
     beginRequestLifecycle: function(id) { currentRequest = id; trackedXhrs[id] = trackedXhrs[id] || []; },
@@ -70,14 +74,15 @@ function createHarness(overrides) {
       var index = requests.indexOf(request);
       if (index !== -1) { requests.splice(index, 1); }
     },
-    syncWatchSettings: function() {},
+    syncWatchSettings: function(value) { watch.syncSettings.push(value); },
     progressStart: function() {},
     progressSet: function(id, title, detail) { watch.progress.push([title, detail]); },
     progressDone: function() {},
     progressToolStart: function() {},
     progressSetContextSizes: function() {},
-    sendError: function(id, message, callback) {
+    sendError: function(id, message, callback, retryAvailable) {
       watch.errors.push(message);
+      watch.retryAvailableErrors.push(retryAvailable === true);
       if (callback) { callback(null); }
     },
     sendResponse: function(id, currentSettings, text, callback) {
@@ -85,10 +90,17 @@ function createHarness(overrides) {
       if (callback) {
         callback();
       }
+    },
+    sendPreparedResponse: function(id, text, callback) {
+      watch.preparedResponses.push(text);
+      watch.responses.push(text);
+      if (callback) {
+        callback(null);
+      }
     }
   };
 
-  var tools = overrides.tools || {
+  var tools = overrides.tools || (overrides.createTools && overrides.createTools(watch)) || {
     discoverPhoneTools: function(currentSettings, id, callback) { callback(null, [], {}); },
     runToolCalls: function(id, calls, map, callback) { callback([]); },
     formatToolCallLabel: function(call) { return call.name || 'tool'; }
@@ -135,12 +147,120 @@ function createHarness(overrides) {
   return { model: model, settings: settings, watch: watch, tools: tools, chatStore: chatStore, endpointCache: endpointCache };
 }
 
+function createRealMcpTools(settings, lifecycleWatch) {
+  var commonStub = {};
+  var watchStub = lifecycleWatch || {
+    isCurrentRequest: function() { return true; },
+    trackXhr: function() { return true; },
+    untrackXhr: function() {},
+    progressToolStart: function() {},
+    progressDone: function() {}
+  };
+
+  Object.keys(common).forEach(function(key) { commonStub[key] = common[key]; });
+  commonStub.loadSettings = function() { return settings; };
+  commonStub.logDebug = function() {};
+  return load.loadWithStubs(toolsPath, {
+    './settings': commonStub,
+    './watch': watchStub
+  });
+}
+
+function runMcpIsErrorModelScenario(useTextFallback) {
+  var message = 'MCP tool failed: access denied for client';
+  var errorEnvelope = JSON.stringify({
+    mcpResult: true,
+    text: message,
+    structuredContent: { code: 'ACCESS_DENIED' }
+  });
+  var settings = common.extend(common.DEFAULT_SETTINGS, {
+    ApiMode: useTextFallback ? 'chat-completions' : 'responses',
+    Endpoint: useTextFallback ? 'https://api.example.test/v1/chat/completions' : 'https://api.example.test/v1/responses',
+    ApiKey: 'test-key',
+    Model: 'test-model',
+    MaxToolCalls: 1,
+    McpServersJson: JSON.stringify([{ enabled: true, label: 'ErrorServer', url: 'https://mcp.example.test' }])
+  });
+  var tools = createRealMcpTools(settings);
+  var harness = createHarness({ settings: settings, tools: tools, useGlobalTimers: true });
+  var providerRequest;
+  var toolRequest;
+  var followUpRequest;
+  var followUpBody;
+  var calls;
+  var error;
+  var i;
+  var item;
+  var content;
+  var marker;
+  var end;
+
+  harness.model.requestCompletion(useTextFallback ? 1201 : 1200, 'Try MCP tool');
+  FakeXMLHttpRequest.instances[0].respond(200, { result: { protocolVersion: '2025-06-18' } });
+  FakeXMLHttpRequest.instances[1].respond(202, '');
+  FakeXMLHttpRequest.instances[2].respond(200, {
+    result: { tools: [{ name: 'fail', description: 'MCP failure', inputSchema: { type: 'object', properties: {} } }] }
+  });
+  providerRequest = FakeXMLHttpRequest.instances[3];
+
+  if (useTextFallback) {
+    providerRequest.respond(400, 'native tools unsupported');
+    assert.equal(FakeXMLHttpRequest.instances.length, 5, 'HTTP 400 retries prompt in text-tool mode');
+    FakeXMLHttpRequest.instances[4].respond(200, {
+      choices: [{ message: { content: '{"tool_calls":[{"id":"error-call","name":"ErrorServer__fail","arguments":{}}]}' } }]
+    });
+    toolRequest = FakeXMLHttpRequest.instances[5];
+  } else {
+    providerRequest.respond(200, {
+      output: [{ type: 'function_call', call_id: 'error-call', name: 'ErrorServer__fail', arguments: '{}' }]
+    });
+    toolRequest = FakeXMLHttpRequest.instances[4];
+  }
+
+  assert.equal(JSON.parse(toolRequest.body).method, 'tools/call');
+  toolRequest.respond(200, {
+    result: {
+      content: [{ type: 'text', text: message }],
+      structuredContent: { code: 'ACCESS_DENIED' },
+      isError: true
+    }
+  });
+  followUpRequest = FakeXMLHttpRequest.last();
+  followUpBody = JSON.parse(followUpRequest.body);
+
+  if (!useTextFallback) {
+    calls = followUpBody.input.filter(function(value) { return value.type === 'function_call_output'; });
+    error = JSON.parse(calls[0].output).error;
+  } else {
+    for (i = 0; i < followUpBody.messages.length; i += 1) {
+      item = followUpBody.messages[i] || {};
+      content = item.content;
+      if (item.role !== 'user' || typeof content !== 'string') { continue; }
+      marker = content.indexOf('Tool results:\n');
+      if (marker === 0) {
+        content = content.substring('Tool results:\n'.length);
+        end = content.indexOf('\nTool call budget exhausted');
+        if (end !== -1) { content = content.substring(0, end); }
+        calls = JSON.parse(content);
+        error = calls[0].error;
+        break;
+      }
+    }
+  }
+
+  assert.equal(errorEnvelope.length, 114);
+  assert.equal(error, errorEnvelope, 'complete MCP message and code survive model error budgeting');
+  followUpRequest.respond(200, { output_text: 'Handled MCP error' });
+  assert.deepEqual(harness.watch.responses, ['Handled MCP error']);
+}
+
 test.afterEach(function() {
   delete global.XMLHttpRequest;
   global.setTimeout = originalSetTimeout;
   global.clearTimeout = originalClearTimeout;
   opencodeSession.resetForTests();
   load.clearModule(modelPath);
+  load.clearModule(toolsPath);
 });
 
 test('Responses request uses input shape, timeout, auth, and parsed output', function() {
@@ -159,6 +279,7 @@ test('Responses request uses input shape, timeout, auth, and parsed output', fun
   assert.deepEqual(body.input[0].content, [{ type: 'input_text', text: body.input[0].content[0].text }]);
   assert.deepEqual(body.input[1].content, [{ type: 'input_text', text: 'Hello' }]);
   assert.equal(body.messages, undefined);
+  assert.deepEqual(harness.watch.syncSettings, [], 'prompts do not trigger full watch settings sync');
 
   request.respond(200, { output_text: 'Watch answer' });
   assert.deepEqual(harness.watch.responses, ['Watch answer']);
@@ -359,6 +480,118 @@ test('native tool result is sent into follow-up Responses request', function() {
   assert.deepEqual(harness.watch.responses, ['Final']);
 });
 
+test('structured null tool result remains visible through model budget handling', function() {
+  var tools = {
+    discoverPhoneTools: function(settings, id, callback) {
+      callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
+        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      });
+    },
+    runToolCalls: function(id, calls, map, callback) {
+      callback([{ id: calls[0].id, call_id: calls[0].call_id, name: 'lookup', result: 'null', _structuredResult: true }]);
+    },
+    formatToolCallLabel: function(call) { return call.name || 'tool'; }
+  };
+  var harness = createHarness({ settings: { MaxToolCalls: 1 }, tools: tools });
+
+  harness.model.requestCompletion(111, 'Use tool');
+  FakeXMLHttpRequest.instances[0].respond(200, {
+    output: [{ type: 'function_call', call_id: 'null-call', name: 'lookup', arguments: '{}' }]
+  });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 2);
+  var followUp = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+  var output = followUp.input.filter(function(item) { return item.type === 'function_call_output'; })[0];
+  assert.deepEqual(JSON.parse(output.output), { result: null });
+});
+
+test('MCP isError message and code survive native and text-tool model flows', function() {
+  runMcpIsErrorModelScenario(false);
+  runMcpIsErrorModelScenario(true);
+});
+
+test('only trusted MCP envelopes are reduced; provider lookalikes retain extra fields', function() {
+  var definitions = [];
+  var toolMap = {};
+  var names = ['structured', 'plain', 'largeStructured', 'adapter'];
+  var lookalike = {
+    mcpResult: true,
+    text: 'provider-owned text',
+    structuredContent: { value: 1 },
+    extra: 'must survive'
+  };
+  var results = {};
+  var tools;
+  var harness;
+  var i;
+  var outputs;
+  var providerResults;
+
+  tools = {
+    discoverPhoneTools: function(settings, id, callback) { callback(null, definitions, toolMap); },
+    runToolCalls: function(id, calls, map, callback) {
+      callback(calls.map(function(call) {
+        if (call.name === 'structured') {
+          return { id: call.id, call_id: call.call_id, name: call.name, result: JSON.stringify(lookalike), _structuredResult: true };
+        }
+        if (call.name === 'plain') {
+          return { id: call.id, call_id: call.call_id, name: call.name, result: JSON.stringify(lookalike) };
+        }
+        if (call.name === 'largeStructured') {
+          return {
+            id: call.id,
+            call_id: call.call_id,
+            name: call.name,
+            result: JSON.stringify({
+              mcpResult: true,
+              text: new Array(7001).join('x'),
+              structuredContent: { value: 2 },
+              extra: 'provider data'
+            }),
+            _structuredResult: true
+          };
+        }
+        return {
+          id: call.id,
+          call_id: call.call_id,
+          name: call.name,
+          result: JSON.stringify({
+            mcpResult: true,
+            text: new Array(7001).join('x'),
+            structuredContent: { value: 3 }
+          }),
+          _structuredResult: true,
+          _mcpResultEnvelope: true
+        };
+      }));
+    },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  for (i = 0; i < names.length; i += 1) {
+    definitions.push({ name: names[i], description: names[i], parameters: { type: 'object', properties: {} } });
+    toolMap[names[i]] = { kind: 'builtin', parameters: { type: 'object', properties: {} } };
+  }
+  harness = createHarness({ settings: { MaxToolCalls: 4 }, tools: tools });
+  harness.model.requestCompletion(112, 'Use all tools');
+  FakeXMLHttpRequest.instances[0].respond(200, { output: names.map(function(name, index) {
+    return { type: 'function_call', call_id: 'lookalike-' + index, name: name, arguments: '{}' };
+  }) });
+
+  outputs = JSON.parse(FakeXMLHttpRequest.instances[1].body).input.filter(function(item) {
+    return item.type === 'function_call_output';
+  });
+  for (i = 0; i < outputs.length; i += 1) {
+    results[names[i]] = JSON.parse(outputs[i].output).result;
+  }
+  assert.equal(results.structured.extra, 'must survive', 'structured provider object keeps unknown key');
+  assert.equal(JSON.parse(results.plain).extra, 'must survive', 'plain JSON-looking text stays opaque');
+  assert.match(results.largeStructured.error, /per-result limit exceeded/, 'untrusted lookalike is not rebuilt as adapter envelope');
+  assert.equal(results.adapter.mcpResult, true);
+  assert.equal(results.adapter.structuredContent.value, 3);
+  assert.equal(results.adapter.textTruncated, true, 'trusted adapter envelope can be reduced within budget');
+  assert.equal(results.adapter._mcpResultEnvelope, undefined, 'internal provenance flag is not exposed to model');
+});
+
 test('tool results are capped by per-result and total context budgets', function() {
   var toolMap = {};
   var definitions = [];
@@ -393,10 +626,305 @@ test('tool results are capped by per-result and total context budgets', function
   followUp = JSON.parse(FakeXMLHttpRequest.instances[1].body);
   outputs = followUp.input.filter(function(item) { return item.type === 'function_call_output'; });
   assert.equal(JSON.parse(outputs[0].output).result.length, 6000);
-  assert.equal(JSON.parse(outputs[1].output).result.length, 6000);
-  assert.match(JSON.parse(outputs[2].output).error, /total tool-result budget exhausted/);
+  assert.equal(JSON.parse(outputs[1].output).result.length, 5846);
+  assert.equal(JSON.parse(outputs[2].output).result.length, 96);
+  assert.match(JSON.parse(outputs[1].output).result, /\[truncated\]$/);
+  assert.match(JSON.parse(outputs[2].output).result, /\[truncated\]$/);
+  var emittedChars = JSON.parse(outputs[0].output).result.length +
+    JSON.parse(outputs[1].output).result.length + JSON.parse(outputs[2].output).result.length +
+    'Tool call budget exhausted. Answer using gathered results.'.length;
+  assert.equal(emittedChars, 12000);
   FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'Final' });
   assert.deepEqual(harness.watch.responses, ['Final']);
+});
+
+test('large structured tool results stay parseable and obey budgets across provider formats', function() {
+  var providers = ['responses', 'chat', 'messages', 'text'];
+  var fullResult = JSON.stringify({
+    mcpResult: true,
+    text: 'Readable MCP text remains alongside data.',
+    structuredContent: { data: new Array(5590).join('x') }
+  });
+  var oversizedResult = JSON.stringify({
+    mcpResult: true,
+    text: 'Readable text survives budget reduction.',
+    structuredContent: { data: new Array(7001).join('y') }
+  });
+  var i;
+  assert.ok(fullResult.length > 5600 && fullResult.length < 6000);
+  assert.ok(oversizedResult.length > 6000);
+
+  function responseFor(provider, calls) {
+    if (provider === 'chat') {
+      return { choices: [{ message: { tool_calls: calls.map(function(call) {
+        return { id: call.id, type: 'function', function: { name: call.name, arguments: '{}' } };
+      }) } }] };
+    }
+    if (provider === 'messages') {
+      return { content: calls.map(function(call) { return { type: 'tool_use', id: call.id, name: call.name, input: {} }; }) };
+    }
+    if (provider === 'text') {
+      return { output_text: JSON.stringify({ tool_calls: calls.map(function(call) {
+        return { id: call.id, name: call.name, arguments: {} };
+      }) }) };
+    }
+    return { output: calls.map(function(call) {
+      return { type: 'function_call', call_id: call.id, name: call.name, arguments: '{}' };
+    }) };
+  }
+
+  function outputsFrom(provider, requestBody) {
+    var body = JSON.parse(requestBody);
+    var outputs = [];
+    var i;
+    var item;
+    var content;
+    if (provider === 'responses') {
+      for (i = 0; i < body.input.length; i += 1) {
+        item = body.input[i];
+        if (item.type === 'function_call_output') { outputs.push(JSON.parse(item.output)); }
+      }
+      return outputs;
+    }
+    if (provider === 'chat') {
+      for (i = 0; i < body.messages.length; i += 1) {
+        item = body.messages[i];
+        if (item.role === 'tool') { outputs.push(JSON.parse(item.content)); }
+      }
+      return outputs;
+    }
+    if (provider === 'messages') {
+      content = body.messages[body.messages.length - 1].content;
+      for (i = 0; i < content.length; i += 1) {
+        if (content[i].type === 'tool_result') { outputs.push(JSON.parse(content[i].content)); }
+      }
+      return outputs;
+    }
+    for (i = 0; i < body.input.length; i += 1) {
+      item = body.input[i];
+      if (item.role === 'user') {
+        if (typeof item.content === 'string' && item.content.indexOf('Tool results:\n') === 0) {
+          content = item.content;
+        } else if (item.content && item.content.length) {
+          content = '';
+          for (var partIndex = 0; partIndex < item.content.length; partIndex += 1) {
+            if (item.content[partIndex].text) { content += item.content[partIndex].text; }
+          }
+        } else {
+          content = '';
+        }
+        if (content.indexOf('Tool results:\n') === 0) {
+          var endAt;
+          content = content.substring('Tool results:\n'.length);
+          endAt = content.indexOf('\nUse these results');
+          if (endAt === -1) { endAt = content.indexOf('\nTool call budget exhausted'); }
+          if (endAt !== -1) { content = content.substring(0, endAt); }
+          return JSON.parse(content);
+        }
+      }
+    }
+    return outputs;
+  }
+
+  for (i = 0; i < providers.length; i += 1) {
+    (function(provider) {
+      var definitions = [];
+      var toolMap = {};
+      var names = ['lookup1', 'lookup2', 'lookup3'];
+      var calls = [];
+      var tools = {
+        discoverPhoneTools: function(settings, requestId, callback) { callback(null, definitions, toolMap); },
+        runToolCalls: function(requestId, requested, map, callback) {
+          callback(requested.map(function(call, index) {
+            return {
+              id: call.id || call.call_id,
+              call_id: call.call_id || call.id,
+              name: call.name,
+              result: index === 2 ? oversizedResult : fullResult,
+              _structuredResult: true,
+              _mcpResultEnvelope: true
+            };
+          }));
+        },
+        formatToolCallLabel: function(call) { return call.name; }
+      };
+      var settings = { MaxToolCalls: 3 };
+      var endpoint = 'https://api.example.test/v1/responses';
+      var harness;
+      var outputs;
+      var callIndex;
+
+      if (provider === 'chat') {
+        settings.ApiMode = 'chat-completions';
+        endpoint = 'https://api.example.test/v1/chat/completions';
+      } else if (provider === 'messages') {
+        settings.ApiMode = 'messages';
+        endpoint = 'https://api.anthropic.example.test/v1/messages';
+      }
+      settings.Endpoint = endpoint;
+      for (callIndex = 0; callIndex < names.length; callIndex += 1) {
+        definitions.push({ name: names[callIndex], description: 'Lookup', parameters: { type: 'object', properties: {} } });
+        toolMap[names[callIndex]] = { kind: 'builtin', parameters: { type: 'object', properties: {} } };
+        calls.push({ id: 'call-' + (callIndex + 1), name: names[callIndex] });
+      }
+      harness = createHarness({ settings: settings, tools: tools });
+      harness.model.requestCompletion(110 + providers.indexOf(provider), 'Use structured tools');
+      FakeXMLHttpRequest.instances[0].respond(200, responseFor(provider, calls));
+      assert.equal(FakeXMLHttpRequest.instances.length, 2, provider + ' sends one follow-up request');
+      outputs = outputsFrom(provider, FakeXMLHttpRequest.instances[1].body);
+      assert.equal(outputs.length, 3, provider + ' returns every tool result');
+       assert.equal(outputs[0].result.text, 'Readable MCP text remains alongside data.', provider + ' keeps mixed text');
+       assert.equal(outputs[0].result.structuredContent.data.length, 5589, provider + ' keeps first structured JSON intact');
+       assert.equal(outputs[1].result.text, 'Readable MCP text remains alongside data.', provider + ' keeps mixed text');
+       assert.equal(outputs[1].result.structuredContent.data.length, 5589, provider + ' keeps second structured JSON intact');
+       assert.match(outputs[2].result.structuredContent.error, /omitted/);
+       assert.equal(outputs[2].result.text, 'Readable text survives budget reduction.', provider + ' keeps readable text when structure exceeds remaining budget');
+      var payloadChars = 0;
+      outputs.forEach(function(output) {
+        payloadChars += output.error ? output.error.length : JSON.stringify(output.result).length;
+      });
+      payloadChars += 'Tool call budget exhausted. Answer using gathered results.'.length;
+       assert.ok(payloadChars <= 12000, provider + ' error/omission payloads count against total budget');
+       assert.equal(JSON.parse(JSON.stringify(outputs[0])).result.structuredContent.data.length, 5589, provider + ' output remains serializable');
+    }(providers[i]));
+  }
+});
+
+test('oversized structured output becomes valid omission while plain text still truncates', function() {
+  var definitions = [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }];
+  var toolMap = { lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } } };
+  var tools = {
+    discoverPhoneTools: function(settings, id, callback) { callback(null, definitions, toolMap); },
+    runToolCalls: function(id, calls, map, callback) {
+      callback([
+        { id: 'structured', call_id: 'structured', name: 'lookup', result: JSON.stringify({ data: new Array(7001).join('x') }), _structuredResult: true },
+        { id: 'plain', call_id: 'plain', name: 'lookup', result: new Array(7001).join('p') }
+      ]);
+    },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  var harness = createHarness({ settings: { MaxToolCalls: 2 }, tools: tools });
+  harness.model.requestCompletion(111, 'Use tool');
+  FakeXMLHttpRequest.instances[0].respond(200, { output: [
+    { type: 'function_call', call_id: 'structured', name: 'lookup', arguments: '{}' },
+    { type: 'function_call', call_id: 'plain', name: 'lookup', arguments: '{}' }
+  ] });
+  var followUp = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+  var outputs = followUp.input.filter(function(item) { return item.type === 'function_call_output'; });
+  var structured = JSON.parse(outputs[0].output);
+  var plain = JSON.parse(outputs[1].output);
+  assert.match(structured.result.error, /per-result limit exceeded/);
+  assert.equal(plain.result.length, 6000);
+  assert.match(plain.result, /\[truncated\]$/);
+});
+
+test('tool-result reserve preserves complete errors at exact aggregate boundary across rounds', function() {
+  var definitions = [];
+  var toolMap = {};
+  var names = ['lookup1', 'lookup2', 'lookup3', 'lookup4'];
+  var fullError = new Array(97).join('E');
+  var tools = {
+    discoverPhoneTools: function(settings, requestId, callback) { callback(null, definitions, toolMap); },
+    runToolCalls: function(requestId, calls, map, callback) {
+      callback(calls.map(function(call) {
+        if (call.name === 'lookup1' || call.name === 'lookup2') {
+          return { id: call.id, call_id: call.call_id, name: call.name, result: new Array(7001).join('s') };
+        }
+        return { id: call.id, call_id: call.call_id, name: call.name, error: fullError };
+      }));
+    },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  var harness;
+  var i;
+  var firstFollowUp;
+  var secondFollowUp;
+  var outputs;
+  var outputChars;
+  for (i = 0; i < names.length; i += 1) {
+    definitions.push({ name: names[i], description: names[i], parameters: { type: 'object', properties: {} } });
+    toolMap[names[i]] = { kind: 'builtin', parameters: { type: 'object', properties: {} } };
+  }
+  harness = createHarness({ settings: { MaxToolCalls: 4 }, tools: tools });
+  harness.model.requestCompletion(112, 'Use four tools');
+  FakeXMLHttpRequest.instances[0].respond(200, { output: [
+    { type: 'function_call', call_id: 'call-1', name: 'lookup1', arguments: '{}' },
+    { type: 'function_call', call_id: 'call-2', name: 'lookup2', arguments: '{}' }
+  ] });
+
+  firstFollowUp = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+  outputs = firstFollowUp.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(JSON.parse(outputs[0].output).result.length, 6000);
+  assert.equal(JSON.parse(outputs[1].output).result.length, 5750);
+  assert.match(JSON.parse(outputs[0].output).result, /\[truncated\]$/);
+  assert.match(JSON.parse(outputs[1].output).result, /\[truncated\]$/);
+
+  FakeXMLHttpRequest.instances[1].respond(200, { output: [
+    { type: 'function_call', call_id: 'call-3', name: 'lookup3', arguments: '{}' },
+    { type: 'function_call', call_id: 'call-4', name: 'lookup4', arguments: '{}' }
+  ] });
+  secondFollowUp = JSON.parse(FakeXMLHttpRequest.instances[2].body);
+  outputs = secondFollowUp.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(outputs.length, 4);
+  assert.equal(JSON.parse(outputs[2].output).error, fullError);
+  assert.equal(JSON.parse(outputs[3].output).error, fullError);
+  outputChars = JSON.parse(outputs[0].output).result.length +
+    JSON.parse(outputs[1].output).result.length +
+    JSON.parse(outputs[2].output).error.length +
+    JSON.parse(outputs[3].output).error.length +
+    'Tool call budget exhausted. Answer using gathered results.'.length;
+  assert.equal(outputChars, 12000);
+  FakeXMLHttpRequest.instances[2].respond(200, { output_text: 'Done' });
+  assert.deepEqual(harness.watch.responses, ['Done']);
+});
+
+test('many tool errors and skipped-call errors share bounded aggregate budget', function() {
+  var definitions = [];
+  var toolMap = {};
+  var longError = new Array(1001).join('X');
+  var tools;
+  var harness;
+  var i;
+  var results;
+  var body;
+  var outputs;
+  var totalErrorChars = 0;
+  for (i = 0; i < 8; i += 1) {
+    var name = 'lookup' + i;
+    definitions.push({ name: name, description: name, parameters: { type: 'object', properties: {} } });
+    toolMap[name] = { kind: 'builtin', parameters: { type: 'object', properties: {} } };
+  }
+  tools = {
+    discoverPhoneTools: function(settings, requestId, callback) { callback(null, definitions, toolMap); },
+    runToolCalls: function(requestId, calls, map, callback) {
+      callback(calls.map(function(call) {
+        return { id: call.id, call_id: call.call_id, name: call.name, error: longError };
+      }));
+    },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  harness = createHarness({ settings: { MaxToolCalls: 4 }, tools: tools });
+  harness.model.requestCompletion(113, 'Use eight tools');
+  FakeXMLHttpRequest.instances[0].respond(200, { output: definitions.map(function(definition, index) {
+    return { type: 'function_call', call_id: 'call-' + index, name: definition.name, arguments: '{}' };
+  }) });
+
+  body = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+  outputs = body.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(outputs.length, 8);
+  outputs.forEach(function(item, index) {
+    var error = JSON.parse(item.output).error;
+    if (index < 4) {
+      assert.equal(error, longError, 'current error may consume unreserved data after minimum slots are protected');
+    } else {
+      assert.equal(error, 'Tool call budget exhausted');
+    }
+    totalErrorChars += error.length;
+  });
+  totalErrorChars += 'Tool call budget exhausted. Answer using gathered results.'.length;
+  assert.ok(totalErrorChars <= 12000);
+  assert.notEqual(JSON.stringify(body.input).indexOf('Tool call budget exhausted. Answer using gathered results.'), -1,
+    'cap notice stays fixed-size and does not include growing skipped-call counts');
 });
 
 test('ShowThinking false removes well-formed <think> blocks from answers', function() {
@@ -755,6 +1283,53 @@ test('native tool 400 caches unsupported so next prompt uses text mode directly'
   assert.equal(secondFirst.tools, undefined, 'second prompt skipped native attempt');
   FakeXMLHttpRequest.instances[2].respond(200, { output_text: 'answer two' });
   assert.deepEqual(harness.watch.responses, ['answer one', 'answer two']);
+});
+
+test('Timeline native and text guidance consistently separates creation from editing', function() {
+  var definitions = [
+    { name: 'pebble_timeline_create_pin', description: 'Create a new pin.', parameters: { type: 'object', properties: {} } },
+    { name: 'pebble_timeline_create_reminder', description: 'Create a new reminder.', parameters: { type: 'object', properties: {} } },
+    { name: 'pebble_timeline_list_pins', description: 'List editable pins.', parameters: { type: 'object', properties: {} } },
+    { name: 'pebble_timeline_edit_pin', description: 'Edit an existing pin; only supplied fields change.', parameters: { type: 'object', properties: {} } }
+  ];
+  var toolMap = {};
+  var tools = {
+    discoverPhoneTools: function(settings, requestId, callback) { callback(null, definitions, toolMap); },
+    runToolCalls: function(requestId, calls, map, callback) { callback([]); },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  var harness = createHarness({ settings: { MaxToolCalls: 5 }, tools: tools });
+  var nativeBody;
+  var nativeSystem;
+  var textBody;
+  var textSystem;
+  var expectedNames = definitions.map(function(tool) { return tool.name; });
+
+  expectedNames.forEach(function(name) { toolMap[name] = { kind: 'builtin', parameters: { type: 'object', properties: {} } }; });
+  harness.model.requestCompletion(64, 'Change calendar event');
+  nativeBody = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+  nativeSystem = nativeBody.input[0].content[0].text;
+  assert.deepEqual(nativeBody.tools.map(function(tool) { return tool.name; }), expectedNames);
+  assert.match(nativeSystem, /pebble_timeline_create_pin/);
+  assert.match(nativeSystem, /pebble_timeline_create_reminder/);
+  assert.match(nativeSystem, /scheduled Pebble Timeline reminder notification attached to a pin, not an OS\/system alarm/i);
+  assert.match(nativeSystem, /alarm request.*explain this limitation/i);
+  assert.match(nativeSystem, /pebble_timeline_edit_pin/);
+  assert.match(nativeSystem, /Only supplied fields change/);
+  assert.match(nativeSystem, /Local acceptance does not confirm watch delivery/i);
+  assert.doesNotMatch(nativeSystem, /watch delivery (?:is )?confirmed/i);
+  assert.doesNotMatch(nativeSystem, /pebble_timeline_create_or_update_pin/);
+
+  FakeXMLHttpRequest.instances[0].respond(400, 'no native tools');
+  textBody = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+  textSystem = textBody.input[0].content[0].text;
+  assert.match(textSystem, /Available tools:/);
+  expectedNames.forEach(function(name) { assert.ok(textSystem.indexOf(name) !== -1, name + ' appears in text guidance'); });
+  assert.match(textSystem, /not an OS\/system alarm/i);
+  assert.match(textSystem, /Local acceptance does not confirm watch delivery/i);
+  assert.doesNotMatch(textSystem, /pebble_timeline_create_or_update_pin/);
+  FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'Updated.' });
+  assert.deepEqual(harness.watch.responses, ['Updated.']);
 });
 
 test('native tool 429 is not cached unsupported and retries transiently', function() {
@@ -1587,4 +2162,569 @@ test('reset clears transient retry timer and next OpenCode request uses rotated 
   } finally {
     timers.restore();
   }
+});
+
+test('cancel aborts current model XHR, suppresses late response, and is idempotent', function() {
+  var harness = createHarness({ settings: { MaxToolCalls: 0 } });
+  var request;
+
+  harness.model.requestCompletion(660, 'cancel this');
+  request = FakeXMLHttpRequest.last();
+  assert.equal(harness.model.cancelCompletion(660), true);
+  assert.equal(request.aborted, true);
+  assert.equal(harness.model.cancelCompletion(660), false, 'duplicate cancel is ignored');
+  request.respond(200, { output_text: 'late answer' });
+
+  assert.deepEqual(harness.watch.responses, []);
+  assert.deepEqual(harness.watch.errors, []);
+  assert.deepEqual(harness.watch.canceledRequestIds, [660]);
+});
+
+test('cancel clears scheduled model retry timer before another HTTP attempt', function() {
+  var timers = installFakeTimers();
+  var harness;
+
+  try {
+    harness = createHarness({
+      useGlobalTimers: true,
+      settings: { ApiMode: 'responses', MaxToolCalls: 0 }
+    });
+    harness.model.requestCompletion(661, 'cancel retry');
+    FakeXMLHttpRequest.last().respond(429, 'rate limited', { 'Retry-After': '5' });
+    assert.equal(timers.timers.length, 1);
+    assert.equal(harness.model.cancelCompletion(661), true);
+    assert.equal(timers.timers[0].cleared, true);
+    timers.runAll();
+    assert.equal(FakeXMLHttpRequest.instances.length, 1);
+    assert.deepEqual(harness.watch.errors, []);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('cancel aborts MCP discovery request and prevents later discovery stages', function() {
+  var timers = installFakeTimers();
+  var settings = common.extend(common.DEFAULT_SETTINGS, {
+    Endpoint: 'https://api.example.test/v1/responses',
+    ApiKey: 'test-key',
+    Model: 'test-model',
+    MaxToolCalls: 2,
+    McpServersJson: JSON.stringify([{ enabled: true, label: 'Server', url: 'https://mcp.example.test' }])
+  });
+  var harness;
+  var request;
+
+  try {
+    harness = createHarness({
+      useGlobalTimers: true,
+      settings: settings,
+      createTools: function(watch) { return createRealMcpTools(settings, watch); }
+    });
+    harness.model.requestCompletion(662, 'cancel MCP discovery');
+    request = FakeXMLHttpRequest.last();
+    assert.match(request.url, /mcp\.example\.test/);
+    assert.equal(harness.model.cancelCompletion(662), true);
+    assert.equal(request.aborted, true);
+    request.respond(200, { result: { protocolVersion: '2025-06-18' } });
+    timers.runAll();
+    assert.equal(FakeXMLHttpRequest.instances.length, 1);
+    assert.deepEqual(harness.watch.responses, []);
+    assert.deepEqual(harness.watch.errors, []);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('setup failure retries with corrected settings and model failure retries same user turn', function() {
+  var setupHarness = createHarness({ settings: { Endpoint: '', MaxToolCalls: 0 } });
+
+  setupHarness.model.requestCompletion(670, 'setup prompt');
+  assert.deepEqual(setupHarness.watch.retryAvailableErrors, [true]);
+  setupHarness.settings.Endpoint = 'https://api.example.test/v1/responses';
+  assert.equal(setupHarness.model.retryCompletion(671, 670), true);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1);
+  assert.deepEqual(JSON.parse(FakeXMLHttpRequest.last().body).input[1].content[0].text,
+      'setup prompt');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'setup fixed' });
+
+  var modelHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  modelHarness.model.requestCompletion(672, 'same prompt');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  assert.deepEqual(modelHarness.watch.retryAvailableErrors, [true]);
+  assert.equal(modelHarness.model.retryCompletion(673, 672), true);
+  assert.equal(JSON.parse(FakeXMLHttpRequest.last().body).input[1].content[0].text,
+      'same prompt');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'retried answer' });
+  assert.deepEqual(modelHarness.watch.responses, ['retried answer']);
+  assert.deepEqual(modelHarness.watch.finishedRequestIds, [672, 673]);
+});
+
+test('before-tools retry accepts changed tool settings and rediscovers against original history', function() {
+  var discoveries = [];
+  var tools = {
+    discoverPhoneTools: function(settings, requestId, callback) {
+      var name = settings.WebSearchEnabled ? 'fresh_web_tool' : 'old_web_tool';
+      var definition = { name: name, description: name, parameters: { type: 'object', properties: {} } };
+      var map = {};
+      discoveries.push({
+        MaxToolCalls: settings.MaxToolCalls,
+        WebSearchEnabled: settings.WebSearchEnabled,
+        McpServersJson: settings.McpServersJson
+      });
+      map[name] = { kind: 'builtin', parameters: definition.parameters };
+      callback(null, [definition], map);
+    },
+    runToolCalls: function(requestId, calls, map, callback) { callback([]); },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+  var harness = createHarness({
+    settings: { ApiMode: 'responses', MaxToolCalls: 0 },
+    tools: tools
+  });
+  var retryBody;
+
+  harness.model.requestCompletion(674, 'First turn');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'First answer' });
+
+  harness.settings.MaxToolCalls = 1;
+  harness.settings.WebSearchEnabled = false;
+  harness.settings.McpServersJson = '[]';
+  harness.model.requestCompletion(675, 'Retry this turn');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized before tool use');
+  assert.deepEqual(discoveries, [{ MaxToolCalls: 1, WebSearchEnabled: false, McpServersJson: '[]' }]);
+
+  harness.settings.MaxToolCalls = 4;
+  harness.settings.WebSearchEnabled = true;
+  harness.settings.McpServersJson = JSON.stringify([
+    { enabled: true, label: 'Fresh', url: 'https://fresh.example.test' }
+  ]);
+  assert.equal(harness.model.retryCompletion(676, 675), true);
+  assert.deepEqual(discoveries[1], {
+    MaxToolCalls: 4,
+    WebSearchEnabled: true,
+    McpServersJson: harness.settings.McpServersJson
+  });
+
+  retryBody = JSON.parse(FakeXMLHttpRequest.last().body);
+  assert.ok(retryBody.tools.some(function(tool) { return tool.name === 'fresh_web_tool'; }));
+  assert.ok(!retryBody.tools.some(function(tool) { return tool.name === 'old_web_tool'; }));
+  assert.deepEqual(retryBody.input.slice(1), [
+    { role: 'user', content: [{ type: 'input_text', text: 'First turn' }] },
+    { role: 'assistant', content: [{ type: 'output_text', text: 'First answer' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Retry this turn' }] }
+  ]);
+});
+
+test('stale retry, canceled retry, and new prompt cannot reuse a failed request capsule', function() {
+  var staleHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  staleHarness.model.requestCompletion(680, 'failed');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  assert.equal(staleHarness.model.retryCompletion(682, 681), false);
+  assert.equal(staleHarness.model.retryCompletion(682, 680), true);
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'ok' });
+  assert.equal(staleHarness.model.retryCompletion(683, 680), false,
+      'old terminal request cannot retry after successful retry');
+
+  var activeHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  activeHarness.model.requestCompletion(679, 'keep active request');
+  var activeXhr = FakeXMLHttpRequest.last();
+  assert.equal(activeHarness.model.retryCompletion(681, 679), false,
+      'invalid retry cannot replace unrelated active completion');
+  assert.equal(activeXhr.aborted, false);
+  activeXhr.respond(200, { output_text: 'active request survived' });
+  assert.deepEqual(activeHarness.watch.responses, ['active request survived']);
+
+  var cancelHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  cancelHarness.model.requestCompletion(684, 'failed then canceled');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  assert.equal(cancelHarness.model.cancelCompletion(684), true);
+  assert.equal(cancelHarness.model.retryCompletion(685, 684), false);
+  assert.equal(cancelHarness.model.retryCompletion(686, 684), false);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1,
+      'repeated canceled retries start no model request');
+
+  var newPromptHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  newPromptHarness.model.requestCompletion(686, 'failed');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  newPromptHarness.model.requestCompletion(687, 'new prompt');
+  assert.equal(newPromptHarness.model.retryCompletion(688, 686), false);
+  assert.equal(FakeXMLHttpRequest.instances.length, 2);
+
+  var expiredHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  expiredHarness.model.requestCompletion(689, 'expired');
+  FakeXMLHttpRequest.last().respond(401, 'unauthorized');
+  assert.equal(expiredHarness.watch.retryAvailableErrors[0], true);
+  expiredHarness.model.resetChatHistory();
+  assert.equal(expiredHarness.model.retryCompletion(691, 689), true);
+  assert.equal(expiredHarness.watch.retryAvailableErrors[1], false);
+  assert.equal(expiredHarness.model.retryCompletion(692, 691), true);
+  assert.equal(expiredHarness.watch.retryAvailableErrors[2], false);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1,
+      'expired-generation retries start no model request');
+});
+
+function recoveryMutationTools(calls, discoveries) {
+  return {
+    discoverPhoneTools: function(settings, requestId, callback) {
+      if (discoveries) {
+        discoveries.push(requestId);
+      }
+      callback(null, [{
+        name: 'pebble_timeline_create_pin',
+        description: 'Create a Timeline pin',
+        parameters: { type: 'object', properties: { title: { type: 'string' } } }
+      }], {
+        pebble_timeline_create_pin: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      });
+    },
+    runToolCalls: function(requestId, toolCalls, toolMap, callback) {
+      calls.push(toolCalls.map(function(call) { return call.name; }));
+      callback(toolCalls.map(function(call) {
+        return {
+          id: call.id,
+          call_id: call.call_id,
+          name: call.name,
+          result: JSON.stringify({ status: 'success', id: 'pin-1', title: 'Event' })
+        };
+      }));
+    },
+    formatToolCallLabel: function(call) { return call.name; }
+  };
+}
+
+function recoveryToolResponse(protocol, asText) {
+  var call = {
+    id: 'call-recovery',
+    name: 'pebble_timeline_create_pin',
+    arguments: { title: 'Event' }
+  };
+  if (asText) {
+    return { output_text: JSON.stringify({ tool_calls: [call] }) };
+  }
+  if (protocol === 'responses') {
+    return { output: [{
+      type: 'function_call', call_id: call.id, name: call.name,
+      arguments: JSON.stringify(call.arguments)
+    }] };
+  }
+  if (protocol === 'chat') {
+    return { choices: [{ message: { tool_calls: [{
+      id: call.id,
+      type: 'function',
+      function: { name: call.name, arguments: JSON.stringify(call.arguments) }
+    }] } }] };
+  }
+  return { content: [{ type: 'tool_use', id: call.id, name: call.name, input: call.arguments }] };
+}
+
+test('post-mutation model failure retries final-answer-only across provider shapes', function() {
+  var cases = [
+    { name: 'Responses native', protocol: 'responses', apiMode: 'responses', endpoint: 'https://api.example.test/v1/responses' },
+    { name: 'Chat Completions native', protocol: 'chat', apiMode: 'chat-completions', endpoint: 'https://api.example.test/v1/chat/completions' },
+    { name: 'Messages native', protocol: 'messages', apiMode: 'messages', endpoint: 'https://api.anthropic.example.test/v1/messages' },
+    { name: 'Responses text fallback', protocol: 'responses', apiMode: 'responses', endpoint: 'https://api.example.test/v1/responses', textFallback: true }
+  ];
+  var i;
+  var item;
+  var mutationCalls;
+  var harness;
+  var firstModelIndex;
+  var followUp;
+  var recovery1;
+  var recovery2;
+  var body;
+  var userTexts;
+
+  for (i = 0; i < cases.length; i += 1) {
+    item = cases[i];
+    mutationCalls = [];
+    harness = createHarness({
+      settings: { ApiMode: item.apiMode, Endpoint: item.endpoint, MaxToolCalls: 2 },
+      tools: recoveryMutationTools(mutationCalls)
+    });
+    harness.model.requestCompletion(690 + i * 10, 'Create one event');
+    firstModelIndex = 0;
+    if (item.textFallback) {
+      FakeXMLHttpRequest.instances[0].respond(400, 'native tools unsupported');
+      firstModelIndex = 1;
+    }
+    FakeXMLHttpRequest.instances[firstModelIndex].respond(200,
+        recoveryToolResponse(item.protocol, item.textFallback));
+    followUp = FakeXMLHttpRequest.last();
+    assert.equal(mutationCalls.length, 1, item.name + ': mutation completed once');
+    followUp.respond(401, 'model failed after mutation');
+    assert.equal(harness.watch.retryAvailableErrors[harness.watch.retryAvailableErrors.length - 1], true,
+        item.name + ': bounded tool results allow safe final-only retry');
+
+    assert.equal(harness.model.retryCompletion(691 + i * 10, 690 + i * 10), true);
+    recovery1 = FakeXMLHttpRequest.last();
+    body = JSON.parse(recovery1.body);
+    assert.equal(body.tools, undefined, item.name + ': first manual recovery cannot execute tools');
+    if (item.textFallback) {
+      assert.match(common.safeJson(body.input), /Tool results:/,
+          item.name + ': recorded text-tool result is replayed');
+      assert.match(common.safeJson(body.input), /pin-1/,
+          item.name + ': recorded mutation result is retained');
+    } else if (item.protocol === 'responses') {
+      assert.ok(body.input.some(function(entry) { return entry.type === 'function_call_output'; }),
+          item.name + ': recorded Responses tool result is replayed');
+    } else if (item.protocol === 'chat') {
+      assert.ok(body.messages.some(function(entry) { return entry.role === 'tool'; }),
+          item.name + ': recorded Chat tool result is replayed');
+    } else {
+      assert.ok(body.messages.some(function(entry) {
+        return entry.role === 'user' && Array.isArray(entry.content) &&
+          entry.content.some(function(part) { return part.type === 'tool_result'; });
+      }), item.name + ': recorded Messages tool result is replayed');
+    }
+    recovery1.respond(401, 'recovery model failed');
+    assert.equal(harness.watch.retryAvailableErrors[harness.watch.retryAvailableErrors.length - 1], true,
+        item.name + ': failed recovery retains same final-only capsule');
+
+    assert.equal(harness.model.retryCompletion(692 + i * 10, 691 + i * 10), true);
+    recovery2 = FakeXMLHttpRequest.last();
+    assert.equal(JSON.parse(recovery2.body).tools, undefined,
+        item.name + ': second manual recovery still has no executable tools');
+    recovery2.respond(200, recoveryToolResponse(item.protocol, item.textFallback));
+    assert.equal(mutationCalls.length, 1, item.name + ': generated recovery call never repeats mutation');
+    assert.match(harness.watch.responses[harness.watch.responses.length - 1], /No additional actions were run/,
+        item.name + ': recovery tool request gets bounded honest notice');
+
+    harness.model.requestCompletion(693 + i * 10, 'What happened?');
+    body = JSON.parse(FakeXMLHttpRequest.last().body);
+    if (item.protocol === 'responses') {
+      userTexts = body.input.filter(function(entry) { return entry.role === 'user'; }).map(function(entry) {
+        return entry.content.map(function(part) { return part.text; }).join('');
+      });
+    } else {
+      userTexts = body.messages.filter(function(entry) { return entry.role === 'user'; }).map(function(entry) {
+        return typeof entry.content === 'string' ? entry.content : '';
+      });
+    }
+    assert.equal(userTexts.filter(function(text) { return text === 'Create one event'; }).length, 1,
+        item.name + ': successful retry stores one user turn');
+    assert.equal(harness.watch.finishedRequestIds.filter(function(id) {
+      return id === 691 + i * 10 || id === 692 + i * 10;
+    }).length, 2, item.name + ': retry lifecycle terminals are idempotent');
+  }
+});
+
+test('watch-delivery retry resends prepared text without a model or tool call and saves one turn', function() {
+  var chatStore = {
+    saved: [],
+    listChats: function() { return []; },
+    getChat: function() { return null; },
+    deleteChat: function() { return false; },
+    deleteAllChats: function() {},
+    saveChatHistory: function(id, messages) {
+      this.saved.push(messages);
+      return { id: 'delivery-chat', title: 'Delivery' };
+    }
+  };
+  var harness = createHarness({
+    settings: { ApiMode: 'responses', MaxToolCalls: 0, PreserveChats: true },
+    chatStore: chatStore
+  });
+  var sendCount = 0;
+  var offered = false;
+
+  harness.watch.sendResponse = function(id, settings, text, callback, onTransferFailure) {
+    sendCount += 1;
+    if (sendCount === 1) {
+      offered = onTransferFailure(new Error('watch unavailable'), 'Prepared: delivery answer');
+      callback(new Error('watch unavailable'));
+      return;
+    }
+    harness.watch.responses.push(text);
+    callback(null);
+  };
+  harness.watch.sendPreparedResponse = function(id, text, callback) {
+    harness.watch.preparedResponses.push(text);
+    harness.watch.responses.push(text);
+    callback(null);
+  };
+
+  harness.model.requestCompletion(710, 'deliver this');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'delivery answer' });
+  assert.equal(offered, true);
+  assert.equal(harness.watch.finishedRequestIds[0], 710);
+  assert.equal(harness.model.retryCompletion(711, 710), true);
+  assert.deepEqual(harness.watch.preparedResponses, ['Prepared: delivery answer']);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'delivery retry makes no model request');
+  assert.equal(chatStore.saved.length, 1, 'successful transfer commits one saved turn');
+  assert.deepEqual(chatStore.saved[0].slice(-2), [
+    { role: 'user', content: 'deliver this' },
+    { role: 'assistant', content: 'delivery answer' }
+  ]);
+
+  harness.model.requestCompletion(712, 'next');
+  var input = JSON.parse(FakeXMLHttpRequest.last().body).input;
+  assert.deepEqual(input.slice(1).map(function(entry) {
+    return entry.content[0].text;
+  }), ['deliver this', 'delivery answer', 'next']);
+});
+
+test('oversized retry capsules disable retry without truncating recovery records', function() {
+  var large = new Array(500001).join('x');
+  var setupHarness = createHarness({ settings: { Endpoint: '' } });
+  var beforeToolsHarness;
+  var beforeToolDiscoveries = [];
+  var beforeToolMutations = [];
+  var cases = [
+    {
+      name: '500KB function arguments',
+      apiMode: 'responses',
+      endpoint: 'https://api.example.test/v1/responses',
+      response: { output: [{
+        type: 'function_call', call_id: 'large-call', name: 'pebble_timeline_create_pin',
+        arguments: JSON.stringify({ title: 'Event', metadata: large })
+      }] }
+    },
+    {
+      name: '500KB encrypted reasoning',
+      apiMode: 'responses',
+      endpoint: 'https://api.example.test/v1/responses',
+      response: { output: [
+        { type: 'reasoning', encrypted_content: large },
+        { type: 'function_call', call_id: 'reasoning-call', name: 'pebble_timeline_create_pin', arguments: '{}' }
+      ] }
+    },
+    {
+      name: 'oversized settings snapshot',
+      apiMode: 'responses',
+      endpoint: 'https://api.example.test/v1/responses',
+      systemPrompt: large,
+      response: { output: [{
+        type: 'function_call', call_id: 'settings-call', name: 'pebble_timeline_create_pin', arguments: '{}'
+      }] }
+    },
+    {
+      name: 'deep provider metadata',
+      apiMode: 'messages',
+      endpoint: 'https://api.example.test/v1/messages',
+      response: null
+    }
+  ];
+  var i;
+  var item;
+  var mutationCalls;
+  var harness;
+  var deepInput;
+  var cursor;
+  var j;
+  var requestId;
+  var xhrCount;
+  var caseSettings;
+  var retryFailedId;
+  var retryAttempt;
+  var discoveries;
+  var freshBody;
+
+  setupHarness.model.requestCompletion(730, large);
+  assert.deepEqual(setupHarness.watch.retryAvailableErrors, [false],
+      'oversized setup prompt has no retry capsule');
+  setupHarness.settings.Endpoint = 'https://api.example.test/v1/responses';
+  assert.equal(setupHarness.model.retryCompletion(732, 730), true,
+      'missing setup capsule returns explicit unavailable error');
+  assert.equal(setupHarness.watch.retryAvailableErrors[1], false);
+  assert.equal(setupHarness.model.retryCompletion(733, 732), true,
+      'unavailable setup retry cannot re-arm itself');
+  assert.equal(setupHarness.watch.retryAvailableErrors[2], false);
+  assert.equal(setupHarness.model.retryCompletion(734, 733), true,
+      'repeated unavailable setup retry remains unavailable');
+  assert.equal(setupHarness.watch.retryAvailableErrors[3], false);
+  assert.equal(FakeXMLHttpRequest.instances.length, 0,
+      'unavailable setup retries send no model request');
+  setupHarness.model.requestCompletion(735, 'Fresh setup follow-up');
+  freshBody = JSON.parse(FakeXMLHttpRequest.last().body);
+  assert.deepEqual(freshBody.input.slice(1), [
+    { role: 'user', content: [{ type: 'input_text', text: 'Fresh setup follow-up' }] }
+  ], 'unavailable retries add no empty or fabricated history turn');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'fresh answer' });
+
+  beforeToolsHarness = createHarness({
+    settings: { ApiMode: 'responses', MaxToolCalls: 2 },
+    tools: recoveryMutationTools(beforeToolMutations, beforeToolDiscoveries)
+  });
+  beforeToolsHarness.model.requestCompletion(731, large);
+  FakeXMLHttpRequest.last().respond(401, 'large prompt failed before tools');
+  assert.equal(beforeToolsHarness.watch.retryAvailableErrors[0], false,
+      'oversized before-tools prompt has no retry capsule');
+  assert.equal(beforeToolDiscoveries.length, 1);
+  xhrCount = FakeXMLHttpRequest.instances.length;
+  retryFailedId = 731;
+  for (retryAttempt = 0; retryAttempt < 3; retryAttempt += 1) {
+    assert.equal(beforeToolsHarness.model.retryCompletion(retryFailedId + 1, retryFailedId), true,
+        'repeated unavailable before-tools retry is handled without running work');
+    assert.equal(beforeToolsHarness.watch.retryAvailableErrors[retryAttempt + 1], false);
+    retryFailedId += 1;
+  }
+  assert.equal(FakeXMLHttpRequest.instances.length, xhrCount,
+      'unavailable before-tools retries send no model request');
+  assert.equal(beforeToolDiscoveries.length, 1,
+      'unavailable before-tools retries do not rediscover tools');
+  assert.equal(beforeToolMutations.length, 0,
+      'unavailable before-tools retries execute no tools');
+
+  for (i = 0; i < cases.length; i += 1) {
+    item = cases[i];
+    if (item.name === 'deep provider metadata') {
+      deepInput = {};
+      cursor = deepInput;
+      for (j = 0; j < 40; j += 1) {
+        cursor.next = {};
+        cursor = cursor.next;
+      }
+      item.response = { content: [{
+        type: 'tool_use', id: 'deep-call', name: 'pebble_timeline_create_pin', input: deepInput
+      }] };
+    }
+    mutationCalls = [];
+    discoveries = [];
+    caseSettings = {
+      ApiMode: item.apiMode,
+      Endpoint: item.endpoint,
+      MaxToolCalls: 2
+    };
+    if (item.systemPrompt) {
+      caseSettings.SystemPrompt = item.systemPrompt;
+    }
+    harness = createHarness({
+      settings: caseSettings,
+      tools: recoveryMutationTools(mutationCalls, discoveries)
+    });
+    requestId = 740 + i * 2;
+    harness.model.requestCompletion(requestId, 'Create one event');
+    FakeXMLHttpRequest.last().respond(200, item.response);
+    assert.equal(mutationCalls.length, 1, item.name + ': tool action completes once');
+    FakeXMLHttpRequest.last().respond(401, 'model failed after tool action');
+
+    assert.equal(harness.watch.retryAvailableErrors[harness.watch.retryAvailableErrors.length - 1], false,
+        item.name + ': oversized or too-deep complete record disables retry');
+    xhrCount = FakeXMLHttpRequest.instances.length;
+    retryFailedId = requestId;
+    for (retryAttempt = 0; retryAttempt < 3; retryAttempt += 1) {
+      assert.equal(harness.model.retryCompletion(retryFailedId + 1, retryFailedId), true,
+          item.name + ': forced retry receives explicit unavailable response');
+      assert.equal(harness.watch.retryAvailableErrors[harness.watch.retryAvailableErrors.length - 1], false,
+          item.name + ': unavailable retry cannot re-arm retry eligibility');
+      assert.match(harness.watch.errors[harness.watch.errors.length - 1], /Retry is no longer available/);
+      retryFailedId += 1;
+    }
+    assert.equal(FakeXMLHttpRequest.instances.length, xhrCount,
+        item.name + ': repeated retry sends no incomplete or oversized model request');
+    assert.equal(discoveries.length, 1,
+        item.name + ': unavailable retries do not rediscover tools');
+    assert.equal(mutationCalls.length, 1, item.name + ': rejected retry never repeats side effect');
+  }
+
+  var deliveryHarness = createHarness({ settings: { ApiMode: 'responses', MaxToolCalls: 0 } });
+  deliveryHarness.watch.sendResponse = function(id, settings, text, callback, onTransferFailure) {
+    var retryAvailable = onTransferFailure(new Error('watch unavailable'), large);
+    deliveryHarness.watch.sendError(id, 'delivery failed', callback, retryAvailable);
+  };
+  deliveryHarness.model.requestCompletion(790, 'deliver safely');
+  FakeXMLHttpRequest.last().respond(200, { output_text: 'small answer' });
+  assert.deepEqual(deliveryHarness.watch.retryAvailableErrors, [false],
+      'oversized prepared delivery text cannot be clipped into a retry capsule');
 });

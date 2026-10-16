@@ -1,10 +1,42 @@
 var common = require('./settings');
 
 var STORE_KEY = 'llm_thing_timeline_pins_v1';
+var PIN_ID_SEQUENCE_KEY = 'llm_thing_timeline_pin_id_sequence_v1';
 var MAX_TIMELINE_PINS = 64;
+var MAX_PIN_ID_SEQUENCE = 9007199254740990;
+var s_pin_id_sequence = 0;
 
 function nowMs() {
   return (new Date()).getTime();
+}
+
+function nextTimelinePinIdSequence() {
+  var raw = '';
+  var stored = 0;
+  var next;
+
+  try {
+    raw = localStorage.getItem(PIN_ID_SEQUENCE_KEY) || '';
+  } catch (e) {}
+  if (/^[0-9]+$/.test(raw)) {
+    stored = Number(raw);
+    if (!isFinite(stored) || stored < 0 || stored > MAX_PIN_ID_SEQUENCE || Math.floor(stored) !== stored) {
+      stored = 0;
+    }
+  }
+  if (stored > s_pin_id_sequence) {
+    s_pin_id_sequence = stored;
+  }
+  next = s_pin_id_sequence >= MAX_PIN_ID_SEQUENCE ? 1 : s_pin_id_sequence + 1;
+  s_pin_id_sequence = next;
+
+  try {
+    localStorage.setItem(PIN_ID_SEQUENCE_KEY, String(next));
+  } catch (e2) {
+    common.logDebug('timeline id sequence write failed');
+  }
+
+  return next;
 }
 
 function cloneJson(value) {
@@ -290,6 +322,7 @@ function removeTimelinePin(id) {
 module.exports = {
   MAX_TIMELINE_PINS: MAX_TIMELINE_PINS,
   STORE_KEY: STORE_KEY,
+  nextTimelinePinIdSequence: nextTimelinePinIdSequence,
   saveTimelinePin: saveTimelinePin,
   getTimelinePin: getTimelinePin,
   listTimelinePins: listTimelinePins,

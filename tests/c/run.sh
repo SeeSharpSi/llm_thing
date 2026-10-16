@@ -24,3 +24,34 @@ trap cleanup EXIT INT TERM
   -o "$OUTPUT_DIR/llm_core_test"
 
 "$OUTPUT_DIR/llm_core_test"
+
+"$CC" \
+  -std=c99 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -pedantic \
+  -fsanitize=undefined \
+  -I"$ROOT/src/c" \
+  "$ROOT/src/c/llm_core.c" \
+  "$ROOT/src/c/llm_text_layout.c" \
+  "$ROOT/tests/c/llm_text_layout_test.c" \
+  -o "$OUTPUT_DIR/llm_text_layout_test"
+
+"$OUTPUT_DIR/llm_text_layout_test"
+
+"$CC" \
+  -std=c99 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -pedantic \
+  -fsanitize=undefined \
+  -DPBL_PLATFORM_APLITE \
+  -I"$ROOT/src/c" \
+  "$ROOT/src/c/llm_core.c" \
+  "$ROOT/src/c/llm_text_layout.c" \
+  "$ROOT/tests/c/llm_text_layout_test.c" \
+  -o "$OUTPUT_DIR/llm_text_layout_aplite_test"
+
+"$OUTPUT_DIR/llm_text_layout_aplite_test"

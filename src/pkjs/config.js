@@ -40,7 +40,7 @@ module.exports = [
         "label": "Model",
         "defaultValue": "gpt-4.1-mini",
         "placeholder": "gpt-4.1-mini",
-        "description": "Enter a model or load models from the endpoint."
+        "description": "Enter a model manually or choose a cached model. Save & Refresh Models saves settings, closes this page, and refreshes the list; reopen settings to choose updated models."
       },
       {
         "type": "select",

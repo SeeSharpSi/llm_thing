@@ -37,6 +37,29 @@ test('empty storage returns empty', function() {
   assert.deepEqual(loaded.store.listTimelinePins(), []);
 });
 
+test('pin id sequence remains monotonic across module reloads and storage write failures', function() {
+  var loaded = loadStore();
+  var first = loaded.store.nextTimelinePinIdSequence();
+  var second = loaded.store.nextTimelinePinIdSequence();
+  var commonStub = {};
+  var reloaded;
+  var third;
+  var fourth;
+
+  assert.equal(second, first + 1);
+  load.clearModule(timelineStorePath);
+  Object.keys(common).forEach(function(key) { commonStub[key] = common[key]; });
+  commonStub.logDebug = function() {};
+  reloaded = load.loadWithStubs(timelineStorePath, { './settings': commonStub });
+  third = reloaded.nextTimelinePinIdSequence();
+  assert.equal(third, second + 1);
+
+  global.localStorage.failWrites = 1;
+  fourth = reloaded.nextTimelinePinIdSequence();
+  assert.equal(fourth, third + 1, 'failed persistence still advances in-memory sequence');
+  assert.equal(reloaded.nextTimelinePinIdSequence(), fourth + 1);
+});
+
 test('unavailable storage does not throw', function() {
   var loaded = loadStore();
   delete global.localStorage;
@@ -145,6 +168,32 @@ test('update overwrites and preserves createdAt', function() {
   assert.equal(second.args.body, 'new');
   assert.equal(second.createdAt, created);
   assert.ok(second.updatedAt >= first.updatedAt);
+});
+
+test('saved reminder removal marker survives reload with other edit arguments', function() {
+  var loaded = loadStore();
+  var pin = {
+    id: 'removed-reminder',
+    time: new Date(Date.now() + 3600000).toISOString(),
+    layout: { type: 'genericPin', title: 'Removed', tinyIcon: 'system://images/NOTIFICATION_REMINDER' }
+  };
+  var args = {
+    id: 'removed-reminder',
+    title: 'Removed',
+    time: pin.time,
+    body: 'KeepMe',
+    _timelineReminderRemoved: true
+  };
+
+  assert.equal(loaded.store.saveTimelinePin(pin.id, 'reminder', pin, args), true);
+  load.clearModule(timelineStorePath);
+  var reloaded = load.loadWithStubs(timelineStorePath, { './settings': loaded.commonStub });
+  var record = reloaded.getTimelinePin(pin.id);
+
+  assert.equal(record.kind, 'reminder');
+  assert.equal(record.args._timelineReminderRemoved, true);
+  assert.equal(record.args.body, 'KeepMe');
+  assert.equal(record.pin.layout.title, 'Removed');
 });
 
 test('invalid records are ignored on load', function() {

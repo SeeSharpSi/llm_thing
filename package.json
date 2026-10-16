@@ -107,7 +107,10 @@
       "RequestTimeoutMs",
       "PebbleMemoryToolEnabled",
       "MemoriesJson",
-      "SpeakerFeedbackEnabled"
+      "SpeakerFeedbackEnabled",
+      "RequestCancel",
+      "RequestRetry",
+      "RetryAvailable"
     ],
     "resources": {
       "media": [

@@ -51,6 +51,22 @@ void llm_response_transfer_reset(LlmResponseTransfer *transfer) {
   transfer->next_index = 0;
 }
 
+bool llm_response_transfer_start_request(LlmResponseTransfer *transfer, uint32_t request_id) {
+  if (!transfer || transfer->request_id == request_id) {
+    return false;
+  }
+
+  transfer->request_id = request_id;
+  llm_response_transfer_reset(transfer);
+  return true;
+}
+
+bool llm_response_transfer_is_active_for_request(const LlmResponseTransfer *transfer,
+                                                 uint32_t request_id) {
+  return transfer && transfer->request_id == request_id &&
+      transfer->phase == LLM_RESPONSE_TRANSFER_RECEIVING;
+}
+
 LlmResponseChunkResult llm_response_transfer_accept_chunk(LlmResponseTransfer *transfer,
                                                            uint32_t chunk_index) {
   if (!transfer || transfer->phase != LLM_RESPONSE_TRANSFER_RECEIVING) {
@@ -110,32 +126,37 @@ bool llm_response_trim_oldest_turn(char *buffer, bool *truncated, char prompt_ma
   return true;
 }
 
-void llm_response_append(char *buffer, size_t capacity, bool *truncated,
-                         char prompt_marker, const char *text) {
+LlmResponseAppendResult llm_response_append(char *buffer, size_t capacity, bool *truncated,
+                                            char prompt_marker, const char *text) {
   const char *suffix = "\n\n[Truncated]";
   size_t suffix_len = strlen(suffix);
   size_t used;
   size_t incoming;
   size_t available;
+  bool rewrote_prefix = false;
 
   if (!buffer || capacity == 0 || !truncated || !text) {
-    return;
+    return LLM_RESPONSE_APPEND_UNCHANGED;
   }
 
   used = strlen(buffer);
   incoming = strlen(text);
   while (used + incoming >= capacity &&
          llm_response_trim_oldest_turn(buffer, truncated, prompt_marker)) {
+    rewrote_prefix = true;
     used = strlen(buffer);
   }
 
   if (used + incoming < capacity) {
+    if (incoming == 0) {
+      return rewrote_prefix ? LLM_RESPONSE_APPEND_REWRITTEN : LLM_RESPONSE_APPEND_UNCHANGED;
+    }
     memcpy(buffer + used, text, incoming + 1);
-    return;
+    return rewrote_prefix ? LLM_RESPONSE_APPEND_REWRITTEN : LLM_RESPONSE_APPEND_ONLY;
   }
 
   if (*truncated || suffix_len + 1 >= capacity) {
-    return;
+    return rewrote_prefix ? LLM_RESPONSE_APPEND_REWRITTEN : LLM_RESPONSE_APPEND_UNCHANGED;
   }
 
   available = capacity - used - suffix_len - 1;
@@ -145,6 +166,7 @@ void llm_response_append(char *buffer, size_t capacity, bool *truncated,
   }
   memcpy(buffer + used, suffix, suffix_len + 1);
   *truncated = true;
+  return LLM_RESPONSE_APPEND_REWRITTEN;
 }
 
 int32_t llm_min_scroll_offset_y(int32_t viewport_height, int32_t content_height,
@@ -171,4 +193,14 @@ int32_t llm_clamp_scroll_offset_y(int32_t offset_y, int32_t viewport_height,
     offset_y = 0;
   }
   return offset_y;
+}
+
+bool llm_get_scroll_line_height(bool progress_mode, LlmScrollLineHeightProvider provider,
+                                void *context, int16_t *line_height) {
+  if (progress_mode || !provider || !line_height) {
+    return false;
+  }
+
+  *line_height = provider(context);
+  return *line_height > 0;
 }

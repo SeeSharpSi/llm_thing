@@ -1,7 +1,9 @@
 #include <pebble.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "llm_core.h"
+#include "llm_text_layout.h"
 #include "speaker_feedback.h"
 
 #define DICTATION_BUFFER_SIZE 384
@@ -39,12 +41,7 @@
 #define PROMPT_BACKGROUND_BOTTOM_PADDING 6
 #define TEXT_MEASURE_HEIGHT 32000
 #define TEXT_MEASURE_WIDTH 32000
-#define TEXT_RUN_BUFFER_SIZE 256
-#define TEXT_LAYOUT_CHECKPOINT_STRIDE 8
-#define TEXT_LAYOUT_CHECKPOINT_COUNT 256
-#define TEXT_LAYOUT_FLAG_BOLD 0x01
-#define TEXT_LAYOUT_FLAG_PROMPT 0x02
-#define TEXT_LAYOUT_FLAG_SMALL 0x04
+#define TEXT_RUN_BUFFER_SIZE LLM_TEXT_LAYOUT_RUN_BUFFER_SIZE
 #define TEXT_LAYOUT_DEBOUNCE_MS 120
 // Phone-side Markdown parsing sends these non-NUL markers inside ResponseChunk.
 #define TEXT_BOLD_ON '\x01'
@@ -66,6 +63,7 @@
 #define PROGRESS_CONTEXT_BUFFER_SIZE 32
 #define PROGRESS_CONTEXT_HEIGHT 18
 #define PROGRESS_CONTEXT_SIDE_PADDING 2
+#define REQUEST_ELAPSED_BUFFER_SIZE 32
 #define PROGRESS_TEXT_SIDE_PADDING 6
 #define PROGRESS_TEXT_GAP 4
 #define PROGRESS_TITLE_MIN_HEIGHT 32
@@ -92,9 +90,34 @@ typedef struct {
 #endif
 
 typedef struct {
-  uint16_t offset;
-  uint8_t flags;
-} TextLayoutCheckpoint;
+  GFont font;
+  uint8_t line_height;
+  uint8_t space_width;
+} ResponseFontMetrics;
+
+#if defined(PBL_PLATFORM_APLITE)
+typedef struct {
+  LlmTextLayout layout;
+  ResponseFontMetrics metrics[4][2];
+  char text_run[TEXT_RUN_BUFFER_SIZE];
+} ApliteResponseLayoutCache;
+
+// Aplite cannot show response and progress views together; reuse progress history storage.
+static union {
+  char progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
+  ApliteResponseLayoutCache response_layout;
+} s_progress_layout_storage;
+
+#define s_progress_history s_progress_layout_storage.progress_history
+#define s_text_run s_progress_layout_storage.response_layout.text_run
+#define s_text_layout s_progress_layout_storage.response_layout.layout
+#define s_response_font_metrics s_progress_layout_storage.response_layout.metrics
+#else
+static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
+static ResponseFontMetrics s_response_font_metrics[4][2];
+static LlmTextLayout s_text_layout;
+static char s_text_run[TEXT_RUN_BUFFER_SIZE];
+#endif
 
 static Window *s_window;
 #if defined(PBL_MICROPHONE)
@@ -120,10 +143,8 @@ static DictationSession *s_dictation_session;
 #endif
 
 static char s_response[RESPONSE_BUFFER_SIZE];
-static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 static char s_progress_title[PROGRESS_TITLE_BUFFER_SIZE];
 static char s_progress_detail[PROGRESS_DETAIL_BUFFER_SIZE];
-static char s_progress_history[PROGRESS_HISTORY_BUFFER_SIZE];
 static char s_progress_input_context[PROGRESS_CONTEXT_BUFFER_SIZE];
 static char s_progress_output_context[PROGRESS_CONTEXT_BUFFER_SIZE];
 #if defined(PBL_MICROPHONE)
@@ -147,7 +168,6 @@ static struct {
   bool extra;
 } s_health_info_session_state;
 #endif
-static TextLayoutCheckpoint s_text_layout_checkpoints[TEXT_LAYOUT_CHECKPOINT_COUNT];
 #if defined(PBL_MICROPHONE)
 static PastChatItem s_past_chats[PAST_CHAT_MAX_ITEMS];
 #endif
@@ -159,9 +179,13 @@ static int16_t s_progress_height;
 static int32_t s_scroll_content_height;
 static int32_t s_scroll_text_height;
 static int32_t s_latest_prompt_y;
-static uint16_t s_text_layout_checkpoint_count;
 #if defined(PBL_MICROPHONE)
 static uint16_t s_past_chat_count;
+static char s_request_elapsed[REQUEST_ELAPSED_BUFFER_SIZE];
+static uint32_t s_request_started_at;
+static uint32_t s_request_elapsed_seconds;
+static bool s_request_active;
+static bool s_retry_available;
 #endif
 static int s_font_size = FONT_SIZE_DEFAULT;
 static int s_buzz_strength = BUZZ_STRENGTH_DEFAULT;
@@ -170,6 +194,10 @@ static GColor s_text_color;
 static GColor s_background_color;
 static GColor s_prompt_background_color;
 static GColor s_bold_text_color;
+static uint32_t s_text_color_hex = TEXT_COLOR_DEFAULT;
+static uint32_t s_background_color_hex = BACKGROUND_COLOR_DEFAULT;
+static uint32_t s_prompt_background_color_hex = PROMPT_BACKGROUND_COLOR_DEFAULT;
+static uint32_t s_bold_text_color_hex = BOLD_TEXT_COLOR_DEFAULT;
 static uint32_t s_request_id;
 static LlmResponseTransfer s_response_transfer;
 static uint16_t s_progress_loading_frame;
@@ -182,12 +210,26 @@ static bool s_show_input_context_size;
 static bool s_show_output_context_size;
 static bool s_preserve_chats;
 static bool s_speaker_feedback_enabled;
+#if defined(PBL_MICROPHONE)
 static bool s_chat_started;
 static bool s_chat_reset_pending = true;
+#endif
 static bool s_home_screen_visible;
 #if defined(PBL_MICROPHONE)
 static bool s_past_chats_loading;
 #endif
+
+typedef struct {
+  bool font_size;
+  bool show_input_context_size;
+  bool show_output_context_size;
+  bool preserve_chats;
+  bool quick_launch;
+  bool text_color;
+  bool background_color;
+  bool prompt_background_color;
+  bool bold_text_color;
+} WatchSettingsDirty;
 
 #if defined(PBL_TOUCH)
 static AppTimer *s_touch_momentum_timer;
@@ -210,6 +252,9 @@ static void prv_request_past_chats(void);
 
 static void prv_progress_loading_timer_callback(void *context);
 static void prv_text_layout_timer_callback(void *context);
+#if defined(PBL_MICROPHONE)
+static void prv_update_request_elapsed(void);
+#endif
 #if defined(PBL_TOUCH)
 static void prv_touch_momentum_timer_callback(void *context);
 static void prv_stop_touch_momentum(void);
@@ -229,34 +274,6 @@ static int prv_normalize_font_size(int size) {
   return llm_normalize_font_size(size);
 }
 
-static const char *prv_font_key_for_size(int size) {
-  switch (prv_normalize_font_size(size)) {
-    case 14:
-      return FONT_KEY_GOTHIC_14;
-    case 24:
-      return FONT_KEY_GOTHIC_24;
-    case 28:
-      return FONT_KEY_GOTHIC_28;
-    case 18:
-    default:
-      return FONT_KEY_GOTHIC_18;
-  }
-}
-
-static const char *prv_bold_font_key_for_size(int size) {
-  switch (prv_normalize_font_size(size)) {
-    case 14:
-      return FONT_KEY_GOTHIC_14_BOLD;
-    case 24:
-      return FONT_KEY_GOTHIC_24_BOLD;
-    case 28:
-      return FONT_KEY_GOTHIC_28_BOLD;
-    case 18:
-    default:
-      return FONT_KEY_GOTHIC_18_BOLD;
-  }
-}
-
 static int prv_smaller_font_size(int size) {
   return llm_smaller_font_size(size);
 }
@@ -267,6 +284,16 @@ static int prv_normalize_buzz_strength(int strength) {
 
 static int prv_normalize_scroll_lines(int lines) {
   return llm_normalize_scroll_lines(lines);
+}
+
+static void prv_invalidate_text_layout(void) {
+#if defined(PBL_PLATFORM_APLITE)
+  // The union belongs to progress history until response view becomes active again.
+  if (s_progress_mode) {
+    return;
+  }
+#endif
+  llm_text_layout_invalidate(&s_text_layout);
 }
 
 static int prv_int_from_tuple(Tuple *tuple, int fallback) {
@@ -312,89 +339,111 @@ static void prv_update_progress_context_layers(void) {
   }
 }
 
-static void prv_apply_show_input_context_size(int enabled, bool should_persist) {
-  s_show_input_context_size = enabled != 0;
-
-  if (should_persist) {
-    persist_write_int(PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE, s_show_input_context_size ? 1 : 0);
+static bool prv_apply_show_input_context_size(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_show_input_context_size == normalized) {
+    return false;
   }
-
-  prv_update_progress_context_layers();
+  s_show_input_context_size = normalized;
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SHOW_INPUT_CONTEXT_SIZE, normalized ? 1 : 0);
+  }
+  return true;
 }
 
-static void prv_apply_show_output_context_size(int enabled, bool should_persist) {
-  s_show_output_context_size = enabled != 0;
-
-  if (should_persist) {
-    persist_write_int(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE, s_show_output_context_size ? 1 : 0);
+static bool prv_apply_show_output_context_size(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_show_output_context_size == normalized) {
+    return false;
   }
-
-  prv_update_progress_context_layers();
+  s_show_output_context_size = normalized;
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE, normalized ? 1 : 0);
+  }
+  return true;
 }
 
-static void prv_apply_buzz_strength(int strength, bool should_persist) {
-  s_buzz_strength = prv_normalize_buzz_strength(strength);
-
-  if (should_persist) {
-    persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, s_buzz_strength);
+static bool prv_apply_buzz_strength(int strength, bool should_persist) {
+  int normalized = prv_normalize_buzz_strength(strength);
+  if (s_buzz_strength == normalized) {
+    return false;
   }
+  s_buzz_strength = normalized;
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_BUZZ_STRENGTH, normalized);
+  }
+  return true;
 }
 
-static void prv_apply_speaker_feedback_enabled(int enabled, bool should_persist) {
-  s_speaker_feedback_enabled = enabled != 0;
-  speaker_feedback_set_enabled(s_speaker_feedback_enabled);
-
-  if (should_persist) {
-    persist_write_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED, s_speaker_feedback_enabled ? 1 : 0);
+static bool prv_apply_speaker_feedback_enabled(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_speaker_feedback_enabled == normalized) {
+    return false;
   }
+  s_speaker_feedback_enabled = normalized;
+  speaker_feedback_set_enabled(normalized);
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED, normalized ? 1 : 0);
+  }
+  return true;
 }
 
-static void prv_apply_scroll_lines(int lines, bool should_persist) {
-  s_scroll_lines = prv_normalize_scroll_lines(lines);
-
-  if (should_persist) {
-    persist_write_int(PERSIST_KEY_SCROLL_LINES, s_scroll_lines);
+static bool prv_apply_scroll_lines(int lines, bool should_persist) {
+  int normalized = prv_normalize_scroll_lines(lines);
+  if (s_scroll_lines == normalized) {
+    return false;
   }
+  s_scroll_lines = normalized;
+  if (should_persist) {
+    persist_write_int(PERSIST_KEY_SCROLL_LINES, normalized);
+  }
+  return true;
 }
 
-static void prv_apply_start_dictation_quick_launch(int enabled, bool should_persist) {
-  s_start_dictation_quick_launch = enabled != 0;
-
-  if (!s_start_dictation_quick_launch && s_quick_launch_dictation_timer) {
+static bool prv_apply_start_dictation_quick_launch(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_start_dictation_quick_launch == normalized) {
+    return false;
+  }
+  s_start_dictation_quick_launch = normalized;
+  if (!normalized && s_quick_launch_dictation_timer) {
     app_timer_cancel(s_quick_launch_dictation_timer);
     s_quick_launch_dictation_timer = NULL;
   }
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH, s_start_dictation_quick_launch ? 1 : 0);
+    persist_write_int(PERSIST_KEY_START_DICTATION_QUICK_LAUNCH, normalized ? 1 : 0);
   }
+  return true;
 }
 
-static void prv_apply_preserve_chats(int enabled, bool should_persist) {
-  s_preserve_chats = enabled != 0;
-
+static bool prv_apply_preserve_chats(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_preserve_chats == normalized) {
+    return false;
+  }
+  s_preserve_chats = normalized;
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_PRESERVE_CHATS, s_preserve_chats ? 1 : 0);
+    persist_write_int(PERSIST_KEY_PRESERVE_CHATS, normalized ? 1 : 0);
   }
-
-  if (s_home_screen_visible && s_text_layer) {
-    layer_mark_dirty(s_text_layer);
-  }
+  return true;
 }
 
 #if defined(PBL_TOUCH)
-static void prv_apply_touch_scroll_enabled(int enabled, bool should_persist) {
-  s_touch_scroll_enabled = enabled != 0;
-
-  if (!s_touch_scroll_enabled) {
+static bool prv_apply_touch_scroll_enabled(int enabled, bool should_persist) {
+  bool normalized = enabled != 0;
+  if (s_touch_scroll_enabled == normalized) {
+    return false;
+  }
+  s_touch_scroll_enabled = normalized;
+  if (!normalized) {
     prv_stop_touch_momentum();
     s_touch_active = false;
     s_touch_threshold_met = false;
   }
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED, s_touch_scroll_enabled ? 1 : 0);
+    persist_write_int(PERSIST_KEY_TOUCH_SCROLL_ENABLED, normalized ? 1 : 0);
   }
+  return true;
 }
 #endif
 
@@ -406,90 +455,52 @@ static GColor prv_color_from_hex(uint32_t hex) {
 #endif
 }
 
-static void prv_apply_text_color(uint32_t hex, bool should_persist) {
+static bool prv_apply_text_color(uint32_t hex, bool should_persist) {
+  if (s_text_color_hex == hex) {
+    return false;
+  }
+  s_text_color_hex = hex;
   s_text_color = prv_color_from_hex(hex);
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_TEXT_COLOR, hex);
+    persist_write_int(PERSIST_KEY_TEXT_COLOR, (int)hex);
   }
-
-  if (s_progress_title_layer) {
-    text_layer_set_text_color(s_progress_title_layer, s_text_color);
-  }
-  if (s_progress_detail_layer) {
-    text_layer_set_text_color(s_progress_detail_layer, s_text_color);
-  }
-  if (s_progress_history_layer) {
-    text_layer_set_text_color(s_progress_history_layer, s_text_color);
-  }
-  if (s_progress_input_context_layer) {
-    text_layer_set_text_color(s_progress_input_context_layer, s_text_color);
-  }
-  if (s_progress_output_context_layer) {
-    text_layer_set_text_color(s_progress_output_context_layer, s_text_color);
-  }
-#if defined(PBL_MICROPHONE)
-  if (s_past_chats_menu_layer) {
-    menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
-    menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
-    layer_mark_dirty(menu_layer_get_layer(s_past_chats_menu_layer));
-  }
-#endif
-  if (s_text_layer) {
-    layer_mark_dirty(s_text_layer);
-  }
+  return true;
 }
 
-static void prv_apply_background_color(uint32_t hex, bool should_persist) {
+static bool prv_apply_background_color(uint32_t hex, bool should_persist) {
+  if (s_background_color_hex == hex) {
+    return false;
+  }
+  s_background_color_hex = hex;
   s_background_color = prv_color_from_hex(hex);
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_BACKGROUND_COLOR, hex);
+    persist_write_int(PERSIST_KEY_BACKGROUND_COLOR, (int)hex);
   }
-
-  if (s_window) {
-    window_set_background_color(s_window, s_background_color);
-  }
-#if defined(PBL_MICROPHONE)
-  if (s_past_chats_window) {
-    window_set_background_color(s_past_chats_window, s_background_color);
-  }
-  if (s_past_chats_menu_layer) {
-    menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
-    menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
-    layer_mark_dirty(menu_layer_get_layer(s_past_chats_menu_layer));
-  }
-#endif
-  if (s_text_layer) {
-    layer_mark_dirty(s_text_layer);
-  }
+  return true;
 }
 
-static void prv_apply_prompt_background_color(uint32_t hex, bool should_persist) {
+static bool prv_apply_prompt_background_color(uint32_t hex, bool should_persist) {
+  if (s_prompt_background_color_hex == hex) {
+    return false;
+  }
+  s_prompt_background_color_hex = hex;
   s_prompt_background_color = prv_color_from_hex(hex);
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR, hex);
+    persist_write_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR, (int)hex);
   }
-
-  if (s_text_layer) {
-    layer_mark_dirty(s_text_layer);
-  }
+  return true;
 }
 
-static void prv_apply_bold_text_color(uint32_t hex, bool should_persist) {
+static bool prv_apply_bold_text_color(uint32_t hex, bool should_persist) {
+  if (s_bold_text_color_hex == hex) {
+    return false;
+  }
+  s_bold_text_color_hex = hex;
   s_bold_text_color = prv_color_from_hex(hex);
-
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_BOLD_TEXT_COLOR, hex);
+    persist_write_int(PERSIST_KEY_BOLD_TEXT_COLOR, (int)hex);
   }
-
-  if (s_text_layer) {
-    layer_mark_dirty(s_text_layer);
-  }
-  if (s_progress_loading_layer) {
-    layer_mark_dirty(s_progress_loading_layer);
-  }
+  return true;
 }
 
 static void prv_buzz_response_done(void) {
@@ -516,28 +527,71 @@ static void prv_buzz_response_done(void) {
   }
 }
 
-static void prv_apply_font_size(int size, bool should_persist) {
-  s_font_size = prv_normalize_font_size(size);
-
+static bool prv_apply_font_size(int size, bool should_persist) {
+  int normalized = prv_normalize_font_size(size);
+  if (s_font_size == normalized) {
+    return false;
+  }
+  s_font_size = normalized;
+  prv_invalidate_text_layout();
   if (should_persist) {
-    persist_write_int(PERSIST_KEY_FONT_SIZE, s_font_size);
+    persist_write_int(PERSIST_KEY_FONT_SIZE, normalized);
   }
+  return true;
+}
 
-  if (s_text_layer) {
+static void prv_apply_settings_visuals(const WatchSettingsDirty *dirty) {
+  bool menu_colors_changed = dirty->text_color || dirty->background_color;
+  bool text_layer_changed = dirty->text_color || dirty->background_color || dirty->prompt_background_color ||
+      dirty->bold_text_color || (dirty->preserve_chats && s_home_screen_visible);
+
+  if (dirty->show_input_context_size || dirty->show_output_context_size) {
+    prv_update_progress_context_layers();
+  }
+  if (dirty->text_color) {
+    if (s_progress_title_layer) {
+      text_layer_set_text_color(s_progress_title_layer, s_text_color);
+    }
+    if (s_progress_detail_layer) {
+      text_layer_set_text_color(s_progress_detail_layer, s_text_color);
+    }
+    if (s_progress_history_layer) {
+      text_layer_set_text_color(s_progress_history_layer, s_text_color);
+    }
+    if (s_progress_input_context_layer) {
+      text_layer_set_text_color(s_progress_input_context_layer, s_text_color);
+    }
+    if (s_progress_output_context_layer) {
+      text_layer_set_text_color(s_progress_output_context_layer, s_text_color);
+    }
+  }
+  if (dirty->background_color) {
+    if (s_window) {
+      window_set_background_color(s_window, s_background_color);
+    }
+#if defined(PBL_MICROPHONE)
+    if (s_past_chats_window) {
+      window_set_background_color(s_past_chats_window, s_background_color);
+    }
+#endif
+  }
+#if defined(PBL_MICROPHONE)
+  if (menu_colors_changed && s_past_chats_menu_layer) {
+    menu_layer_set_normal_colors(s_past_chats_menu_layer, s_background_color, s_text_color);
+    menu_layer_set_highlight_colors(s_past_chats_menu_layer, s_text_color, s_background_color);
+    layer_mark_dirty(menu_layer_get_layer(s_past_chats_menu_layer));
+  }
+#else
+  (void)menu_colors_changed;
+#endif
+  if (dirty->font_size && s_text_layer) {
     prv_update_scroll_text();
+  } else if (text_layer_changed && s_text_layer) {
+    layer_mark_dirty(s_text_layer);
   }
-}
-
-static GFont prv_response_font_for_size(int size, bool bold) {
-  return fonts_get_system_font(bold ? prv_bold_font_key_for_size(size) : prv_font_key_for_size(size));
-}
-
-static GFont prv_response_font(bool bold) {
-  return prv_response_font_for_size(s_font_size, bold);
-}
-
-static GFont prv_response_font_with_small(bool bold, bool small) {
-  return prv_response_font_for_size(small ? prv_smaller_font_size(s_font_size) : s_font_size, bold);
+  if (dirty->bold_text_color && s_progress_loading_layer) {
+    layer_mark_dirty(s_progress_loading_layer);
+  }
 }
 
 static void prv_copy_text_run(const char *text, size_t length) {
@@ -561,295 +615,141 @@ static int16_t prv_measure_text_width(const char *text, GFont font) {
   return size.w;
 }
 
+static ResponseFontMetrics *prv_font_metrics(int size, bool bold) {
+  int normalized_size = prv_normalize_font_size(size);
+  const char *font_key;
+  uint8_t metric_index;
+  ResponseFontMetrics *metrics;
+
+  switch (normalized_size) {
+    case 14:
+      metric_index = 0;
+      font_key = bold ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_14;
+      break;
+    case 18:
+      metric_index = 1;
+      font_key = bold ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_18;
+      break;
+    case 24:
+      metric_index = 2;
+      font_key = bold ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_24;
+      break;
+    default:
+      metric_index = 3;
+      font_key = bold ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_GOTHIC_28;
+      break;
+  }
+  metrics = &s_response_font_metrics[metric_index][bold ? 1 : 0];
+
+  if (!metrics->font) {
+    metrics->font = fonts_get_system_font(font_key);
+    GSize line_size;
+    int16_t x_width;
+    int16_t spaced_width;
+
+    line_size = graphics_text_layout_get_content_size("Ag", metrics->font,
+        GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
+        GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+    metrics->line_height = line_size.h > 0 ? line_size.h : (int16_t)(normalized_size + 4);
+
+    x_width = prv_measure_text_width("x", metrics->font);
+    spaced_width = prv_measure_text_width("x x", metrics->font);
+    metrics->space_width = (int16_t)(spaced_width - (x_width * 2));
+    if (metrics->space_width <= 0) {
+      metrics->space_width = (int16_t)(normalized_size / 3);
+    }
+    if (metrics->space_width <= 0) {
+      metrics->space_width = 1;
+    }
+  }
+
+  return metrics;
+}
+
 static int16_t prv_line_height(void) {
-  GFont normal_font = prv_response_font(false);
-  GFont bold_font = prv_response_font(true);
-  GSize normal_size = graphics_text_layout_get_content_size("Ag", normal_font,
-      GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
-      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
-  GSize bold_size = graphics_text_layout_get_content_size("Ag", bold_font,
-      GRect(0, 0, TEXT_MEASURE_WIDTH, TEXT_MEASURE_HEIGHT),
-      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
-  int16_t height = normal_size.h > bold_size.h ? normal_size.h : bold_size.h;
-
-  if (height <= 0) {
-    height = s_font_size + 4;
-  }
-
-  return height;
+  int16_t normal_height = prv_font_metrics(s_font_size, false)->line_height;
+  int16_t bold_height = prv_font_metrics(s_font_size, true)->line_height;
+  return normal_height > bold_height ? normal_height : bold_height;
 }
 
-static int16_t prv_space_width(GFont font) {
-  int16_t x_width = prv_measure_text_width("x", font);
-  int16_t spaced_width = prv_measure_text_width("x x", font);
-  int16_t width = spaced_width - (x_width * 2);
-
-  if (width <= 0) {
-    width = s_font_size / 3;
-  }
-  if (width <= 0) {
-    width = 1;
-  }
-
-  return width;
+static int16_t prv_scroll_line_height(void *context) {
+  (void)context;
+  return prv_line_height();
 }
 
-static size_t prv_safe_chunk_length(const char *text, size_t length) {
-  return llm_safe_utf8_prefix_length(text, length, sizeof(s_text_run) - 1);
+static int16_t prv_layout_measure_text(const char *text, size_t length,
+                                      uint8_t flags, void *context) {
+  int size = (flags & LLM_TEXT_LAYOUT_FLAG_SMALL) ? prv_smaller_font_size(s_font_size) : s_font_size;
+  bool bold = (flags & (LLM_TEXT_LAYOUT_FLAG_BOLD | LLM_TEXT_LAYOUT_FLAG_PROMPT)) != 0;
+  ResponseFontMetrics *metrics = prv_font_metrics(size, bold);
+  (void)context;
+
+  prv_copy_text_run(text, length);
+  return prv_measure_text_width(s_text_run, metrics->font);
 }
 
-static size_t prv_fit_chunk_length(const char *text, size_t length, GFont font) {
-  size_t chunk_length = prv_safe_chunk_length(text, length);
-
-  while (chunk_length > 1) {
-    prv_copy_text_run(text, chunk_length);
-    if (prv_measure_text_width(s_text_run, font) <= s_text_width) {
-      break;
-    }
-    chunk_length = prv_safe_chunk_length(text, chunk_length / 2);
-  }
-
-  return chunk_length;
+static int16_t prv_layout_measure_space(uint8_t flags, void *context) {
+  int size = (flags & LLM_TEXT_LAYOUT_FLAG_SMALL) ? prv_smaller_font_size(s_font_size) : s_font_size;
+  bool bold = (flags & (LLM_TEXT_LAYOUT_FLAG_BOLD | LLM_TEXT_LAYOUT_FLAG_PROMPT)) != 0;
+  (void)context;
+  return prv_font_metrics(size, bold)->space_width;
 }
 
-static uint8_t prv_text_layout_flags(bool bold, bool prompt, bool small) {
-  uint8_t flags = 0;
+static void prv_layout_draw_text(const char *text, size_t length, uint8_t flags,
+                                 int16_t x, int16_t y, int16_t width,
+                                 int16_t line_height, void *context) {
+  int size = (flags & LLM_TEXT_LAYOUT_FLAG_SMALL) ? prv_smaller_font_size(s_font_size) : s_font_size;
+  bool bold = (flags & LLM_TEXT_LAYOUT_FLAG_BOLD) != 0;
+  ResponseFontMetrics *metrics;
+  GContext *ctx = context;
 
-  if (bold) {
-    flags |= TEXT_LAYOUT_FLAG_BOLD;
-  }
-  if (prompt) {
-    flags |= TEXT_LAYOUT_FLAG_PROMPT;
-  }
-  if (small) {
-    flags |= TEXT_LAYOUT_FLAG_SMALL;
-  }
-
-  return flags;
-}
-
-static void prv_record_text_layout_checkpoint(const char *line_start, bool bold, bool prompt, bool small,
-                                               int16_t y, int16_t line_height) {
-  int32_t line_index;
-  uint16_t checkpoint_index;
-
-  if (!line_start || line_height <= 0 || y < 0) {
+  if (!ctx) {
     return;
   }
-
-  line_index = y / line_height;
-  if (line_index % TEXT_LAYOUT_CHECKPOINT_STRIDE != 0) {
-    return;
-  }
-
-  checkpoint_index = (uint16_t)(line_index / TEXT_LAYOUT_CHECKPOINT_STRIDE);
-  if (checkpoint_index >= TEXT_LAYOUT_CHECKPOINT_COUNT) {
-    return;
-  }
-
-  s_text_layout_checkpoints[checkpoint_index].offset = (uint16_t)(line_start - s_response);
-  s_text_layout_checkpoints[checkpoint_index].flags = prv_text_layout_flags(bold, prompt, small);
-  if (s_text_layout_checkpoint_count <= checkpoint_index) {
-    s_text_layout_checkpoint_count = checkpoint_index + 1;
-  }
+  metrics = prv_font_metrics(size, bold ||
+      (flags & LLM_TEXT_LAYOUT_FLAG_PROMPT) != 0);
+  prv_copy_text_run(text, length);
+  graphics_context_set_text_color(ctx, bold ? s_bold_text_color : s_text_color);
+  graphics_draw_text(ctx, s_text_run, metrics->font,
+      GRect(x + TEXT_SIDE_PADDING, y, width + 2, line_height),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
-static bool prv_line_visible(int16_t y, int16_t height, int32_t visible_top, int32_t visible_bottom) {
-  return (int32_t)y + height >= visible_top && y <= visible_bottom;
-}
-
-static void prv_fill_prompt_line(GContext *ctx, bool should_draw, bool prompt,
-                                 int16_t y, int16_t line_height, int16_t *filled_y,
-                                 int32_t visible_top, int32_t visible_bottom) {
-  if (!prompt || *filled_y == y) {
+static void prv_layout_fill_prompt(int16_t y, int16_t line_height, void *context) {
+  GContext *ctx = context;
+  if (!ctx) {
     return;
   }
-
-  *filled_y = y;
-  if (!should_draw || !ctx || !prv_line_visible(y, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING, visible_top, visible_bottom)) {
-    return;
-  }
-
   graphics_context_set_fill_color(ctx, s_prompt_background_color);
-  graphics_fill_rect(ctx, GRect(0, y, s_text_layer_width, line_height + PROMPT_BACKGROUND_BOTTOM_PADDING), 0, GCornerNone);
-}
-
-static void prv_layout_word(const char *text, size_t length, bool bold, bool prompt, bool small, GContext *ctx,
-                            bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
-                            int16_t *prompt_filled_y, bool record_checkpoints,
-                            int32_t visible_top, int32_t visible_bottom) {
-  GFont font = prv_response_font_with_small(bold || prompt, small);
-
-  while (length > 0) {
-    size_t chunk_length = prv_fit_chunk_length(text, length, font);
-    int16_t width;
-    int16_t draw_width;
-
-    prv_copy_text_run(text, chunk_length);
-    width = prv_measure_text_width(s_text_run, font);
-    if (width <= 0) {
-      width = 1;
-    }
-
-    if (*x > 0 && *x + width > s_text_width) {
-      *x = 0;
-      *y += line_height;
-      if (record_checkpoints) {
-        prv_record_text_layout_checkpoint(text, bold, prompt, small, *y, line_height);
-      }
-    }
-
-    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
-
-    draw_width = width;
-    if (draw_width > s_text_width - *x) {
-      draw_width = s_text_width - *x;
-    }
-
-    if (should_draw && ctx && draw_width > 0 && prv_line_visible(*y, line_height, visible_top, visible_bottom)) {
-      graphics_context_set_text_color(ctx, bold ? s_bold_text_color : s_text_color);
-      graphics_draw_text(ctx, s_text_run, font, GRect(*x + TEXT_SIDE_PADDING, *y, draw_width + 2, line_height),
-          GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-    }
-
-    *x += width;
-    if (*x > s_text_width) {
-      *x = s_text_width;
-    }
-
-    text += chunk_length;
-    length -= chunk_length;
-  }
-}
-
-static void prv_layout_spaces(const char *text, size_t length, bool bold, bool prompt, bool small, GContext *ctx,
-                              bool should_draw, int16_t *x, int16_t *y, int16_t line_height,
-                              int16_t *prompt_filled_y, bool record_checkpoints,
-                              int32_t visible_top, int32_t visible_bottom) {
-  GFont font = prv_response_font_with_small(bold || prompt, small);
-  int16_t space_width = prv_space_width(font);
-  int32_t width = 0;
-  size_t i;
-
-  if (*x == 0) {
-    return;
-  }
-
-  prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
-
-  for (i = 0; i < length; i += 1) {
-    width += text[i] == '\t' ? space_width * 2 : space_width;
-  }
-
-  if ((int32_t)*x + width > s_text_width) {
-    *x = 0;
-    *y += line_height;
-    if (record_checkpoints) {
-      prv_record_text_layout_checkpoint(text + length, bold, prompt, small, *y, line_height);
-    }
-    prv_fill_prompt_line(ctx, should_draw, prompt, *y, line_height, prompt_filled_y, visible_top, visible_bottom);
-    return;
-  }
-
-  *x += (int16_t)width;
-}
-
-static int16_t prv_layout_response_text(GContext *ctx, bool should_draw, int32_t *latest_prompt_y,
-                                         uint16_t start_offset, int16_t start_y,
-                                         bool start_bold, bool start_prompt, bool start_small,
-                                         bool record_checkpoints,
-                                         int32_t visible_top, int32_t visible_bottom) {
-  const char *cursor = s_response + start_offset;
-  int16_t x = 0;
-  int16_t y = start_y;
-  int16_t line_height = prv_line_height();
-  int16_t prompt_filled_y = -1;
-  bool bold = start_bold;
-  bool prompt = start_prompt;
-  bool small = start_small;
-
-  if (latest_prompt_y) {
-    *latest_prompt_y = 0;
-  }
-
-  if (record_checkpoints) {
-    s_text_layout_checkpoint_count = 0;
-    prv_record_text_layout_checkpoint(cursor, bold, prompt, small, y, line_height);
-  }
-
-  if (should_draw && ctx) {
-    graphics_context_set_text_color(ctx, s_text_color);
-  }
-
-  while (*cursor != '\0' && y < TEXT_MEASURE_HEIGHT - line_height) {
-    if (should_draw && y > visible_bottom) {
-      break;
-    }
-
-    if (*cursor == TEXT_BOLD_ON) {
-      bold = true;
-      cursor += 1;
-    } else if (*cursor == TEXT_BOLD_OFF) {
-      bold = false;
-      cursor += 1;
-    } else if (*cursor == TEXT_PROMPT_ON) {
-      prompt = true;
-      if (latest_prompt_y) {
-        *latest_prompt_y = y;
-      }
-      cursor += 1;
-    } else if (*cursor == TEXT_PROMPT_OFF) {
-      prompt = false;
-      cursor += 1;
-    } else if (*cursor == TEXT_SMALL_ON) {
-      small = true;
-      cursor += 1;
-    } else if (*cursor == TEXT_SMALL_OFF) {
-      small = false;
-      cursor += 1;
-    } else if (*cursor == '\n') {
-      prv_fill_prompt_line(ctx, should_draw, prompt, y, line_height, &prompt_filled_y, visible_top, visible_bottom);
-      x = 0;
-      y += line_height;
-      cursor += 1;
-      if (record_checkpoints) {
-        prv_record_text_layout_checkpoint(cursor, bold, prompt, small, y, line_height);
-      }
-    } else if (*cursor == ' ' || *cursor == '\t') {
-      const char *start = cursor;
-      while (*cursor == ' ' || *cursor == '\t') {
-        cursor += 1;
-      }
-      prv_layout_spaces(start, cursor - start, bold, prompt, small, ctx, should_draw, &x, &y, line_height, &prompt_filled_y,
-          record_checkpoints, visible_top, visible_bottom);
-    } else {
-      const char *start = cursor;
-      while (*cursor != '\0' && *cursor != TEXT_BOLD_ON && *cursor != TEXT_BOLD_OFF &&
-              *cursor != TEXT_PROMPT_ON && *cursor != TEXT_PROMPT_OFF &&
-              *cursor != TEXT_SMALL_ON && *cursor != TEXT_SMALL_OFF &&
-              *cursor != '\n' && *cursor != ' ' && *cursor != '\t') {
-        cursor += 1;
-      }
-      prv_layout_word(start, cursor - start, bold, prompt, small, ctx, should_draw, &x, &y, line_height, &prompt_filled_y,
-          record_checkpoints, visible_top, visible_bottom);
-    }
-  }
-
-  return y + line_height;
+  graphics_fill_rect(ctx, GRect(0, y, s_text_layer_width,
+      line_height + PROMPT_BACKGROUND_BOTTOM_PADDING), 0, GCornerNone);
 }
 
 static void prv_update_scroll_text(void) {
+#if defined(PBL_PLATFORM_APLITE)
+  // Progress updates own the overlaid buffer; response layout is rebuilt on return.
+  if (s_progress_mode) {
+    return;
+  }
+#endif
   if (!s_text_layer || !s_scroll_layer) {
     return;
   }
 
-  int32_t latest_prompt_y = 0;
-  int32_t measured_height = prv_layout_response_text(NULL, false, &latest_prompt_y,
-      0, 0, false, false, false, true, 0, TEXT_MEASURE_HEIGHT);
+  LlmTextLayoutCallbacks callbacks = {
+    .measure_text = prv_layout_measure_text,
+    .measure_space = prv_layout_measure_space,
+    .draw_text = prv_layout_draw_text,
+    .fill_prompt = prv_layout_fill_prompt,
+    .context = NULL,
+  };
+  int32_t measured_height = llm_text_layout_update(&s_text_layout, s_response,
+      strlen(s_response), true, s_text_width,
+      (uint8_t)s_font_size, prv_line_height(), &callbacks);
   int32_t text_height = measured_height + s_font_size + TEXT_BOTTOM_PADDING;
   int32_t scroll_height;
 
-  s_latest_prompt_y = latest_prompt_y;
+  s_latest_prompt_y = s_text_layout.latest_prompt_y;
 
   if (text_height < s_min_text_height) {
     text_height = s_min_text_height;
@@ -914,11 +814,15 @@ static void prv_scroll_to_latest_prompt(bool animated) {
 }
 
 static void prv_scroll_by_lines(int lines, bool animated) {
-  int32_t line_height;
+  int16_t line_height;
   int32_t next_y;
   GPoint offset;
 
   if (!s_scroll_layer || s_scroll_text_height <= s_min_text_height) {
+    return;
+  }
+  if (!llm_get_scroll_line_height(s_progress_mode, prv_scroll_line_height, NULL,
+          &line_height)) {
     return;
   }
 
@@ -926,7 +830,6 @@ static void prv_scroll_by_lines(int lines, bool animated) {
   prv_stop_touch_momentum();
 #endif
 
-  line_height = prv_line_height();
   offset = scroll_layer_get_content_offset(s_scroll_layer);
   next_y = prv_clamp_scroll_offset_y(offset.y - ((int32_t)lines * line_height));
 
@@ -1113,14 +1016,22 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
 }
 
 static void prv_draw_response_text(GContext *ctx) {
+#if defined(PBL_PLATFORM_APLITE)
+  // Progress history overlays layout state; hidden response layer must not read it.
+  if (s_progress_mode) {
+    return;
+  }
+#endif
   int16_t line_height = prv_line_height();
   int32_t visible_top = 0;
   int32_t visible_bottom;
-  uint16_t start_offset = 0;
-  int16_t start_y = 0;
-  bool bold = false;
-  bool prompt = false;
-  bool small = false;
+  LlmTextLayoutCallbacks callbacks = {
+    .measure_text = prv_layout_measure_text,
+    .measure_space = prv_layout_measure_space,
+    .draw_text = prv_layout_draw_text,
+    .fill_prompt = prv_layout_fill_prompt,
+    .context = ctx,
+  };
 
   if (s_scroll_layer) {
     visible_top = -scroll_layer_get_content_offset(s_scroll_layer).y;
@@ -1130,22 +1041,9 @@ static void prv_draw_response_text(GContext *ctx) {
   }
 
   visible_bottom = visible_top + s_min_text_height + line_height;
-
-  if (line_height > 0 && s_text_layout_checkpoint_count > 0) {
-    uint16_t checkpoint_index = (uint16_t)((visible_top / line_height) / TEXT_LAYOUT_CHECKPOINT_STRIDE);
-
-    if (checkpoint_index < s_text_layout_checkpoint_count) {
-      TextLayoutCheckpoint *checkpoint = &s_text_layout_checkpoints[checkpoint_index];
-      start_offset = checkpoint->offset;
-      start_y = (int16_t)(checkpoint_index * TEXT_LAYOUT_CHECKPOINT_STRIDE * line_height);
-      bold = (checkpoint->flags & TEXT_LAYOUT_FLAG_BOLD) != 0;
-      prompt = (checkpoint->flags & TEXT_LAYOUT_FLAG_PROMPT) != 0;
-      small = (checkpoint->flags & TEXT_LAYOUT_FLAG_SMALL) != 0;
-    }
-  }
-
-  prv_layout_response_text(ctx, true, NULL, start_offset, start_y, bold, prompt, small, false,
-      visible_top - line_height, visible_bottom);
+  graphics_context_set_text_color(ctx, s_text_color);
+  llm_text_layout_draw(&s_text_layout, s_response, strlen(s_response),
+      visible_top, visible_bottom, &callbacks);
 }
 
 static void prv_text_layer_update_proc(Layer *layer, GContext *ctx) {
@@ -1194,6 +1092,11 @@ static void prv_progress_loading_timer_callback(void *context) {
     return;
   }
 
+#if defined(PBL_MICROPHONE)
+  if (s_request_active) {
+    prv_update_request_elapsed();
+  }
+#endif
   s_progress_loading_frame += 1;
   if (s_progress_loading_layer) {
     layer_mark_dirty(s_progress_loading_layer);
@@ -1253,7 +1156,16 @@ static void prv_set_progress_visible(bool visible) {
 }
 
 static void prv_show_response_view(void) {
+#if defined(PBL_PLATFORM_APLITE)
+  bool was_progress_mode = s_progress_mode;
+#endif
   s_progress_mode = false;
+#if defined(PBL_PLATFORM_APLITE)
+  if (was_progress_mode) {
+    prv_invalidate_text_layout();
+    memset(s_response_font_metrics, 0, sizeof(s_response_font_metrics));
+  }
+#endif
   prv_set_progress_visible(false);
 }
 
@@ -1294,7 +1206,11 @@ static void prv_update_progress_text(void) {
   }
 
   title_height = prv_clamp_int16(text_layer_get_content_size(s_progress_title_layer).h, PROGRESS_TITLE_MIN_HEIGHT, PROGRESS_TITLE_MAX_HEIGHT);
-  if (s_progress_detail[0] != '\0') {
+  if (s_progress_detail[0] != '\0'
+#if defined(PBL_MICROPHONE)
+      || s_request_active
+#endif
+      ) {
     detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
   }
   if (s_progress_history_layer && s_progress_history[0] != '\0') {
@@ -1333,7 +1249,28 @@ static void prv_update_progress_text(void) {
   if (detail_height) {
     layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
   }
+#if defined(PBL_MICROPHONE)
+  if (s_request_active && s_progress_detail_layer) {
+    text_layer_set_text(s_progress_detail_layer, s_request_elapsed);
+  }
+#endif
 }
+
+#if defined(PBL_MICROPHONE)
+static void prv_update_request_elapsed(void) {
+  uint32_t elapsed = (uint32_t)time(NULL) - s_request_started_at;
+
+  if (elapsed == s_request_elapsed_seconds) {
+    return;
+  }
+  s_request_elapsed_seconds = elapsed;
+  snprintf(s_request_elapsed, sizeof(s_request_elapsed), "%lus | BACK cancel",
+      (unsigned long)elapsed);
+  if (s_progress_detail_layer) {
+    text_layer_set_text(s_progress_detail_layer, s_request_elapsed);
+  }
+}
+#endif
 
 static void prv_set_progress_title(const char *text) {
   snprintf(s_progress_title, sizeof(s_progress_title), "%s", text && text[0] ? text : "thinking");
@@ -1361,9 +1298,57 @@ static void prv_set_progress_output_context(const char *text) {
 }
 
 static void prv_append_text_limited(const char *text) {
-  llm_response_append(s_response, sizeof(s_response), &s_response_truncated,
-      TEXT_PROMPT_ON, text);
+  LlmResponseAppendResult result = llm_response_append(s_response, sizeof(s_response),
+      &s_response_truncated, TEXT_PROMPT_ON, text);
+  if (result == LLM_RESPONSE_APPEND_REWRITTEN) {
+    prv_invalidate_text_layout();
+  }
 }
+
+#if defined(PBL_MICROPHONE)
+static void prv_rewind_request(bool keep_prompt) {
+  char *prompt = strrchr(s_response, TEXT_PROMPT_ON);
+
+  if (!prompt) {
+    s_response[0] = '\0';
+  } else if (!keep_prompt) {
+    *prompt = '\0';
+  } else {
+    char *end = strchr(prompt, TEXT_PROMPT_OFF);
+    if (!end) {
+      *prompt = '\0';
+    } else {
+      end += 1;
+      if (*end == '\n') { end += 1; }
+      if (*end == '\n') { end += 1; }
+      *end = '\0';
+    }
+  }
+
+  s_response_truncated = false;
+  s_home_screen_visible = false;
+  prv_invalidate_text_layout();
+  prv_update_scroll_text();
+  prv_scroll_to_latest_prompt(false);
+}
+
+static void prv_append_error_block(const char *message, bool retry_available) {
+  size_t length = strlen(s_response);
+
+  prv_show_response_view();
+  s_home_screen_visible = false;
+  if (length && s_response[length - 1] != '\n') {
+    prv_append_text_limited("\n\n");
+  }
+  prv_append_text_limited("\x01Error\x02\n");
+  prv_append_text_limited(message ? message : "Request failed.");
+  if (retry_available) {
+    prv_append_text_limited("\n\nSELECT retry");
+  }
+  prv_flush_scroll_text_update();
+  prv_scroll_to_latest_prompt(false);
+}
+#endif
 
 #if defined(PBL_MICROPHONE)
 static void prv_append_prompt(const char *text) {
@@ -1372,6 +1357,7 @@ static void prv_append_prompt(const char *text) {
   s_response_truncated = false;
 
   if (!s_chat_started) {
+    prv_invalidate_text_layout();
     s_response[0] = '\0';
     s_chat_started = true;
   } else if (s_response[0] != '\0') {
@@ -1397,6 +1383,7 @@ static void prv_preserve_chat_or_set_response(const char *text) {
 }
 #endif
 
+#if defined(PBL_MICROPHONE)
 static void prv_append_notice(const char *text) {
   if (!s_chat_started) {
     prv_set_response(text);
@@ -1411,6 +1398,7 @@ static void prv_append_notice(const char *text) {
   prv_update_scroll_text();
   prv_scroll_to_latest_prompt(false);
 }
+#endif
 
 static void prv_send_health_info_response(uint32_t request_id, uint32_t health_request_id,
                                           const char *json, const char *error) {
@@ -1763,12 +1751,19 @@ static void prv_progress_append(const char *text) {
 }
 
 static void prv_set_response(const char *text) {
+#if defined(PBL_MICROPHONE)
+  llm_response_transfer_finish(&s_response_transfer);
+  s_request_active = false;
+  s_retry_available = false;
+  s_request_started_at = 0;
+#endif
 #if defined(PBL_TOUCH)
   prv_stop_touch_momentum();
 #endif
 
   prv_show_response_view();
   s_home_screen_visible = false;
+  prv_invalidate_text_layout();
   snprintf(s_response, sizeof(s_response), "%s", text ? text : "");
   s_response_truncated = false;
   prv_update_scroll_text();
@@ -1776,12 +1771,19 @@ static void prv_set_response(const char *text) {
 }
 
 static void prv_show_home_screen(void) {
+#if defined(PBL_MICROPHONE)
+  llm_response_transfer_finish(&s_response_transfer);
+  s_request_active = false;
+  s_retry_available = false;
+  s_request_started_at = 0;
+#endif
 #if defined(PBL_TOUCH)
   prv_stop_touch_momentum();
 #endif
 
   prv_show_response_view();
   s_home_screen_visible = true;
+  prv_invalidate_text_layout();
   s_response[0] = '\0';
   s_response_truncated = false;
   prv_update_scroll_text();
@@ -1800,6 +1802,12 @@ static void prv_set_progress(const char *text) {
 }
 
 static void prv_append_response(const char *text) {
+#if defined(PBL_MICROPHONE)
+  if (s_request_active) {
+    prv_append_text_limited(text);
+    return;
+  }
+#endif
   prv_show_response_view();
   s_home_screen_visible = false;
   prv_append_text_limited(text);
@@ -1808,6 +1816,102 @@ static void prv_append_response(const char *text) {
 }
 
 #if defined(PBL_MICROPHONE)
+static void prv_send_cancel_message(uint32_t request_id) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+  DictionaryResult write_result;
+
+  if (result != APP_MSG_OK || !iter) {
+    return;
+  }
+  write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestId, request_id);
+  if (write_result == DICT_OK) {
+    write_result = dict_write_uint8(iter, MESSAGE_KEY_RequestCancel, 1);
+  }
+  if (write_result != DICT_OK) {
+    return;
+  }
+  dict_write_end(iter);
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "request cancel send failed id=%lu result=%d",
+        (unsigned long)request_id, result);
+  }
+}
+
+static void prv_start_request_clock(void) {
+  s_request_started_at = (uint32_t)time(NULL);
+  s_request_elapsed_seconds = UINT32_MAX;
+  prv_update_request_elapsed();
+}
+
+static void prv_send_retry_request(void) {
+  DictionaryIterator *iter;
+  AppMessageResult result;
+  DictionaryResult write_result;
+  uint32_t old_request_id = s_request_id;
+  uint32_t next_request_id = old_request_id + 1;
+
+  if (!s_retry_available || s_request_active) {
+    return;
+  }
+  result = app_message_outbox_begin(&iter);
+  if (result != APP_MSG_OK || !iter) {
+    s_retry_available = false;
+    prv_rewind_request(true);
+    prv_append_error_block("Could not send retry to phone. No work was replayed.", false);
+    return;
+  }
+  write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestId, next_request_id);
+  if (write_result == DICT_OK) {
+    write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestRetry, old_request_id);
+  }
+  if (write_result != DICT_OK) {
+    s_retry_available = false;
+    prv_rewind_request(true);
+    prv_append_error_block("Could not send retry to phone. No work was replayed.", false);
+    return;
+  }
+  dict_write_end(iter);
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    s_retry_available = false;
+    prv_rewind_request(true);
+    prv_append_error_block("Could not send retry to phone. No work was replayed.", false);
+    return;
+  }
+
+  s_request_id = next_request_id;
+  s_request_active = true;
+  s_retry_available = false;
+  llm_response_transfer_start_request(&s_response_transfer, s_request_id);
+  prv_show_response_view();
+  prv_rewind_request(true);
+  prv_start_request_clock();
+  prv_progress_reset();
+  prv_set_progress("Retrying");
+  prv_set_progress_detail("waiting for phone");
+}
+
+static void prv_cancel_active_request(void) {
+  uint32_t old_request_id;
+
+  if (!s_request_active) {
+    return;
+  }
+  old_request_id = s_request_id;
+  prv_send_cancel_message(old_request_id);
+  llm_response_transfer_finish(&s_response_transfer);
+  s_request_id += 1;
+  s_request_active = false;
+  s_retry_available = false;
+  s_request_started_at = 0;
+  speaker_feedback_stop();
+  prv_show_response_view();
+  prv_rewind_request(false);
+  prv_set_status("Canceled");
+}
+
 static void prv_send_request(const char *text) {
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
@@ -1817,8 +1921,9 @@ static void prv_send_request(const char *text) {
 
   if (result != APP_MSG_OK || !iter) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox begin failed result=%d", result);
+    s_retry_available = false;
     prv_set_status("Phone unavailable");
-    prv_append_notice("Could not contact phone. Try again.");
+    prv_append_error_block("Could not contact phone.", false);
     return;
   }
 
@@ -1833,7 +1938,8 @@ static void prv_send_request(const char *text) {
   }
   if (write_result != DICT_OK) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "request dictionary write failed result=%d", write_result);
-    prv_append_notice("Prompt is too long to send.");
+    s_retry_available = false;
+    prv_append_error_block("Prompt is too long to send.", false);
     return;
   }
   dict_write_end(iter);
@@ -1841,17 +1947,21 @@ static void prv_send_request(const char *text) {
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "outbox send failed request_id=%lu result=%d", (unsigned long)next_request_id, result);
+    s_retry_available = false;
     prv_set_status("Send failed");
-    prv_append_notice("Could not send request to phone.");
+    prv_append_error_block("Could not send request to phone.", false);
     return;
   }
 
   s_request_id = next_request_id;
-  llm_response_transfer_reset(&s_response_transfer);
+  s_request_active = true;
+  s_retry_available = false;
+  llm_response_transfer_start_request(&s_response_transfer, s_request_id);
   APP_LOG(APP_LOG_LEVEL_DEBUG, "send request queued request_id=%lu", (unsigned long)s_request_id);
   s_chat_reset_pending = false;
   prv_append_prompt(text);
   prv_set_status("Waiting for phone");
+  prv_start_request_clock();
   prv_progress_reset();
   prv_set_progress("thinking");
   prv_set_progress_detail("waiting for phone");
@@ -2214,19 +2324,46 @@ static void prv_show_past_chats_menu(void) {
 static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
+#if defined(PBL_MICROPHONE)
+  if (s_request_active) {
+    return;
+  }
+  if (s_retry_available) {
+    prv_send_retry_request();
+    return;
+  }
+#endif
   APP_LOG(APP_LOG_LEVEL_DEBUG, "select pressed: start dictation");
   prv_start_dictation();
 }
 
+#if defined(PBL_MICROPHONE)
+static void prv_back_click_handler(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  if (s_request_active) {
+    prv_cancel_active_request();
+  } else {
+    window_stack_pop(true);
+  }
+}
+#endif
+
 static void prv_up_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
+  if (s_progress_mode) {
+    return;
+  }
   prv_scroll_by_lines(-s_scroll_lines, true);
 }
 
 static void prv_down_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
+  if (s_progress_mode) {
+    return;
+  }
 
 #if defined(PBL_MICROPHONE)
   if (s_home_screen_visible && s_preserve_chats) {
@@ -2242,20 +2379,27 @@ static void prv_scroll_click_config_provider(void *context) {
   window_single_repeating_click_subscribe(BUTTON_ID_UP, SCROLL_REPEAT_INTERVAL_MS, prv_up_click_handler);
   window_single_repeating_click_subscribe(BUTTON_ID_DOWN, SCROLL_REPEAT_INTERVAL_MS, prv_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, prv_select_click_handler);
+#if defined(PBL_MICROPHONE)
+  window_single_click_subscribe(BUTTON_ID_BACK, prv_back_click_handler);
+#endif
 }
 
 static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) {
   Tuple *request_id_t = dict_find(iter, MESSAGE_KEY_RequestId);
+  WatchSettingsDirty dirty = {0};
+  uint32_t message_request_id = request_id_t ? request_id_t->value->uint32 : s_request_id;
+  bool response_lifecycle_active = request_id_t &&
+      llm_response_transfer_is_active_for_request(&s_response_transfer, message_request_id);
+
   APP_LOG(APP_LOG_LEVEL_DEBUG, "inbox received request_id=%lu current=%lu", (unsigned long)(request_id_t ? request_id_t->value->uint32 : 0), (unsigned long)s_request_id);
-  if (request_id_t && request_id_t->value->uint32 != s_request_id) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored stale response request_id=%lu", (unsigned long)request_id_t->value->uint32);
-    return;
+  if (request_id_t && message_request_id != s_request_id) {
+    APP_LOG(APP_LOG_LEVEL_DEBUG, "stale request payload id=%lu current=%lu; filtering response lifecycle", (unsigned long)message_request_id, (unsigned long)s_request_id);
   }
 
   Tuple *font_size_t = dict_find(iter, MESSAGE_KEY_FontSize);
   if (font_size_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "font size update");
-    prv_apply_font_size(prv_int_from_tuple(font_size_t, s_font_size), true);
+    dirty.font_size = prv_apply_font_size(prv_int_from_tuple(font_size_t, s_font_size), true);
   }
 
   Tuple *buzz_strength_t = dict_find(iter, MESSAGE_KEY_BuzzStrength);
@@ -2289,58 +2433,62 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   Tuple *show_input_context_size_t = dict_find(iter, MESSAGE_KEY_ShowInputContextSize);
   if (show_input_context_size_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "show input context size update");
-    prv_apply_show_input_context_size(prv_int_from_tuple(show_input_context_size_t,
+    dirty.show_input_context_size = prv_apply_show_input_context_size(prv_int_from_tuple(show_input_context_size_t,
         s_show_input_context_size ? 1 : 0), true);
   }
 
   Tuple *show_output_context_size_t = dict_find(iter, MESSAGE_KEY_ShowOutputContextSize);
   if (show_output_context_size_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "show output context size update");
-    prv_apply_show_output_context_size(prv_int_from_tuple(show_output_context_size_t,
+    dirty.show_output_context_size = prv_apply_show_output_context_size(prv_int_from_tuple(show_output_context_size_t,
         s_show_output_context_size ? 1 : 0), true);
   }
 
   Tuple *preserve_chats_t = dict_find(iter, MESSAGE_KEY_PreserveChats);
   if (preserve_chats_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "preserve chats setting update");
-    prv_apply_preserve_chats(prv_int_from_tuple(preserve_chats_t,
+    dirty.preserve_chats = prv_apply_preserve_chats(prv_int_from_tuple(preserve_chats_t,
         s_preserve_chats ? 1 : 0), true);
   }
 
   Tuple *start_dictation_quick_launch_t = dict_find(iter, MESSAGE_KEY_StartDictationQuickLaunch);
   if (start_dictation_quick_launch_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "quick launch dictation setting update");
-    prv_apply_start_dictation_quick_launch(prv_int_from_tuple(start_dictation_quick_launch_t,
+    dirty.quick_launch = prv_apply_start_dictation_quick_launch(prv_int_from_tuple(start_dictation_quick_launch_t,
         s_start_dictation_quick_launch ? 1 : 0), true);
-    prv_maybe_schedule_quick_launch_dictation();
   }
 
   Tuple *text_color_t = dict_find(iter, MESSAGE_KEY_TextColor);
   if (text_color_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "text color update");
-    prv_apply_text_color(prv_int_from_tuple(text_color_t, TEXT_COLOR_DEFAULT), true);
+    dirty.text_color = prv_apply_text_color(prv_uint32_from_tuple(text_color_t, TEXT_COLOR_DEFAULT), true);
   }
 
   Tuple *background_color_t = dict_find(iter, MESSAGE_KEY_BackgroundColor);
   if (background_color_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "background color update");
-    prv_apply_background_color(prv_int_from_tuple(background_color_t, BACKGROUND_COLOR_DEFAULT), true);
+    dirty.background_color = prv_apply_background_color(prv_uint32_from_tuple(background_color_t, BACKGROUND_COLOR_DEFAULT), true);
   }
 
   Tuple *prompt_background_color_t = dict_find(iter, MESSAGE_KEY_PromptBackgroundColor);
   if (prompt_background_color_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "prompt background color update");
-    prv_apply_prompt_background_color(prv_int_from_tuple(prompt_background_color_t, PROMPT_BACKGROUND_COLOR_DEFAULT), true);
+    dirty.prompt_background_color = prv_apply_prompt_background_color(prv_uint32_from_tuple(prompt_background_color_t, PROMPT_BACKGROUND_COLOR_DEFAULT), true);
   }
 
   Tuple *bold_text_color_t = dict_find(iter, MESSAGE_KEY_BoldTextColor);
   if (bold_text_color_t) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "bold text color update");
-    prv_apply_bold_text_color(prv_int_from_tuple(bold_text_color_t, BOLD_TEXT_COLOR_DEFAULT), true);
+    dirty.bold_text_color = prv_apply_bold_text_color(prv_uint32_from_tuple(bold_text_color_t, BOLD_TEXT_COLOR_DEFAULT), true);
   }
 
+  if (dirty.quick_launch) {
+    prv_maybe_schedule_quick_launch_dictation();
+  }
+  prv_apply_settings_visuals(&dirty);
+
   Tuple *health_info_request_t = dict_find(iter, MESSAGE_KEY_HealthSummaryRequest);
-  if (health_info_request_t) {
+  if (health_info_request_t && (!request_id_t || message_request_id == s_request_id)) {
     APP_LOG(APP_LOG_LEVEL_DEBUG, "health info request token=%lu", (unsigned long)prv_uint32_from_tuple(health_info_request_t, 0));
     prv_handle_health_info_request(request_id_t ? request_id_t->value->uint32 : s_request_id,
         health_info_request_t,
@@ -2405,6 +2553,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     s_home_screen_visible = false;
     s_chat_started = true;
     s_chat_reset_pending = false;
+    prv_invalidate_text_layout();
     s_response[0] = '\0';
     s_response_truncated = false;
     prv_update_scroll_text();
@@ -2435,123 +2584,181 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
   }
 #endif
 
-  Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
-  if (reset_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
-    prv_set_status("Receiving");
-    prv_show_response_view();
-    s_response_truncated = false;
-    llm_response_transfer_reset(&s_response_transfer);
-    prv_update_scroll_text();
-    prv_scroll_to_latest_prompt(false);
-  }
-
-  Tuple *progress_reset_t = dict_find(iter, MESSAGE_KEY_ProgressReset);
-  if (progress_reset_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress reset");
-    prv_progress_reset();
-  }
-
-  Tuple *progress_append_t = dict_find(iter, MESSAGE_KEY_ProgressAppend);
-  if (progress_append_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress append len=%u", (unsigned int)strlen(progress_append_t->value->cstring));
-    prv_progress_append(progress_append_t->value->cstring);
-  }
-
-  Tuple *progress_t = dict_find(iter, MESSAGE_KEY_ProgressText);
-  if (progress_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress text len=%u", (unsigned int)strlen(progress_t->value->cstring));
-    prv_set_progress(progress_t->value->cstring);
-  }
-
-  Tuple *progress_detail_t = dict_find(iter, MESSAGE_KEY_ProgressDetail);
-  if (progress_detail_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress detail len=%u", (unsigned int)strlen(progress_detail_t->value->cstring));
-    if (!s_progress_mode) {
-      prv_progress_reset();
-    }
-    prv_set_progress_detail(progress_detail_t->value->cstring);
-  }
-
-  Tuple *progress_history_t = dict_find(iter, MESSAGE_KEY_ProgressHistory);
-  if (progress_history_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress history len=%u", (unsigned int)strlen(progress_history_t->value->cstring));
-    if (!s_progress_mode) {
-      prv_progress_reset();
-    }
-    prv_set_progress_history(progress_history_t->value->cstring);
-  }
-
-  Tuple *progress_input_context_t = dict_find(iter, MESSAGE_KEY_ProgressInputContextSize);
-  if (progress_input_context_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress input context len=%u", (unsigned int)strlen(progress_input_context_t->value->cstring));
-    if (!s_progress_mode) {
-      prv_progress_reset();
-    }
-    prv_set_progress_input_context(progress_input_context_t->value->cstring);
-  }
-
-  Tuple *progress_output_context_t = dict_find(iter, MESSAGE_KEY_ProgressOutputContextSize);
-  if (progress_output_context_t) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "progress output context len=%u", (unsigned int)strlen(progress_output_context_t->value->cstring));
-    if (!s_progress_mode) {
-      prv_progress_reset();
-    }
-    prv_set_progress_output_context(progress_output_context_t->value->cstring);
-  }
-
-  Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
-  if (chunk_t) {
-    Tuple *chunk_index_t = dict_find(iter, MESSAGE_KEY_ResponseChunkIndex);
-    uint32_t chunk_index = prv_uint32_from_tuple(chunk_index_t,
-        s_response_transfer.next_index);
-    LlmResponseChunkResult chunk_result = llm_response_transfer_accept_chunk(
-        &s_response_transfer, chunk_index);
-
-    if (chunk_result == LLM_RESPONSE_CHUNK_DUPLICATE) {
-      APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored duplicate response chunk index=%lu expected=%lu",
-          (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
-    } else if (chunk_result == LLM_RESPONSE_CHUNK_OUT_OF_ORDER) {
-      APP_LOG(APP_LOG_LEVEL_ERROR, "ignored out-of-order response chunk index=%lu expected=%lu",
-          (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
-    } else if (chunk_result == LLM_RESPONSE_CHUNK_ACCEPTED) {
-      APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk index=%lu len=%u",
-          (unsigned long)chunk_index, (unsigned int)strlen(chunk_t->value->cstring));
-      prv_append_response(chunk_t->value->cstring);
-    }
-  }
-
-  Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
-  if (error_t && llm_response_transfer_finish(&s_response_transfer)) {
-    APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
-    prv_set_status("Error");
-    prv_append_response(error_t->value->cstring);
-    prv_flush_scroll_text_update();
-  }
-
-  Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
-  if (done_t && llm_response_transfer_finish(&s_response_transfer)) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
-    prv_set_status("Done");
-    if (s_response[0] == '\0') {
-      prv_set_response("No response text.");
-    } else {
-      prv_flush_scroll_text_update();
+  if (response_lifecycle_active) {
+    Tuple *reset_t = dict_find(iter, MESSAGE_KEY_ResponseReset);
+    if (reset_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "response reset");
+      // A reset may rewind an active transfer, never reopen a terminal request.
+      llm_response_transfer_reset(&s_response_transfer);
+      prv_set_status("Receiving");
+  #if defined(PBL_MICROPHONE)
+      if (s_request_active) {
+        prv_set_progress("Receiving");
+        prv_set_progress_detail("response chunks");
+      } else {
+        prv_show_response_view();
+      }
+  #else
+      prv_show_response_view();
+  #endif
+      s_response_truncated = false;
+  #if !defined(PBL_MICROPHONE)
+      prv_update_scroll_text();
       prv_scroll_to_latest_prompt(false);
+  #endif
     }
-    prv_buzz_response_done();
-    speaker_feedback_play_response_done();
+
+    Tuple *progress_reset_t = dict_find(iter, MESSAGE_KEY_ProgressReset);
+    if (progress_reset_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress reset");
+      prv_progress_reset();
+    }
+
+    Tuple *progress_append_t = dict_find(iter, MESSAGE_KEY_ProgressAppend);
+    if (progress_append_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress append len=%u", (unsigned int)strlen(progress_append_t->value->cstring));
+      prv_progress_append(progress_append_t->value->cstring);
+    }
+
+    Tuple *progress_t = dict_find(iter, MESSAGE_KEY_ProgressText);
+    if (progress_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress text len=%u", (unsigned int)strlen(progress_t->value->cstring));
+      prv_set_progress(progress_t->value->cstring);
+    }
+
+    Tuple *progress_detail_t = dict_find(iter, MESSAGE_KEY_ProgressDetail);
+    if (progress_detail_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress detail len=%u", (unsigned int)strlen(progress_detail_t->value->cstring));
+      if (!s_progress_mode) {
+        prv_progress_reset();
+      }
+      prv_set_progress_detail(progress_detail_t->value->cstring);
+    }
+
+    Tuple *progress_history_t = dict_find(iter, MESSAGE_KEY_ProgressHistory);
+    if (progress_history_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress history len=%u", (unsigned int)strlen(progress_history_t->value->cstring));
+      if (!s_progress_mode) {
+        prv_progress_reset();
+      }
+      prv_set_progress_history(progress_history_t->value->cstring);
+    }
+
+    Tuple *progress_input_context_t = dict_find(iter, MESSAGE_KEY_ProgressInputContextSize);
+    if (progress_input_context_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress input context len=%u", (unsigned int)strlen(progress_input_context_t->value->cstring));
+      if (!s_progress_mode) {
+        prv_progress_reset();
+      }
+      prv_set_progress_input_context(progress_input_context_t->value->cstring);
+    }
+
+    Tuple *progress_output_context_t = dict_find(iter, MESSAGE_KEY_ProgressOutputContextSize);
+    if (progress_output_context_t) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "progress output context len=%u", (unsigned int)strlen(progress_output_context_t->value->cstring));
+      if (!s_progress_mode) {
+        prv_progress_reset();
+      }
+      prv_set_progress_output_context(progress_output_context_t->value->cstring);
+    }
+
+    Tuple *chunk_t = dict_find(iter, MESSAGE_KEY_ResponseChunk);
+    if (chunk_t) {
+      Tuple *chunk_index_t = dict_find(iter, MESSAGE_KEY_ResponseChunkIndex);
+      uint32_t chunk_index = prv_uint32_from_tuple(chunk_index_t,
+          s_response_transfer.next_index);
+      LlmResponseChunkResult chunk_result = llm_response_transfer_accept_chunk(
+          &s_response_transfer, chunk_index);
+
+      if (chunk_result == LLM_RESPONSE_CHUNK_DUPLICATE) {
+        APP_LOG(APP_LOG_LEVEL_DEBUG, "ignored duplicate response chunk index=%lu expected=%lu",
+            (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
+      } else if (chunk_result == LLM_RESPONSE_CHUNK_OUT_OF_ORDER) {
+        APP_LOG(APP_LOG_LEVEL_ERROR, "ignored out-of-order response chunk index=%lu expected=%lu",
+            (unsigned long)chunk_index, (unsigned long)s_response_transfer.next_index);
+      } else if (chunk_result == LLM_RESPONSE_CHUNK_ACCEPTED) {
+        APP_LOG(APP_LOG_LEVEL_DEBUG, "response chunk index=%lu len=%u",
+            (unsigned long)chunk_index, (unsigned int)strlen(chunk_t->value->cstring));
+        prv_append_response(chunk_t->value->cstring);
+      }
+    }
+
+    Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
+    if (error_t && llm_response_transfer_finish(&s_response_transfer)) {
+  #if defined(PBL_MICROPHONE)
+      Tuple *retry_available_t = dict_find(iter, MESSAGE_KEY_RetryAvailable);
+      bool retry_available = retry_available_t &&
+          prv_int_from_tuple(retry_available_t, 0) != 0;
+      APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
+      s_request_active = false;
+      s_retry_available = retry_available;
+      s_request_started_at = 0;
+      prv_set_status("Error");
+      speaker_feedback_stop();
+      prv_show_response_view();
+      prv_rewind_request(true);
+      prv_append_error_block(error_t->value->cstring, retry_available);
+  #else
+      APP_LOG(APP_LOG_LEVEL_ERROR, "response error: %s", error_t->value->cstring);
+      prv_set_status("Error");
+      prv_set_response("Error:\n");
+      prv_append_response(error_t->value->cstring);
+      prv_flush_scroll_text_update();
+  #endif
+    }
+
+    Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
+    if (done_t && llm_response_transfer_finish(&s_response_transfer)) {
+      APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
+  #if defined(PBL_MICROPHONE)
+      s_request_active = false;
+      s_retry_available = false;
+      s_request_started_at = 0;
+  #endif
+      prv_set_status("Done");
+      prv_show_response_view();
+      if (s_response[0] == '\0') {
+        prv_set_response("No response text.");
+      } else {
+        prv_flush_scroll_text_update();
+        prv_scroll_to_latest_prompt(false);
+      }
+      prv_buzz_response_done();
+      speaker_feedback_play_response_done();
+    }
   }
 }
 
 static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "inbox dropped reason=%d", reason);
   prv_set_status("Message dropped");
-  prv_append_notice("Response message dropped. Try again.");
+#if defined(PBL_MICROPHONE)
+  if (s_request_active) {
+    prv_send_cancel_message(s_request_id);
+    llm_response_transfer_finish(&s_response_transfer);
+    s_request_id += 1;
+    s_request_active = false;
+    s_retry_available = false;
+    s_request_started_at = 0;
+    speaker_feedback_stop();
+    prv_show_response_view();
+    prv_rewind_request(true);
+    prv_append_error_block("Response message dropped. Retry unavailable.", false);
+    return;
+  }
+#endif
+#if defined(PBL_MICROPHONE)
+  prv_append_error_block("Response message dropped.", false);
+#else
+  prv_set_response("Error:\nResponse message dropped.");
+#endif
 }
 
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
+  if (iter && dict_find(iter, MESSAGE_KEY_RequestCancel)) {
+    return;
+  }
   if (iter && dict_find(iter, MESSAGE_KEY_HealthSummaryRequest)) {
     return;
   }
@@ -2569,11 +2776,35 @@ static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult
     return;
   }
 #endif
+#if defined(PBL_MICROPHONE)
   if (iter && dict_find(iter, MESSAGE_KEY_ChatReset)) {
     s_chat_reset_pending = true;
   }
+#endif
+#if defined(PBL_MICROPHONE)
+  if (iter && (dict_find(iter, MESSAGE_KEY_RequestText) ||
+      dict_find(iter, MESSAGE_KEY_RequestRetry))) {
+    if (s_request_active) {
+      prv_send_cancel_message(s_request_id);
+      llm_response_transfer_finish(&s_response_transfer);
+      s_request_id += 1;
+      s_request_active = false;
+      s_retry_available = false;
+      s_request_started_at = 0;
+      speaker_feedback_stop();
+      prv_show_response_view();
+      prv_rewind_request(true);
+    }
+    prv_append_error_block("Phone connection failed. Safe retry unavailable.", false);
+    return;
+  }
+#endif
   prv_set_status("Phone failed");
-  prv_append_notice("Phone connection failed. Try again.");
+#if defined(PBL_MICROPHONE)
+  prv_append_error_block("Phone connection failed.", false);
+#else
+  prv_set_response("Error:\nPhone connection failed.");
+#endif
 }
 
 static void prv_window_load(Window *window) {
@@ -2589,7 +2820,10 @@ static void prv_window_load(Window *window) {
   layer_add_child(window_layer, scroll_layer_get_layer(s_scroll_layer));
 
   s_text_layer_width = bounds.size.w;
-  s_text_width = bounds.size.w - (TEXT_SIDE_PADDING * 2);
+  if (s_text_width != bounds.size.w - (TEXT_SIDE_PADDING * 2)) {
+    prv_invalidate_text_layout();
+    s_text_width = bounds.size.w - (TEXT_SIDE_PADDING * 2);
+  }
   s_min_text_height = bounds.size.h;
   s_progress_width = bounds.size.w - (PROGRESS_TEXT_SIDE_PADDING * 2);
   s_progress_height = bounds.size.h;
@@ -2649,6 +2883,7 @@ static void prv_window_load(Window *window) {
   text_layer_set_text_alignment(s_progress_output_context_layer, GTextAlignmentRight);
   layer_set_hidden(text_layer_get_layer(s_progress_output_context_layer), true);
   layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_output_context_layer));
+  prv_update_progress_context_layers();
 
   prv_set_status("Ready");
   prv_show_home_screen();
@@ -2662,6 +2897,15 @@ static void prv_window_load(Window *window) {
 
 static void prv_window_unload(Window *window) {
   speaker_feedback_stop();
+#if defined(PBL_MICROPHONE)
+  if (s_request_active) {
+    prv_send_cancel_message(s_request_id);
+    llm_response_transfer_finish(&s_response_transfer);
+  }
+  s_request_active = false;
+  s_retry_available = false;
+  s_request_started_at = 0;
+#endif
 #if defined(PBL_TOUCH)
   prv_stop_touch_momentum();
   touch_service_unsubscribe();
@@ -2701,8 +2945,9 @@ static void prv_init(void) {
   if (persist_exists(PERSIST_KEY_BUZZ_STRENGTH)) {
     s_buzz_strength = prv_normalize_buzz_strength(persist_read_int(PERSIST_KEY_BUZZ_STRENGTH));
   }
-  prv_apply_speaker_feedback_enabled(persist_exists(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) ?
-      persist_read_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) : 0, false);
+  s_speaker_feedback_enabled = persist_exists(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) ?
+      persist_read_int(PERSIST_KEY_SPEAKER_FEEDBACK_ENABLED) != 0 : false;
+  speaker_feedback_set_enabled(s_speaker_feedback_enabled);
   if (persist_exists(PERSIST_KEY_SCROLL_LINES)) {
     s_scroll_lines = prv_normalize_scroll_lines(persist_read_int(PERSIST_KEY_SCROLL_LINES));
   }
@@ -2724,10 +2969,14 @@ static void prv_init(void) {
     s_show_output_context_size = persist_read_int(PERSIST_KEY_SHOW_OUTPUT_CONTEXT_SIZE) != 0;
   }
 
-  prv_apply_text_color(persist_exists(PERSIST_KEY_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_TEXT_COLOR) : TEXT_COLOR_DEFAULT, false);
-  prv_apply_background_color(persist_exists(PERSIST_KEY_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_BACKGROUND_COLOR) : BACKGROUND_COLOR_DEFAULT, false);
-  prv_apply_prompt_background_color(persist_exists(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) : PROMPT_BACKGROUND_COLOR_DEFAULT, false);
-  prv_apply_bold_text_color(persist_exists(PERSIST_KEY_BOLD_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_BOLD_TEXT_COLOR) : BOLD_TEXT_COLOR_DEFAULT, false);
+  s_text_color_hex = persist_exists(PERSIST_KEY_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_TEXT_COLOR) : TEXT_COLOR_DEFAULT;
+  s_background_color_hex = persist_exists(PERSIST_KEY_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_BACKGROUND_COLOR) : BACKGROUND_COLOR_DEFAULT;
+  s_prompt_background_color_hex = persist_exists(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) ? persist_read_int(PERSIST_KEY_PROMPT_BACKGROUND_COLOR) : PROMPT_BACKGROUND_COLOR_DEFAULT;
+  s_bold_text_color_hex = persist_exists(PERSIST_KEY_BOLD_TEXT_COLOR) ? persist_read_int(PERSIST_KEY_BOLD_TEXT_COLOR) : BOLD_TEXT_COLOR_DEFAULT;
+  s_text_color = prv_color_from_hex(s_text_color_hex);
+  s_background_color = prv_color_from_hex(s_background_color_hex);
+  s_prompt_background_color = prv_color_from_hex(s_prompt_background_color_hex);
+  s_bold_text_color = prv_color_from_hex(s_bold_text_color_hex);
 
   AppLaunchReason reason = launch_reason();
   s_launched_from_quick_launch = reason == APP_LAUNCH_QUICK_LAUNCH;

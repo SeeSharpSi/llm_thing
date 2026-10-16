@@ -4,6 +4,7 @@ var test = require('node:test');
 var assert = require('node:assert/strict');
 var JSDOM = require('jsdom').JSDOM;
 var component = require('../../src/pkjs/model_selector_component');
+var clayConfig = require('../../src/pkjs/config');
 
 function createConfigItem(value) {
   var listeners = [];
@@ -145,7 +146,7 @@ test('keeps saved custom model when preloaded list does not contain it', functio
   assert.equal(component.manipulator.get.call(item), 'provider-custom');
 });
 
-test('endpoint changes invalidate models and Load Models submits a phone-side refresh', function() {
+test('endpoint changes invalidate models and Save & Refresh submits the explicit refresh flow', function() {
   var item = createItem({
     endpoint: 'https://old.example/v1/responses',
     apiKey: 'test-secret',
@@ -155,11 +156,28 @@ test('endpoint changes invalidate models and Load Models submits a phone-side re
 
   item.endpoint.setValue('https://new.example/v1/responses');
   assert.equal(select.disabled, true);
-  assert.match(item.root.querySelector('[data-model-status]').textContent, /changed/);
+  assert.match(item.root.querySelector('[data-model-status]').textContent, /Save & Refresh Models/);
+  assert.match(item.root.querySelector('[data-model-status]').textContent, /reopen settings/);
 
   click(item, '[data-model-load]');
+  assert.equal(item.root.querySelector('[data-model-load]').textContent, 'Save & Refresh Models');
   assert.equal(item.reloadModelsItem.get(), 'reload_models');
   assert.equal(item.submitCount(), 1);
   assert.equal(item.root.querySelector('[data-model-load]').disabled, true);
-  assert.equal(item.root.querySelector('[data-model-status]').textContent, 'Saving settings and loading models...');
+  assert.equal(item.root.querySelector('[data-model-status]').textContent,
+    'Saving settings and refreshing models. Reopen settings to select the updated list.');
+});
+
+test('manual entry and reopen-after-refresh instructions are available without a model list', function() {
+  var item = createItem();
+  var customInput = item.root.querySelector('[data-model-custom]');
+  var select = item.root.querySelector('[data-model-select]');
+
+  assert.equal(select.disabled, true);
+  assert.equal(customInput.parentNode.style.display, 'block');
+  assert.match(component.defaults.description, /reopen settings/i);
+  assert.match(JSON.stringify(clayConfig), /Save & Refresh Models.*reopen settings/i);
+  customInput.value = 'manual-provider-model';
+  customInput.dispatchEvent(new item.window.Event('input', { bubbles: true }));
+  assert.equal(component.manipulator.get.call(item), 'manual-provider-model');
 });

@@ -48,7 +48,7 @@ function createHarness(options) {
   };
   var watch = {
     calls: [],
-    syncWatchSettings: function(value) { watch.calls.push(['sync', value]); },
+    syncWatchSettings: function(value, force) { watch.calls.push(['sync', value, force]); },
     handleHealthInfoResponse: function(value) { watch.calls.push(['health', value]); },
     sendPastChatsError: function(value) { watch.calls.push(['list-error', value]); },
     sendPastChats: function(value) { watch.calls.push(['list', value]); },
@@ -62,14 +62,33 @@ function createHarness(options) {
     loadSavedChat: function(id) { return id === 'one' ? { id: 'one', messages: [] } : null; },
     deleteSavedChat: function(id) { model.calls.push(['delete', id]); },
     deleteAllSavedChats: function() { model.calls.push(['delete-all']); },
-    requestCompletion: function(id, text) { model.calls.push(['request', id, text]); }
+    requestCompletion: function(id, text) { model.calls.push(['request', id, text]); },
+    cancelCompletion: function(id) { model.calls.push(['cancel', id]); },
+    retryCompletion: function(id, failedId) { model.calls.push(['retry', id, failedId]); }
   };
   var modelDiscovery = {
-    calls: [],
+    discoverCalls: [],
+    cachedCalls: [],
+    refreshCalls: [],
+    refreshCallbacks: [],
     discover: function(value, callback) {
-      modelDiscovery.calls.push(value);
-      callback({ models: ['model-a', "$'model-b"], status: '2 models loaded.' });
+      modelDiscovery.discoverCalls.push(value);
+      if (callback) {
+        modelDiscovery.discoveryCallback = callback;
+      }
+    },
+    getCached: function(value) {
+      modelDiscovery.cachedCalls.push(value);
+      return { models: ['model-a', "$'model-b"], status: '2 cached models.' };
+    },
+    refresh: function(value, callback) {
+      modelDiscovery.refreshCalls.push(value);
+      modelDiscovery.refreshCallbacks.push(callback);
     }
+  };
+  var tools = {
+    warmCalls: [],
+    warmMcpTools: function(value) { tools.warmCalls.push(value); }
   };
   var config = [{
     type: 'section',
@@ -84,6 +103,7 @@ function createHarness(options) {
     './model_discovery': modelDiscovery,
     './model_selector_component': { name: 'model_selector' },
     './settings': settings,
+    './tools': tools,
     './watch': watch,
     './model': model,
     './memory_store': options.memoryStore || {
@@ -93,7 +113,7 @@ function createHarness(options) {
     }
   });
 
-  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery };
+  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery, tools: tools };
 }
 
 test.afterEach(function() {
@@ -103,7 +123,7 @@ test.afterEach(function() {
   load.clearModule(indexPath);
 });
 
-test('registers Clay and handles ready and configuration open', function() {
+test('opens configuration synchronously from cache without starting model discovery', function() {
   var harness = createHarness();
 
   assert.deepEqual(harness.clay.options, { autoHandleEvents: false });
@@ -114,13 +134,17 @@ test('registers Clay and handles ready and configuration open', function() {
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
+  assert.equal(harness.watch.calls[0][2], true, 'startup always performs full settings sync');
+  assert.deepEqual(harness.tools.warmCalls, [harness.settings.loadSettings()]);
 
   global.Pebble.emit('showConfiguration');
-  assert.equal(harness.clay.currentSettings.FontSize, 18);
-  assert.equal(harness.modelDiscovery.calls.length, 1);
-  assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[0].modelsEncoded)), ['model-a', "$'model-b"]);
-  assert.equal(harness.clay.config[0].items[0].modelsStatus, '2 models loaded.');
   assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
+  assert.equal(harness.clay.currentSettings.FontSize, 18);
+  assert.equal(harness.modelDiscovery.cachedCalls.length, 1);
+  assert.equal(harness.modelDiscovery.discoverCalls.length, 0);
+  assert.equal(harness.modelDiscovery.refreshCalls.length, 0);
+  assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[0].modelsEncoded)), ['model-a', "$'model-b"]);
+  assert.equal(harness.clay.config[0].items[0].modelsStatus, '2 cached models.');
 });
 
 test('memory manager visibility follows its toggle after Clay builds', function() {
@@ -284,6 +308,8 @@ test('webview close deletes chats once for the delete action without reloading',
   assert.deepEqual(harness.model.calls, [['delete-all']]);
   assert.equal(harness.settings.saved.length, 1);
   assert.equal(harness.watch.calls[0][0], 'sync');
+  assert.deepEqual(harness.tools.warmCalls, [harness.settings.saved[0]], 'settings save warms MCP definitions');
+  assert.equal(harness.watch.calls[0][2], undefined, 'settings save uses changed-settings deduplication');
   assert.equal(harness.watch.calls[0][1].FontSize, 24);
   assert.ok(!('ConfigAction' in harness.settings.saved[0]));
   assert.ok(!('DeleteAllPastChats' in harness.settings.saved[0]));
@@ -302,7 +328,7 @@ test('webview close object-wrapped delete action unwraps and executes once', fun
   assert.deepEqual(global.Pebble.openedUrls, []);
 });
 
-test('model reload action saves settings and reopens with phone-side discovery', function() {
+test('model refresh action saves settings, refreshes cache, and never reopens configuration', function() {
   var harness = createHarness();
 
   global.Pebble.emit('webviewclosed', {
@@ -316,13 +342,14 @@ test('model reload action saves settings and reopens with phone-side discovery',
   assert.deepEqual(harness.model.calls, []);
   assert.equal(harness.settings.saved.length, 1);
   assert.equal(harness.watch.calls[0][0], 'sync');
-  assert.equal(harness.modelDiscovery.calls.length, 1);
-  assert.equal(harness.modelDiscovery.calls[0].Endpoint, 'https://new.example/v1/responses');
+  assert.equal(harness.modelDiscovery.refreshCalls.length, 1);
+  assert.equal(harness.modelDiscovery.refreshCalls[0].Endpoint, 'https://new.example/v1/responses');
+  assert.deepEqual(harness.tools.warmCalls, [harness.settings.saved[0]]);
   assert.ok(!('ConfigAction' in harness.settings.saved[0]));
   assert.ok(!('DeleteAllPastChats' in harness.settings.saved[0]));
-  assert.ok(!('ConfigAction' in harness.clay.currentSettings));
-  assert.ok(!('DeleteAllPastChats' in harness.clay.currentSettings));
-  assert.deepEqual(global.Pebble.openedUrls, ['data:text/html,test']);
+  assert.deepEqual(global.Pebble.openedUrls, []);
+  harness.modelDiscovery.refreshCallbacks[0]({ models: ['fresh-model'], status: '1 model loaded.' });
+  assert.deepEqual(global.Pebble.openedUrls, []);
 });
 
 test('empty or unknown configuration actions perform neither flow and stay unpersisted', function() {
@@ -330,7 +357,8 @@ test('empty or unknown configuration actions perform neither flow and stay unper
 
   global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: '', FontSize: 20 }) });
   assert.deepEqual(harness.model.calls, []);
-  assert.equal(harness.modelDiscovery.calls.length, 0);
+  assert.equal(harness.modelDiscovery.discoverCalls.length, 0);
+  assert.equal(harness.modelDiscovery.refreshCalls.length, 0);
   assert.equal(harness.settings.saved.length, 1);
   assert.equal(harness.watch.calls.length, 1);
   assert.ok(!('ConfigAction' in harness.settings.saved[0]));
@@ -339,7 +367,8 @@ test('empty or unknown configuration actions perform neither flow and stay unper
   global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: true }) });
   global.Pebble.emit('webviewclosed', { response: JSON.stringify({ ConfigAction: 'bogus_action' }) });
   assert.deepEqual(harness.model.calls, []);
-  assert.equal(harness.modelDiscovery.calls.length, 0);
+  assert.equal(harness.modelDiscovery.discoverCalls.length, 0);
+  assert.equal(harness.modelDiscovery.refreshCalls.length, 0);
   assert.equal(harness.settings.saved.length, 3);
   assert.deepEqual(global.Pebble.openedUrls, []);
 });
@@ -362,6 +391,15 @@ test('appmessage routes reset, request, saved chat, delete, and health flows', f
   assert.ok(harness.watch.calls.some(function(call) { return call[0] === 'transcript'; }));
   assert.ok(harness.watch.calls.some(function(call) { return call[0] === 'deleted'; }));
   assert.ok(harness.watch.calls.some(function(call) { return call[0] === 'health'; }));
+});
+
+test('appmessage routes cancel and safe retry request ids', function() {
+  var harness = createHarness();
+
+  global.Pebble.emit('appmessage', { payload: { RequestId: 42, RequestCancel: 1 } });
+  global.Pebble.emit('appmessage', { payload: { RequestId: 43, RequestRetry: 42 } });
+
+  assert.deepEqual(harness.model.calls, [['cancel', 42], ['retry', 43, 42]]);
 });
 
 test('saved-chat requests reject disabled preservation and missing chats', function() {

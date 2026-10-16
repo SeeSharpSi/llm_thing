@@ -9,6 +9,7 @@ var settings = require('./settings');
 var watch = require('./watch');
 var model = require('./model');
 var memoryStore = require('./memory_store');
+var tools = require('./tools');
 
 function clayCustomFn() {
   var self = this;
@@ -149,17 +150,17 @@ function openConfiguration(currentSettings) {
     }
   }
   clay.setSettings(configurationSettings);
-  modelDiscovery.discover(currentSettings, function(result) {
-    settings.logDebug('configuration model discovery count=' + result.models.length);
-    setDiscoveredModels(result);
-    Pebble.openURL(clay.generateUrl());
-  });
+  setDiscoveredModels(modelDiscovery.getCached(currentSettings));
+  Pebble.openURL(clay.generateUrl());
 }
 
 Pebble.addEventListener('ready', function() {
+  var startupSettings = settings.loadSettings();
+
   settings.logDebug('ready');
   model.resetChatHistory();
-  watch.syncWatchSettings(settings.loadSettings());
+  watch.syncWatchSettings(startupSettings, true);
+  tools.warmMcpTools(startupSettings);
 });
 
 Pebble.addEventListener('showConfiguration', function() {
@@ -217,15 +218,18 @@ Pebble.addEventListener('webviewclosed', function(e) {
     settings.logDebug('delete all saved chats from settings');
     model.deleteAllSavedChats();
   } else if (settingsAction === 'reload_models') {
-    settings.logDebug('reopening configuration with refreshed models');
+    settings.logDebug('refreshing model list after configuration save');
   } else if (settingsAction) {
     settings.logDebug('ignored unknown configuration action');
     settingsAction = '';
   }
   settings.saveSettings(normalizedSettings);
   watch.syncWatchSettings(normalizedSettings);
+  tools.warmMcpTools(normalizedSettings);
   if (settingsAction === 'reload_models') {
-    openConfiguration(normalizedSettings);
+    modelDiscovery.refresh(normalizedSettings, function(result) {
+      settings.logDebug('configuration model discovery count=' + result.models.length);
+    });
   }
 });
 
@@ -235,6 +239,18 @@ Pebble.addEventListener('appmessage', function(e) {
 
   if (dict.HealthSummaryRequest) {
     watch.handleHealthInfoResponse(dict);
+    return;
+  }
+
+  if (dict.RequestCancel) {
+    settings.logDebug('appmessage request cancel id=' + requestId);
+    model.cancelCompletion(requestId);
+    return;
+  }
+
+  if (dict.RequestRetry !== undefined && dict.RequestRetry !== null) {
+    settings.logDebug('appmessage request retry id=' + requestId + ' failed_id=' + dict.RequestRetry);
+    model.retryCompletion(requestId, dict.RequestRetry);
     return;
   }
 

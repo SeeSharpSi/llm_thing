@@ -18,10 +18,18 @@ var s_saved_chat_history = [];
 var s_active_chat_id = null;
 var s_conversation_generation = 0;
 var s_active_completion = null;
+var s_retry_capsule = null;
 var s_native_unsupported_keys = {};
 var MAX_TOOL_RESULT_CHARS = 6000;
 var MAX_TOOL_RESULTS_TOTAL_CHARS = 12000;
+var MAX_RETRY_CAPSULE_BYTES = 64 * 1024;
+var MAX_RETRY_CAPSULE_NODES = 4096;
+var MAX_RETRY_CAPSULE_DEPTH = 32;
 var TOOL_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
+var TOOL_RESULT_ERROR_RESERVE_CHARS = 96;
+var TOOL_RESULT_ERROR_OMISSION = 'Tool result omitted: budget exhausted';
+var TOOL_ERROR_OMISSION = 'Tool error omitted: exceeds reserved allowance';
+var TOOL_CAP_NOTICE = 'Tool call budget exhausted. Answer using gathered results.';
 var DEFAULT_MESSAGES_MAX_TOKENS = 4096;
 var ANTHROPIC_API_VERSION = '2023-06-01';
 var NATIVE_UNSUPPORTED_TTL_MS = 5 * 60 * 1000;
@@ -102,10 +110,14 @@ function buildToolGuidance(toolDefinitions, maxToolCalls) {
 
   if (hasTimelineTools(toolDefinitions)) {
     text += '\nTimeline tool rules:' +
-      '\n- For reminder requests, alarms, alerts, or phrases like "remind me", call pebble_timeline_create_reminder.' +
-      '\n- For non-reminder calendar events, schedule items, or timeline pins, call pebble_timeline_create_or_update_pin.' +
-      '\n- To change an existing pin, first call pebble_timeline_list_pins to find its id, then call pebble_timeline_edit_pin with the same id (same-ID PUT replaces the pin entirely).' +
-      '\n- Do not say a reminder, event, or pin was created, updated, or deleted unless the timeline tool result succeeded.' +
+      '\n- For reminder requests or phrases like "remind me", call pebble_timeline_create_reminder.' +
+      '\n- This creates a scheduled Pebble Timeline reminder notification attached to a pin, not an OS/system alarm. For an alarm request, explain this limitation and offer the Timeline reminder as the available alternative; never claim a system alarm was set.' +
+      '\n- Set reminderTime for an exact notification time, remindMinutesBefore for relative timing (0 means pin time), or omit both to use time.' +
+      '\n- For events without a scheduled reminder, call pebble_timeline_create_pin.' +
+      '\n- Creation tools always make new pins with generated ids; never supply an id when creating.' +
+      '\n- To change an existing pin, first call pebble_timeline_list_pins and use a listed id with pebble_timeline_edit_pin. Only supplied fields change; other fields stay as stored.' +
+      '\n- Empty string clears supported optional text fields; integer and enum fields cannot be cleared with empty string. Use clearReminder:true to remove scheduled alerts.' +
+      '\n- Do not say a reminder, event, or pin was created, updated, or deleted unless the timeline tool result succeeded. Local acceptance does not confirm watch delivery.' +
       '\n- After a successful timeline tool result, include the title/time when known and the returned pin id.' +
       '\n- If title, time, or target pin is ambiguous, ask one concise clarification instead of calling a tool.';
   }
@@ -397,14 +409,15 @@ function copyRequestOptions(options) {
   return result;
 }
 
-function buildConversation(settings, userText, toolInstructions) {
+function buildConversation(settings, userText, toolInstructions, history) {
   var conversation = [
     { role: 'system', content: buildSystemPrompt(settings, toolInstructions) }
   ];
   var i;
 
-  for (i = 0; i < s_chat_history.length; i += 1) {
-    conversation.push(s_chat_history[i]);
+  history = history || s_chat_history;
+  for (i = 0; i < history.length; i += 1) {
+    conversation.push(history[i]);
   }
 
   conversation.push({ role: 'user', content: userText });
@@ -535,6 +548,279 @@ function isCurrentCompletion(context) {
     watch.isCurrentRequest(context.requestId);
 }
 
+function cloneJsonValue(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (e) {
+    return null;
+  }
+}
+
+function addRetryCapsuleBytes(state, amount) {
+  if (amount < 0 || state.bytes + amount > MAX_RETRY_CAPSULE_BYTES) {
+    return false;
+  }
+  state.bytes += amount;
+  return true;
+}
+
+function addRetryCapsuleString(state, value) {
+  var i;
+  var code;
+  var next;
+
+  if (typeof value !== 'string' || value.length > MAX_RETRY_CAPSULE_BYTES ||
+      !addRetryCapsuleBytes(state, 2)) {
+    return false;
+  }
+  for (i = 0; i < value.length; i += 1) {
+    code = value.charCodeAt(i);
+    if (code === 0x22 || code === 0x5c) {
+      if (!addRetryCapsuleBytes(state, 2)) { return false; }
+    } else if (code < 0x20) {
+      if (!addRetryCapsuleBytes(state,
+          code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d ? 2 : 6)) {
+        return false;
+      }
+    } else if (code <= 0x7f) {
+      if (!addRetryCapsuleBytes(state, 1)) { return false; }
+    } else if (code <= 0x7ff) {
+      if (!addRetryCapsuleBytes(state, 2)) { return false; }
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      next = i + 1 < value.length ? value.charCodeAt(i + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        if (!addRetryCapsuleBytes(state, 4)) { return false; }
+        i += 1;
+      } else if (!addRetryCapsuleBytes(state, 6)) {
+        return false;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      if (!addRetryCapsuleBytes(state, 6)) { return false; }
+    } else if (!addRetryCapsuleBytes(state, 3)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function cloneBoundedRetryValue(value, state, depth) {
+  var type;
+  var result;
+  var key;
+  var child;
+  var count = 0;
+  var separator = false;
+  var i;
+  var numberText;
+
+  if (depth > MAX_RETRY_CAPSULE_DEPTH || state.nodes >= MAX_RETRY_CAPSULE_NODES) {
+    return undefined;
+  }
+  state.nodes += 1;
+  if (value === null) {
+    return addRetryCapsuleBytes(state, 4) ? null : undefined;
+  }
+
+  type = typeof value;
+  if (type === 'string') {
+    return addRetryCapsuleString(state, value) ? value : undefined;
+  }
+  if (type === 'boolean') {
+    return addRetryCapsuleBytes(state, value ? 4 : 5) ? value : undefined;
+  }
+  if (type === 'number') {
+    if (!isFinite(value)) { return undefined; }
+    numberText = String(value);
+    return addRetryCapsuleBytes(state, numberText.length) ? value : undefined;
+  }
+  if (type !== 'object') {
+    return undefined;
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Array]') {
+    if (value.length > MAX_RETRY_CAPSULE_NODES - state.nodes ||
+        !addRetryCapsuleBytes(state, 1)) {
+      return undefined;
+    }
+    result = [];
+    for (i = 0; i < value.length; i += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, i) ||
+          (i > 0 && !addRetryCapsuleBytes(state, 1))) {
+        return undefined;
+      }
+      child = cloneBoundedRetryValue(value[i], state, depth + 1);
+      if (child === undefined) { return undefined; }
+      result.push(child);
+    }
+    return addRetryCapsuleBytes(state, 1) ? result : undefined;
+  }
+  if (Object.prototype.toString.call(value) !== '[object Object]' ||
+      !addRetryCapsuleBytes(state, 1)) {
+    return undefined;
+  }
+
+  result = Object.create(null);
+  for (key in value) {
+    count += 1;
+    if (count > MAX_RETRY_CAPSULE_NODES || state.nodes >= MAX_RETRY_CAPSULE_NODES) {
+      return undefined;
+    }
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      continue;
+    }
+    if ((separator && !addRetryCapsuleBytes(state, 1)) ||
+        !addRetryCapsuleString(state, key) || !addRetryCapsuleBytes(state, 1)) {
+      return undefined;
+    }
+    child = cloneBoundedRetryValue(value[key], state, depth + 1);
+    if (child === undefined) { return undefined; }
+    result[key] = child;
+    separator = true;
+  }
+  return addRetryCapsuleBytes(state, 1) ? result : undefined;
+}
+
+function cloneBoundedRetryCapsule(capsule) {
+  var state = { bytes: 0, nodes: 0 };
+  var copy = cloneBoundedRetryValue(capsule, state, 0);
+  var serialized;
+  var bytes = 0;
+  var i;
+  var code;
+  var next;
+
+  if (copy === undefined) {
+    return null;
+  }
+  try {
+    serialized = JSON.stringify(copy);
+  } catch (e) {
+    return null;
+  }
+  if (typeof serialized !== 'string' || serialized.length > MAX_RETRY_CAPSULE_BYTES) {
+    return null;
+  }
+  for (i = 0; i < serialized.length; i += 1) {
+    code = serialized.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < serialized.length &&
+        (next = serialized.charCodeAt(i + 1)) >= 0xdc00 && next <= 0xdfff) {
+      bytes += 4;
+      i += 1;
+    } else {
+      bytes += 3;
+    }
+    if (bytes > MAX_RETRY_CAPSULE_BYTES) {
+      return null;
+    }
+  }
+  return copy;
+}
+
+function storeRetryCapsule(capsule) {
+  var copy;
+
+  s_retry_capsule = null;
+  copy = cloneBoundedRetryCapsule(capsule);
+  if (!copy) {
+    common.logDebug('retry capsule rejected by size or shape limit');
+    return false;
+  }
+  s_retry_capsule = copy;
+  return true;
+}
+
+function rememberModelFailure(context) {
+  var state = context && context.retryState;
+
+  if (!state) {
+    s_retry_capsule = null;
+    return false;
+  }
+  if (!state.toolsStarted) {
+    return rememberBeforeToolsFailure(context);
+  }
+  return storeRetryCapsule({
+    requestId: context.requestId,
+    generation: context.generation,
+    kind: 'final-only',
+    conversation: state.baseConversation || state.conversation,
+    settings: state.settings,
+    userText: context.userText,
+    mode: state.mode || 'text',
+    thinkingTrace: state.thinkingTrace || ''
+  });
+}
+
+function rememberBeforeToolsFailure(context) {
+  return storeRetryCapsule({
+    requestId: context.requestId,
+    generation: context.generation,
+    kind: 'before-tools',
+    userText: context.userText,
+    history: context.historyAtStart
+  });
+}
+
+function rememberSetupFailure(context) {
+  return storeRetryCapsule({
+    requestId: context.requestId,
+    generation: context.generation,
+    kind: 'setup',
+    userText: context.userText,
+    history: context.historyAtStart
+  });
+}
+
+function rememberDeliveryFailure(context, settings, userText, text, answerText) {
+  return storeRetryCapsule({
+    requestId: context.requestId,
+    generation: context.generation,
+    kind: 'delivery',
+    settings: { PreserveChats: !!settings.PreserveChats },
+    userText: userText,
+    text: String(text || ''),
+    answerText: String(answerText || '')
+  });
+}
+
+function setModelRetryState(context, settings, conversation, toolDefinitions, toolMap, mode,
+                            round, usedToolCalls, mcpToolCallCounts, thinkingTrace,
+                            remainingToolResultChars, baseConversation) {
+  context.retryState = {
+    settings: settings,
+    conversation: conversation,
+    baseConversation: baseConversation || null,
+    toolDefinitions: toolDefinitions,
+    toolMap: toolMap,
+    mode: mode,
+    round: round,
+    usedToolCalls: usedToolCalls,
+    mcpToolCallCounts: mcpToolCallCounts,
+    thinkingTrace: thinkingTrace,
+    remainingToolResultChars: remainingToolResultChars,
+    toolsStarted: context.toolsStarted === true
+  };
+}
+
+function sendCompletionResponse(context, settings, userText, text) {
+  watch.sendResponse(context.requestId, settings, text, function(sendError) {
+    if (!sendError && isCurrentCompletion(context)) {
+      s_retry_capsule = null;
+      rememberChatTurn(settings, userText, text);
+    }
+    finishCompletionContext(context);
+  }, function(sendError, preparedText) {
+    if (!sendError || !isCurrentCompletion(context)) {
+      return false;
+    }
+    return rememberDeliveryFailure(context, settings, userText, preparedText, text);
+  });
+}
+
 function finishCompletionContext(context) {
   clearCompletionTimers(context);
   if (s_active_completion !== context) {
@@ -545,18 +831,33 @@ function finishCompletionContext(context) {
 }
 
 function failCompletionContext(context, message) {
+  var retryAvailable;
+
   if (!isCurrentCompletion(context)) {
     return;
   }
+  if (context.retryKind === 'setup') {
+    rememberSetupFailure(context);
+  } else if (context.retryKind === 'before-tools') {
+    rememberBeforeToolsFailure(context);
+  }
+  if (s_retry_capsule && Number(s_retry_capsule.requestId) === Number(context.requestId) &&
+      s_retry_capsule.generation !== context.generation) {
+    s_retry_capsule = null;
+  }
+  retryAvailable = !!(s_retry_capsule &&
+      Number(s_retry_capsule.requestId) === Number(context.requestId) &&
+      s_retry_capsule.generation === context.generation);
   watch.sendError(context.requestId, message, function() {
     finishCompletionContext(context);
-  });
+  }, retryAvailable);
 }
 
 function invalidateConversationGeneration() {
   var context = s_active_completion;
 
   s_conversation_generation += 1;
+  s_retry_capsule = null;
   s_active_completion = null;
   if (context) {
     clearCompletionTimers(context);
@@ -594,6 +895,9 @@ function loadSavedChat(chatId) {
 function deleteSavedChat(chatId) {
   var deleted = chatStore.deleteChat(chatId);
 
+  if (deleted) {
+    s_retry_capsule = null;
+  }
   if (deleted && s_active_chat_id === String(chatId || '')) {
     invalidateConversationGeneration();
     s_active_chat_id = null;
@@ -888,6 +1192,9 @@ function requestModel(settings, conversation, requestId, options, callback) {
     done = true;
     if (!isCurrentCompletion(completionContext)) {
       return;
+    }
+    if (error) {
+      rememberModelFailure(completionContext);
     }
     callback(error, json, meta);
   }
@@ -1612,56 +1919,298 @@ function extractToolCallBatch(json, mode, toolMap) {
   return { source: '', calls: [] };
 }
 
-function buildToolCapNotice(skippedCount) {
-  var text = 'Tool call budget exhausted for this request. No more tool calls are available.';
-  if (skippedCount > 0) {
-    text += ' ' + skippedCount + ' requested tool call(s) were not run.';
-  }
-  return text +
-    '\nDo not output tool_calls JSON.' +
-    '\nWrite the final answer now using only the original request, prior conversation, and tool results already provided.' +
-    '\nIf you needed more tool calls, start with a brief caveat that you are out of tool calls.';
+function buildToolCapNotice() {
+  return TOOL_CAP_NOTICE;
 }
 
 function formatToolResultOutput(result) {
-  if (result.error) {
-    return common.safeJson({ error: result.error });
-  }
-
-  return common.safeJson({ result: result.result });
+  var sanitized = sanitizeToolResult(result);
+  if (sanitized.error) { return common.safeJson({ error: sanitized.error }); }
+  return common.safeJson({ result: sanitized.result });
 }
 
-function capToolResults(results, remainingChars) {
+function capErrorText(value) {
+  var text = String(value || '');
+  var suffix = '... [truncated]';
+  var maximum = 900;
+  if (text.length <= maximum) { return text; }
+  return text.substring(0, maximum - suffix.length) + suffix;
+}
+
+function boundedToolError(value) {
+  var text = String(value || '');
+  if (text.length <= MAX_TOOL_RESULT_CHARS) { return text; }
+  return TOOL_ERROR_OMISSION;
+}
+
+function capPlainToolValue(value, limit) {
+  var text = String(value || '');
+  if (text.length <= limit) { return text; }
+  if (limit > TOOL_RESULT_TRUNCATION_SUFFIX.length) {
+    return text.substring(0, limit - TOOL_RESULT_TRUNCATION_SUFFIX.length) + TOOL_RESULT_TRUNCATION_SUFFIX;
+  }
+  return null;
+}
+
+function structuredOmission(reason, limit) {
+  var text = common.safeJson({ error: reason });
+  if (text.length <= limit) { return text; }
+  text = common.safeJson({ error: 'Omitted' });
+  if (text.length <= limit) { return text; }
+  return limit >= 4 ? 'null' : null;
+}
+
+function isTrustedMcpResultEnvelope(result, value) {
+  return result && result._mcpResultEnvelope === true && value && typeof value === 'object' && value.mcpResult === true &&
+    typeof value.text === 'string' && Object.prototype.hasOwnProperty.call(value, 'structuredContent');
+}
+
+function capMcpResultEnvelope(value, limit) {
+  var text = value.text;
+  var structuredContent = value.structuredContent;
+  var textTruncated = value.textTruncated === true;
+  var structuredContentOmitted = value.structuredContentOmitted === true;
+  var omittedBlocks = typeof value.omittedBlocks === 'number' && isFinite(value.omittedBlocks) && value.omittedBlocks > 0 ? Math.floor(value.omittedBlocks) : 0;
+  var low;
+  var high;
+  var middle;
+  var candidate;
+  var best = null;
+
+  function serialize(candidateText) {
+    var output = {
+      mcpResult: true,
+      text: candidateText,
+      structuredContent: structuredContent
+    };
+    if (textTruncated) { output.textTruncated = true; }
+    if (structuredContentOmitted) { output.structuredContentOmitted = true; }
+    if (omittedBlocks) { output.omittedBlocks = omittedBlocks; }
+    return JSON.stringify(output);
+  }
+
+  try {
+    candidate = serialize(text);
+    if (candidate.length <= limit) { return candidate; }
+
+    textTruncated = true;
+    candidate = serialize('');
+    if (candidate.length > limit) {
+      structuredContent = { error: 'Structured MCP content omitted: remaining tool-result budget is too small' };
+      structuredContentOmitted = true;
+      candidate = serialize('');
+      if (candidate.length > limit) { return null; }
+    }
+
+    low = 0;
+    high = text.length;
+    while (low <= high) {
+      middle = Math.floor((low + high) / 2);
+      if (middle > 0 && middle < text.length && text.charCodeAt(middle - 1) >= 0xD800 && text.charCodeAt(middle - 1) <= 0xDBFF &&
+          text.charCodeAt(middle) >= 0xDC00 && text.charCodeAt(middle) <= 0xDFFF) {
+        middle -= 1;
+      }
+      candidate = serialize(text.substring(0, middle));
+      if (candidate.length <= limit) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    return best;
+  } catch (e) {
+    return null;
+  }
+}
+
+function sanitizeToolResult(result) {
+  var output = {};
+  var value;
+  var parsed;
+  var structured;
+  if (!result || typeof result !== 'object') { result = {}; }
+  if (result.id !== undefined) { output.id = capErrorText(result.id).substring(0, 128); }
+  if (result.call_id !== undefined) { output.call_id = capErrorText(result.call_id).substring(0, 128); }
+  if (result.name !== undefined) { output.name = capErrorText(result.name).substring(0, 128); }
+  if (result.error) {
+    output.error = boundedToolError(result.error);
+    return output;
+  }
+  if (result.result === undefined) { return output; }
+
+  structured = result._structuredResult === true ||
+    (result.result !== null && typeof result.result === 'object');
+  if (structured) {
+    value = typeof result.result === 'string' ? result.result : common.safeJson(result.result);
+    try {
+      parsed = JSON.parse(value);
+      output.result = parsed;
+    } catch (e) {
+      output.result = { error: 'Structured tool result omitted: invalid JSON' };
+    }
+    return output;
+  }
+
+  output.result = String(result.result);
+  return output;
+}
+
+function sanitizeToolResults(results) {
+  var sanitized = [];
+  var i;
+  for (i = 0; i < results.length; i += 1) {
+    sanitized.push(sanitizeToolResult(results[i]));
+  }
+  return sanitized;
+}
+
+function errorForReservedAllowance(error, allowance) {
+  var text = String(error || '');
+  if (text.length <= allowance && text.length <= MAX_TOOL_RESULT_CHARS) { return text; }
+  if (TOOL_ERROR_OMISSION.length <= allowance) { return TOOL_ERROR_OMISSION; }
+  if ('Omitted'.length <= allowance) { return 'Omitted'; }
+  return '';
+}
+
+function capToolResults(results, remainingChars, options) {
   var i;
   var result;
   var value;
   var limit;
+  var structured;
+  var parsed;
+  var futureSlots;
+  var slotCount;
+  var noticeLength;
+  var slotAllowance;
+  var remainingData;
+  var omissionReason;
+  var omission;
+
+  options = options || {};
+  remainingChars = typeof remainingChars === 'number' && isFinite(remainingChars) ? Math.max(0, remainingChars) : MAX_TOOL_RESULTS_TOTAL_CHARS;
+  futureSlots = typeof options.futureSlots === 'number' && isFinite(options.futureSlots) ? Math.max(0, Math.floor(options.futureSlots)) : 0;
+  slotCount = results.length + futureSlots;
+  noticeLength = options.includeCapNotice || futureSlots > 0 ? TOOL_CAP_NOTICE.length : 0;
+  slotAllowance = slotCount > 0 ? Math.min(
+    TOOL_RESULT_ERROR_RESERVE_CHARS,
+    Math.floor(Math.max(0, remainingChars - noticeLength) / slotCount)
+  ) : 0;
+  remainingData = Math.max(0, remainingChars - noticeLength - slotAllowance * slotCount);
 
   for (i = 0; i < results.length; i += 1) {
     result = results[i] || {};
-    if (result.error || result.result === undefined || result.result === null) {
+    if (result.error) {
+      value = String(result.error);
+      limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingData + slotAllowance);
+      if (value.length > limit) {
+        value = errorForReservedAllowance(value, slotAllowance);
+      }
+      result.error = value;
+      remainingChars -= result.error.length;
+      remainingData += slotAllowance - result.error.length;
       continue;
     }
-    if (remainingChars <= 0) {
-      delete result.result;
-      result.error = 'Tool result omitted: total tool-result budget exhausted';
+    if (result.result === undefined || (result.result === null && result._structuredResult !== true)) {
+      remainingData += slotAllowance;
       continue;
     }
 
     value = typeof result.result === 'string' ? result.result : common.safeJson(result.result);
-    limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingChars);
-    if (value.length > limit) {
-      if (limit > TOOL_RESULT_TRUNCATION_SUFFIX.length) {
-        value = value.substring(0, limit - TOOL_RESULT_TRUNCATION_SUFFIX.length) + TOOL_RESULT_TRUNCATION_SUFFIX;
+    structured = result._structuredResult === true ||
+      (result.result !== null && typeof result.result === 'object');
+    if (structured) {
+      parsed = null;
+      try {
+        parsed = JSON.parse(value);
+        value = common.safeJson(parsed);
+      } catch (e) {
+        value = common.safeJson({ error: 'Structured tool result omitted: invalid JSON' });
+      }
+      if (isTrustedMcpResultEnvelope(result, parsed)) {
+        omissionReason = value.length > MAX_TOOL_RESULT_CHARS ?
+          'Structured MCP result omitted: per-result limit exceeded' :
+          'Structured MCP result omitted: budget reserved for other results';
+        limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingData + slotAllowance);
+        value = capMcpResultEnvelope(parsed, limit);
+        if (value !== null) {
+          remainingChars -= value.length;
+          remainingData += slotAllowance - value.length;
+          result.result = value;
+          result._structuredResult = true;
+          continue;
+        }
+        value = structuredOmission(omissionReason, slotAllowance);
+        if (value === null) {
+          delete result.result;
+          delete result._structuredResult;
+          result.error = errorForReservedAllowance(TOOL_RESULT_ERROR_OMISSION, slotAllowance);
+          remainingChars -= result.error.length;
+          remainingData += slotAllowance - result.error.length;
+          continue;
+        }
+        remainingChars -= value.length;
+        remainingData += slotAllowance - value.length;
+        result.result = value;
+        result._structuredResult = true;
+        continue;
+      }
+      limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingData + slotAllowance);
+      if (value.length > limit) {
+        omissionReason = value.length > MAX_TOOL_RESULT_CHARS ?
+          'Tool result omitted: per-result limit exceeded' :
+          'Tool result omitted: budget reserved for other results';
+        omission = structuredOmission(omissionReason, slotAllowance);
+        value = omission;
+        if (value === null) {
+          delete result.result;
+          delete result._structuredResult;
+          result.error = errorForReservedAllowance(TOOL_RESULT_ERROR_OMISSION, slotAllowance);
+          remainingChars -= result.error.length;
+          remainingData += slotAllowance - result.error.length;
+          continue;
+        }
+        remainingChars -= value.length;
+        remainingData += slotAllowance - value.length;
       } else {
-        value = value.substring(0, limit);
+        remainingChars -= value.length;
+        remainingData += slotAllowance - value.length;
+      }
+      result.result = value;
+      result._structuredResult = true;
+      continue;
+    }
+
+    limit = Math.min(MAX_TOOL_RESULT_CHARS, remainingData + slotAllowance);
+    if (limit <= 0) {
+      delete result.result;
+      delete result._structuredResult;
+      result.error = errorForReservedAllowance(TOOL_RESULT_ERROR_OMISSION, slotAllowance);
+      remainingChars -= result.error.length;
+      remainingData += slotAllowance - result.error.length;
+      continue;
+    }
+    if (value.length > limit) {
+      value = capPlainToolValue(value, limit);
+      if (value === null) {
+        delete result.result;
+        delete result._structuredResult;
+        result.error = errorForReservedAllowance(TOOL_RESULT_ERROR_OMISSION, slotAllowance);
+        remainingChars -= result.error.length;
+        remainingData += slotAllowance - result.error.length;
+        continue;
       }
     }
     result.result = value;
     remainingChars -= value.length;
+    remainingData -= value.length;
+    remainingData += slotAllowance;
   }
 
-  return remainingChars;
+  if (options.includeCapNotice) { remainingChars -= TOOL_CAP_NOTICE.length; }
+
+  return Math.max(0, remainingChars);
 }
 
 function buildSkippedToolResult(call, index, error) {
@@ -1754,7 +2303,7 @@ function mergePlannedToolResults(plan, runnableResults) {
 }
 
 function appendTextToolResults(conversation, assistantText, results, noMoreTools, skippedCount) {
-  var content = 'Tool results:\n' + common.safeJson(results);
+  var content = 'Tool results:\n' + common.safeJson(sanitizeToolResults(results));
   if (noMoreTools) {
     content += '\n' + buildToolCapNotice(skippedCount);
   } else {
@@ -1967,7 +2516,9 @@ function isNativeToolRequestError(error) {
   return /^HTTP (400|404|422)/.test(String(error || ''));
 }
 
-function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback) {
+function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
+                                  usedToolCalls, mcpToolCallCounts, thinkingTrace,
+                                  remainingToolResultChars, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
   var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
@@ -1975,6 +2526,8 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
     return;
   }
   watch.progressSet(requestId, 'thinking', 'tool call limit reached');
+  setModelRetryState(completionContext, settings, conversation, toolDefinitions, toolMap, mode,
+      0, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
     var batch;
@@ -2009,6 +2562,8 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
   watch.progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
+  setModelRetryState(completionContext, settings, conversation, toolDefinitions, toolMap, mode,
+      round, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
     var batch;
@@ -2019,6 +2574,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     var skippedCount;
     var skippedResults;
     var budgetPlan;
+    var futureToolCallSlots;
 
     if (!isCurrentCompletion(completionContext)) {
       return;
@@ -2052,8 +2608,13 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     originalToolCalls = toolCalls;
     if (remainingToolCalls <= 0) {
       skippedResults = buildSkippedToolResults(originalToolCalls);
+      remainingToolResultChars = capToolResults(skippedResults, remainingToolResultChars, {
+        futureSlots: 0,
+        includeCapNotice: true
+      });
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, skippedResults, true, originalToolCalls.length);
-      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
+      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
+          usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
       return;
     }
     budgetPlan = planToolCallsByBudget(originalToolCalls, toolMap, remainingToolCalls, mcpToolCallCounts);
@@ -2063,16 +2624,28 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
     if (skippedCount > 0) {
       common.logDebug('tool loop budget skipped=' + skippedCount + ' runnable=' + toolCalls.length + ' requested=' + originalToolCalls.length + ' remaining=' + remainingToolCalls);
     }
+    if (toolCalls.length) {
+      completionContext.toolsStarted = true;
+    }
     tools.runToolCalls(requestId, toolCalls, toolMap, function(results) {
       if (!isCurrentCompletion(completionContext)) {
         return;
       }
       results = mergePlannedToolResults(budgetPlan.plan, results);
-      remainingToolResultChars = capToolResults(results, remainingToolResultChars);
+      if (usedToolCalls + results.length >= settings.MaxToolCalls) {
+        noMoreTools = true;
+      }
+      futureToolCallSlots = noMoreTools ? 0 : Math.max(0, remainingToolCalls - results.length);
+      remainingToolResultChars = capToolResults(results, remainingToolResultChars, {
+        futureSlots: futureToolCallSlots,
+        includeCapNotice: noMoreTools
+      });
       common.logDebug('tool loop results=' + results.length + ' skipped=' + skippedCount);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
-        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode, thinkingTrace, callback);
+        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
+            usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace,
+            remainingToolResultChars, callback);
         return;
       }
       completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
@@ -2080,103 +2653,283 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
   });
 }
 
-function requestCompletion(requestId, userText) {
-  var settings = common.loadSettings();
-  var conversation;
-  var previousContext = s_active_completion;
-  var completionContext;
+function finishToolCompletion(context, settings, conversation, toolDefinitions, toolMap,
+                              mode, completionError, text, meta) {
+  if (!isCurrentCompletion(context)) {
+    return;
+  }
+  if (completionError && meta && meta.nativeUnsupported) {
+    common.logDebug('native tool request rejected; retrying text tool fallback');
+    markNativeToolsUnsupported(settings);
+    context.toolInstructions = buildToolInstructions(toolDefinitions, settings.MaxToolCalls, false);
+    conversation = buildConversation(settings, context.userText, context.toolInstructions,
+        context.historyAtStart);
+    completeWithTools(context.requestId, settings, conversation, toolDefinitions, toolMap,
+        'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS,
+        function(error, answer, fallbackMeta) {
+          finishToolCompletion(context, settings, conversation, toolDefinitions, toolMap,
+              'text', error, answer, fallbackMeta);
+        });
+    return;
+  }
+  if (completionError) {
+    failCompletionContext(context, completionError);
+    return;
+  }
+  sendCompletionResponse(context, settings, context.userText, text);
+}
 
-  common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + s_chat_history.length);
-  clearCompletionTimers(previousContext);
-  watch.beginRequestLifecycle(requestId);
-  completionContext = {
-    generation: s_conversation_generation,
-    requestId: requestId,
-    timers: []
-  };
-  s_active_completion = completionContext;
-  watch.syncWatchSettings(settings);
+function startCompletion(context, settings) {
+  var requestId = context.requestId;
+  var userText = context.userText;
+  var conversation;
+
+  context.settings = settings;
+  common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + context.historyAtStart.length);
   watch.progressStart(requestId, 'thinking', '');
 
   if (!settings.Endpoint) {
-    failCompletionContext(completionContext, 'Endpoint missing. Open settings on phone.');
+    context.retryKind = 'setup';
+    failCompletionContext(context, 'Endpoint missing. Open settings on phone.');
     return;
   }
 
   if (!settings.ApiKey) {
-    failCompletionContext(completionContext, 'API key missing. Open settings on phone.');
+    context.retryKind = 'setup';
+    failCompletionContext(context, 'API key missing. Open settings on phone.');
     return;
   }
 
   if (settings.MaxToolCalls <= 0) {
     common.logDebug('tools disabled maxToolCalls=0');
-    conversation = buildConversation(settings, userText, '');
-    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text) {
-      if (!isCurrentCompletion(completionContext)) {
-        return;
-      }
-      if (completionError) {
-        failCompletionContext(completionContext, completionError);
-        return;
-      }
-
-      watch.sendResponse(requestId, settings, text, function(sendError) {
-        if (!sendError && isCurrentCompletion(completionContext)) {
-          rememberChatTurn(settings, userText, text);
-        }
-        finishCompletionContext(completionContext);
-      });
-    });
+    conversation = buildConversation(settings, userText, '', context.historyAtStart);
+    completeWithTools(requestId, settings, conversation, [], {}, 'text', 0, 0, {}, '',
+        MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text) {
+          finishToolCompletion(context, settings, conversation, [], {}, 'text',
+              completionError, text, null);
+        });
     return;
   }
 
   watch.progressSet(requestId, 'Loading tools', 'discovering phone tools');
   tools.discoverPhoneTools(settings, requestId, function(error, discoveredTools, toolMap) {
-    if (!isCurrentCompletion(completionContext)) {
+    var mode;
+
+    if (!isCurrentCompletion(context)) {
       return;
     }
     if (error) {
-      failCompletionContext(completionContext, error);
+      context.retryKind = 'before-tools';
+      failCompletionContext(context, error);
       return;
     }
 
-    conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, !isNativeToolsUnsupported(settings)));
+    context.toolInstructions = buildToolInstructions(discoveredTools, settings.MaxToolCalls,
+        !isNativeToolsUnsupported(settings));
+    context.toolDefinitions = discoveredTools;
+    context.toolMap = toolMap;
+    conversation = buildConversation(settings, userText, context.toolInstructions,
+        context.historyAtStart);
     common.logDebug('tools discover done tools=' + discoveredTools.length + ' nativeUnsupported=' + (isNativeToolsUnsupported(settings) ? '1' : '0'));
     watch.progressDone(requestId, 'Tools loaded', discoveredTools.length + ' tools');
-
-    function finishCompletion(completionError, text) {
-      if (!isCurrentCompletion(completionContext)) {
-        return;
-      }
-      if (completionError) {
-        failCompletionContext(completionContext, completionError);
-        return;
-      }
-
-      watch.sendResponse(requestId, settings, text, function(sendError) {
-        if (!sendError && isCurrentCompletion(completionContext)) {
-          rememberChatTurn(settings, userText, text);
-        }
-        finishCompletionContext(completionContext);
-      });
-    }
-
-    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, isNativeToolsUnsupported(settings) ? 'text' : 'native', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, function(completionError, text, meta) {
-      if (!isCurrentCompletion(completionContext)) {
-        return;
-      }
-
-      if (completionError && meta && meta.nativeUnsupported) {
-        common.logDebug('native tool request rejected; retrying text tool fallback');
-        markNativeToolsUnsupported(settings);
-        conversation = buildConversation(settings, userText, buildToolInstructions(discoveredTools, settings.MaxToolCalls, false));
-        completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, 'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS, finishCompletion);
-        return;
-      }
-
-      finishCompletion(completionError, text);
-    });
+    mode = isNativeToolsUnsupported(settings) ? 'text' : 'native';
+    completeWithTools(requestId, settings, conversation, discoveredTools, toolMap, mode,
+        0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS,
+        function(completionError, text, meta) {
+          finishToolCompletion(context, settings, conversation, discoveredTools, toolMap,
+              mode, completionError, text, meta);
+        });
   });
+}
+
+function createCompletionContext(requestId, userText, history) {
+  return {
+    generation: s_conversation_generation,
+    requestId: requestId,
+    userText: String(userText || ''),
+    historyAtStart: copyChatHistory(history),
+    timers: [],
+    toolsStarted: false,
+    retryKind: null
+  };
+}
+
+function activateCompletion(context) {
+  var previousContext = s_active_completion;
+
+  clearCompletionTimers(previousContext);
+  watch.beginRequestLifecycle(context.requestId);
+  s_active_completion = context;
+}
+
+function appendRecoveryInstruction(conversation, settings) {
+  var instruction = 'FINAL-ANSWER-ONLY RECOVERY. Do not call or request any tools. Summarize available evidence from recorded tool results. Report incomplete or unknown actions honestly. Never claim an action ran unless a recorded result proves it. If more work would need a tool, state that no additional action was run.';
+  var last = conversation.length ? conversation[conversation.length - 1] : null;
+
+  if (isMessagesEndpoint(settings) && last && last.role === 'user' &&
+      Object.prototype.toString.call(last.content) === '[object Array]') {
+    last.content.push({ type: 'text', text: instruction });
+    return;
+  }
+  if (last && last.role === 'user' && typeof last.content === 'string') {
+    last.content += '\n\n' + instruction;
+    return;
+  }
+  conversation.push({ role: 'user', content: instruction });
+}
+
+function sendRetryUnavailable(requestId, message, failedRequestId) {
+  if (!watch.isCurrentRequest(failedRequestId) || s_active_completion) {
+    return false;
+  }
+  watch.beginRequestLifecycle(requestId);
+  watch.progressStart(requestId, 'Error', '');
+  watch.sendError(requestId, message, function() {
+    watch.finishRequestLifecycle(requestId);
+  }, false);
+  return true;
+}
+
+function retryCompletion(requestId, failedRequestId) {
+  var capsule = s_retry_capsule;
+  var context;
+  var settings;
+  var conversation;
+  var knownKind;
+
+  if (!watch.isCurrentRequest(failedRequestId) || !requestId ||
+      Number(requestId) === Number(failedRequestId)) {
+    return false;
+  }
+  if (s_active_completion) {
+    return false;
+  }
+  if (!capsule || Number(capsule.requestId) !== Number(failedRequestId) ||
+      capsule.generation !== s_conversation_generation) {
+    if (capsule && Number(capsule.requestId) === Number(failedRequestId)) {
+      s_retry_capsule = null;
+    }
+    return sendRetryUnavailable(requestId, 'Retry is no longer available. Start a new request.', failedRequestId);
+  }
+
+  knownKind = capsule.kind === 'setup' || capsule.kind === 'before-tools' ||
+      capsule.kind === 'delivery' || capsule.kind === 'final-only';
+  if (!knownKind || typeof capsule.userText !== 'string') {
+    s_retry_capsule = null;
+    return sendRetryUnavailable(requestId, 'Retry context is unavailable. Start a new request.', failedRequestId);
+  }
+
+  if ((capsule.kind === 'setup' || capsule.kind === 'before-tools') &&
+      Object.prototype.toString.call(capsule.history) !== '[object Array]') {
+    s_retry_capsule = null;
+    return sendRetryUnavailable(requestId, 'Retry context is unavailable. Start a new request.', failedRequestId);
+  }
+  if (capsule.kind === 'final-only') {
+    settings = capsule.settings;
+    conversation = cloneBoundedRetryCapsule(capsule.conversation);
+    if (Object.prototype.toString.call(settings) !== '[object Object]' || !conversation ||
+        Object.prototype.toString.call(conversation) !== '[object Array]') {
+      s_retry_capsule = null;
+      return sendRetryUnavailable(requestId,
+          'Recorded tool results are unavailable. Start a new request.', failedRequestId);
+    }
+  }
+  if (capsule.kind === 'delivery' &&
+      (Object.prototype.toString.call(capsule.settings) !== '[object Object]' ||
+       typeof capsule.text !== 'string' || typeof capsule.answerText !== 'string')) {
+    s_retry_capsule = null;
+    return sendRetryUnavailable(requestId, 'Retry context is unavailable. Start a new request.', failedRequestId);
+  }
+
+  s_retry_capsule = null;
+  context = createCompletionContext(requestId, capsule.userText, capsule.history || []);
+  context.toolsStarted = capsule.kind === 'final-only';
+  activateCompletion(context);
+
+  if (capsule.kind === 'setup' || capsule.kind === 'before-tools') {
+    startCompletion(context, common.loadSettings());
+    return true;
+  }
+
+  if (capsule.kind === 'delivery') {
+    watch.progressStart(requestId, 'Receiving', 'retrying response');
+    watch.sendPreparedResponse(requestId, capsule.text, function(sendError) {
+      if (!sendError && isCurrentCompletion(context)) {
+        s_retry_capsule = null;
+        rememberChatTurn(capsule.settings, capsule.userText, capsule.answerText);
+      }
+      finishCompletionContext(context);
+    }, function(sendError, preparedText) {
+      if (!sendError || !isCurrentCompletion(context)) {
+        return false;
+      }
+      return rememberDeliveryFailure(context, capsule.settings, capsule.userText, preparedText,
+          capsule.answerText);
+    });
+    return true;
+  }
+
+  if (capsule.kind === 'final-only') {
+    appendRecoveryInstruction(conversation, settings);
+    setModelRetryState(context, settings, conversation, [], {}, capsule.mode,
+        0, 0, {}, capsule.thinkingTrace, MAX_TOOL_RESULTS_TOTAL_CHARS,
+        capsule.conversation);
+    watch.progressStart(requestId, 'thinking', 'summarizing recorded tool results');
+    requestModel(settings, conversation, requestId, {}, function(error, json) {
+      var batch;
+      var answer;
+
+      if (!isCurrentCompletion(context)) {
+        return;
+      }
+      if (error) {
+        failCompletionContext(context, error);
+        return;
+      }
+      updateProgressContextSizes(requestId, settings, json);
+      batch = extractToolCallBatch(json, capsule.mode, {});
+      if (batch.calls.length) {
+        answer = 'Recovery requested another tool. No additional actions were run. I can only summarize recorded results.';
+      } else {
+        answer = parseResponse(json, settings.ShowThinking, capsule.thinkingTrace);
+      }
+      sendCompletionResponse(context, settings, capsule.userText, answer);
+    });
+    return true;
+  }
+  return false;
+}
+
+function requestCompletion(requestId, userText) {
+  var settings = common.loadSettings();
+  var previousContext = s_active_completion;
+  var completionContext;
+
+  clearCompletionTimers(previousContext);
+  s_retry_capsule = null;
+  completionContext = createCompletionContext(requestId, userText, copyChatHistory(s_chat_history));
+  activateCompletion(completionContext);
+  startCompletion(completionContext, settings);
+}
+
+function cancelCompletion(requestId) {
+  var context;
+  var canceled;
+
+  if (!watch.isCurrentRequest(requestId)) {
+    return false;
+  }
+  s_retry_capsule = null;
+  context = s_active_completion;
+  if (context && Number(context.requestId) === Number(requestId)) {
+    clearCompletionTimers(context);
+    s_active_completion = null;
+  }
+  canceled = watch.cancelRequestLifecycle(requestId);
+  if (canceled && tools.cancelMcpRequest) {
+    tools.cancelMcpRequest(requestId);
+  }
+  return canceled;
 }
 
 module.exports = {
@@ -2185,5 +2938,7 @@ module.exports = {
   loadSavedChat: loadSavedChat,
   deleteSavedChat: deleteSavedChat,
   deleteAllSavedChats: deleteAllSavedChats,
-  requestCompletion: requestCompletion
+  requestCompletion: requestCompletion,
+  cancelCompletion: cancelCompletion,
+  retryCompletion: retryCompletion
 };

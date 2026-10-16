@@ -3,11 +3,14 @@ var watch = require('./watch');
 var timelineStore = require('./timeline_store');
 var memoryStore = require('./memory_store');
 var webFetch = require('./web_fetch');
+var toolPagination = require('./tool_pagination');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
 var MCP_CLIENT_VERSION = '1.0.0';
 var TIMELINE_API_BASE = 'https://timeline-api.getpebble.com/v1/user/pins/';
+var TIMELINE_PIN_ID_MAX_ATTEMPTS = 128;
+var TIMELINE_PIN_ID_MAX_PENDING = 128;
 var TIMELINE_DEFAULT_PIN_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_REMINDER_ICON = 'NOTIFICATION_REMINDER';
 var TIMELINE_DEFAULT_NOTIFICATION_ICON = 'NOTIFICATION_GENERIC';
@@ -47,20 +50,49 @@ var HEALTH_ACTIVITY_TYPES = {
 var TIMELINE_MAX_PAST_MS = 2 * 24 * 60 * 60 * 1000;
 var TIMELINE_MAX_FUTURE_MS = 365 * 24 * 60 * 60 * 1000;
 var TIMELINE_RETRY_DELAY_MS = 250;
+var TIMELINE_RESULT_WARNING_MAX_CHARS = 256;
+var TOOL_READ_CONCURRENCY = 2;
+var TOOL_EXECUTION_SERIAL = 'serial';
+var TOOL_EXECUTION_INDEPENDENT_READ = 'independent_read';
+var TOOL_VALIDATION_MAX_DEPTH = 64;
+var TOOL_VALIDATION_MAX_OBJECT_PROPERTIES = 256;
+var TOOL_VALIDATION_MAX_WORK = 2048;
+var TOOL_VALIDATION_MAX_SIGNATURE_CHARS = 65536;
 
 var s_mcp_request_id = 1;
+var s_tool_execution_id = 1;
+var s_timeline_pending_pin_ids = Object.create(null);
+var s_timeline_pending_pin_id_order = [];
 
-var MCP_MAX_RESULT_CHARS = 12000;
+var MCP_MAX_RESULT_CHARS = 6000;
 var MCP_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
+var MCP_MAX_CONTENT_BLOCKS = 32;
+var MCP_MAX_RESULT_METADATA_CHARS = 256;
+var MCP_MAX_STRUCTURED_DEPTH = 128;
+var MCP_MAX_STRUCTURED_NODES = 4096;
 var MCP_MAX_PAGINATION_PAGES = 20;
 var MCP_MAX_TOOLS_PER_SERVER = 64;
 var MCP_MAX_TOOLS_GLOBAL = 64;
+var MCP_MAX_TOOL_NAME_CHARS = 128;
 var MCP_MAX_DESCRIPTION_CHARS = 1024;
 var MCP_MAX_INPUTSCHEMA_CHARS = 8192;
+var MCP_MAX_SERVER_CACHE_CHARS = 65536;
+var MCP_MAX_SESSION_ID_CHARS = 1024;
+var MCP_MAX_SCHEMA_DEPTH = 64;
+var MCP_REQUEST_TIMEOUT_MS = 30000;
 var MCP_SUPPORTED_PROTOCOL_VERSIONS = { '2025-06-18': true };
 var MCP_CACHE_TTL_MS = 5 * 60 * 1000;
+var MCP_MAX_CACHE_ENTRIES = 32;
+var MCP_MAX_PENDING_DISCOVERIES = 16;
+var MCP_MAX_PENDING_WAITERS = 32;
 
-var s_mcp_cache = null;
+var s_mcp_cache = Object.create(null);
+var s_mcp_cache_keys = [];
+var s_mcp_pending = Object.create(null);
+var s_mcp_pending_count = 0;
+var s_mcp_warm_generation = null;
+var s_mcp_warm_generation_id = 1;
+var MCP_INVALID_SCHEMA = {};
 
 function hasOwn(object, key) {
   return object !== null && object !== undefined && Object.prototype.hasOwnProperty.call(object, key);
@@ -419,6 +451,7 @@ function parseMcpServers(settings) {
           common.logDebug('mcp server omitted invalid url server=' + server.label);
           continue;
         }
+        server._mcpCacheKey = mcpCacheKey(server);
         servers.push(server);
       }
     }
@@ -460,14 +493,254 @@ function applyMcpCustomHeaders(request, server, authorization) {
   }
 }
 
-function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
-  var request = new XMLHttpRequest();
+function isCurrentMcpContext(context) {
+  if (context && typeof context === 'object' && context.background === true) {
+    if (context.warmGeneration) {
+      return context.active !== false && context.warmGeneration.active &&
+        s_mcp_warm_generation === context.warmGeneration;
+    }
+    return context.active !== false;
+  }
+  return watch.isCurrentRequest(context);
+}
+
+function makeMcpWaiter(requestContext, server, callback) {
+  if (requestContext && typeof requestContext === 'object' && requestContext.warmGeneration) {
+    return {
+      type: 'warm',
+      generation: requestContext.warmGeneration,
+      key: mcpCacheStorageKey(server._mcpCacheKey),
+      server: server,
+      callback: callback,
+      settled: false
+    };
+  }
+  return {
+    type: 'foreground',
+    requestId: requestContext,
+    server: server,
+    callback: callback,
+    settled: false
+  };
+}
+
+function isCurrentMcpWaiter(waiter) {
+  if (waiter.type === 'warm') {
+    return waiter.generation.active && s_mcp_warm_generation === waiter.generation &&
+      hasOwn(waiter.generation.serverKeys, waiter.key);
+  }
+  return watch.isCurrentRequest(waiter.requestId);
+}
+
+function settleMcpWaiter(waiter, error, tools, noTools) {
+  if (waiter.settled) {
+    return;
+  }
+  waiter.settled = true;
+  waiter.callback(error, tools, noTools === true);
+}
+
+function pruneMcpWaiters(pending) {
+  var kept = [];
+  var removed = [];
+  var i;
+
+  for (i = 0; i < pending.waiters.length; i += 1) {
+    if (isCurrentMcpWaiter(pending.waiters[i])) {
+      kept.push(pending.waiters[i]);
+    } else {
+      removed.push(pending.waiters[i]);
+    }
+  }
+  pending.waiters = kept;
+  for (i = 0; i < removed.length; i += 1) {
+    settleMcpWaiter(removed[i], 'MCP discovery canceled', null, false);
+  }
+}
+
+function cancelMcpServerDiscovery(pending, error) {
+  var storageKey = mcpCacheStorageKey(pending.key);
+  var waiters;
+  var requests;
+  var i;
+
+  if (pending.done) {
+    return;
+  }
+  pending.done = true;
+  delete s_mcp_pending[storageKey];
+  s_mcp_pending_count -= 1;
+  pending.context.active = false;
+  waiters = pending.waiters.slice();
+  pending.waiters = [];
+  requests = pending.context.requests.slice();
+
+  for (i = 0; i < waiters.length; i += 1) {
+    settleMcpWaiter(waiters[i], error || 'MCP discovery canceled', null, false);
+  }
+  for (i = 0; i < requests.length; i += 1) {
+    try {
+      requests[i].abort();
+    } catch (e) {}
+  }
+}
+
+function cancelUnobservedMcpDiscoveries(preserveGeneration) {
+  var keys = Object.keys(s_mcp_pending);
+  var i;
+  var pending;
+
+  for (i = 0; i < keys.length; i += 1) {
+    pending = s_mcp_pending[keys[i]];
+    if (!pending || pending.done) {
+      continue;
+    }
+    pruneMcpWaiters(pending);
+    if (!pending.waiters.length && (!preserveGeneration ||
+        !hasOwn(preserveGeneration.serverKeys, keys[i]))) {
+      cancelMcpServerDiscovery(pending, 'MCP discovery canceled');
+    }
+  }
+}
+
+function cancelMcpRequest(requestId) {
+  var keys = Object.keys(s_mcp_pending);
+  var i;
+  var j;
+  var pending;
+  var kept;
+  var removed;
+  var waiter;
+
+  for (i = 0; i < keys.length; i += 1) {
+    pending = s_mcp_pending[keys[i]];
+    if (!pending || pending.done) {
+      continue;
+    }
+    kept = [];
+    removed = [];
+    for (j = 0; j < pending.waiters.length; j += 1) {
+      waiter = pending.waiters[j];
+      if (waiter.type === 'foreground' && Number(waiter.requestId) === Number(requestId)) {
+        removed.push(waiter);
+      } else {
+        kept.push(waiter);
+      }
+    }
+    pending.waiters = kept;
+    for (j = 0; j < removed.length; j += 1) {
+      settleMcpWaiter(removed[j], 'MCP discovery canceled', null, false);
+    }
+    if (!kept.length) {
+      cancelMcpServerDiscovery(pending, 'MCP discovery canceled');
+    }
+  }
+}
+
+function trackMcpXhr(context, request) {
+  if (context && typeof context === 'object' && context.background === true) {
+    if (context.active === false) {
+      try {
+        request.abort();
+      } catch (e) {}
+      return false;
+    }
+    context.requests.push(request);
+    return true;
+  }
+  return watch.trackXhr(context, request);
+}
+
+function untrackMcpXhr(context, request) {
+  var i;
+
+  if (context && typeof context === 'object' && context.background === true) {
+    for (i = context.requests.length - 1; i >= 0; i -= 1) {
+      if (context.requests[i] === request) {
+        context.requests.splice(i, 1);
+      }
+    }
+    return;
+  }
+  watch.untrackXhr(context, request);
+}
+
+function updateMcpCacheSession(server) {
+  var key;
+  var entry;
+
+  if (!server || !server._mcpCacheKey) {
+    return;
+  }
+  key = 'mcp:' + server._mcpCacheKey;
+  entry = s_mcp_cache[key];
+  if (entry) {
+    entry.sessionId = server.sessionId || '';
+  }
+}
+
+function mcpJsonRpc(server, method, params, expectBody, requestContext, callback) {
+  var request = null;
   var payload = {
     jsonrpc: '2.0',
     method: method
   };
   var authorization = authHeader(server.authorization);
   var jsonRpcId;
+  var requestSettled = false;
+  var requestTracked = false;
+  var deadlineTimer = null;
+  var stage = 'construct';
+
+  function cleanupRpc() {
+    if (deadlineTimer !== null) {
+      try {
+        clearTimeout(deadlineTimer);
+      } catch (e) {}
+      deadlineTimer = null;
+    }
+    if (requestTracked) {
+      requestTracked = false;
+      try {
+        untrackMcpXhr(requestContext, request);
+      } catch (e2) {}
+    }
+  }
+
+  function finishRpc(error, result, status) {
+    if (requestSettled) {
+      return;
+    }
+    requestSettled = true;
+    cleanupRpc();
+    callback(error, result, status);
+  }
+
+  function discardRpc() {
+    if (requestSettled) {
+      return;
+    }
+    requestSettled = true;
+    cleanupRpc();
+  }
+
+  function timeoutRpc() {
+    if (requestSettled) {
+      return;
+    }
+    deadlineTimer = null;
+    if (!isCurrentMcpContext(requestContext)) {
+      discardRpc();
+      return;
+    }
+    common.logDebug('mcp deadline timeout server=' + server.label + ' method=' + method);
+    finishRpc('MCP request timed out', null, 0);
+    if (request) {
+      try {
+        request.abort();
+      } catch (e) {}
+    }
+  }
 
   if (method.indexOf('notifications/') !== 0) {
     payload.id = s_mcp_request_id;
@@ -478,96 +751,138 @@ function mcpJsonRpc(server, method, params, expectBody, requestId, callback) {
   }
   jsonRpcId = payload.id;
 
-  request.open('POST', server.url, true);
-  request.setRequestHeader('Content-Type', 'application/json');
-  request.setRequestHeader('Accept', 'application/json, text/event-stream');
-  request.setRequestHeader('MCP-Protocol-Version', MCP_PROTOCOL_VERSION);
-  if (server.sessionId) {
-    request.setRequestHeader('Mcp-Session-Id', server.sessionId);
-  }
-  if (authorization) {
-    request.setRequestHeader('Authorization', authorization);
-  }
-  applyMcpCustomHeaders(request, server, authorization);
-  request.timeout = 30000;
+  try {
+    request = new XMLHttpRequest();
 
-  if (!watch.trackXhr(requestId, request)) {
-    return;
-  }
+    request.onload = function() {
+      var json;
+      var sessionId;
 
-  common.logDebug('mcp request server=' + server.label + ' method=' + method + ' id=' + (payload.id || 'notification'));
-
-  request.onload = function() {
-    var json;
-    var sessionId;
-
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-
-    common.logDebug('mcp response server=' + server.label + ' method=' + method + ' status=' + request.status + ' bytes=' + String(request.responseText || '').length);
-
-    if (request.status < 200 || request.status >= 300) {
-      callback('MCP HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 180), null, request.status);
-      return;
-    }
-
-    try {
-      sessionId = request.getResponseHeader('Mcp-Session-Id');
-      if (sessionId) {
-        server.sessionId = sessionId;
+      if (requestSettled) {
+        return;
       }
-    } catch (e) {}
+      if (!isCurrentMcpContext(requestContext)) {
+        discardRpc();
+        return;
+      }
 
-    if (!expectBody || !common.trim(request.responseText)) {
-      callback(null, null, request.status);
+      common.logDebug('mcp response server=' + server.label + ' method=' + method + ' status=' + request.status + ' bytes=' + String(request.responseText || '').length);
+
+      if (request.status < 200 || request.status >= 300) {
+        finishRpc('MCP HTTP ' + request.status + ': ' + String(request.responseText || '').substring(0, 180), null, request.status);
+        return;
+      }
+
+      try {
+        sessionId = request.getResponseHeader('Mcp-Session-Id');
+        if (sessionId) {
+          if (String(sessionId).length > MCP_MAX_SESSION_ID_CHARS) {
+            common.logDebug('mcp session id skipped oversized server=' + server.label);
+          } else {
+            server.sessionId = sessionId;
+            if (method !== 'initialize') {
+              updateMcpCacheSession(server);
+            }
+          }
+        }
+      } catch (e) {}
+
+      if (!expectBody || !common.trim(request.responseText)) {
+        finishRpc(null, null, request.status);
+        return;
+      }
+
+      try {
+        json = parseMcpResponse(request.responseText, jsonRpcId);
+      } catch (e2) {
+        finishRpc('Bad MCP JSON response', null, request.status);
+        return;
+      }
+
+      if (!json) {
+        finishRpc('No matching MCP response', null, request.status);
+        return;
+      }
+
+      if (json.error) {
+        finishRpc(json.error.message || common.safeJson(json.error), null, request.status);
+        return;
+      }
+
+      finishRpc(null, json.result || {}, request.status);
+    };
+
+    request.onerror = function() {
+      if (requestSettled) {
+        return;
+      }
+      if (!isCurrentMcpContext(requestContext)) {
+        discardRpc();
+        return;
+      }
+      common.logDebug('mcp network error server=' + server.label + ' method=' + method);
+      finishRpc('MCP network error', null, 0);
+    };
+
+    request.ontimeout = function() {
+      if (requestSettled) {
+        return;
+      }
+      if (!isCurrentMcpContext(requestContext)) {
+        discardRpc();
+        return;
+      }
+      common.logDebug('mcp timeout server=' + server.label + ' method=' + method);
+      finishRpc('MCP request timed out', null, 0);
+    };
+
+    request.onabort = function() {
+      if (requestSettled) {
+        return;
+      }
+      if (!isCurrentMcpContext(requestContext)) {
+        discardRpc();
+        return;
+      }
+      common.logDebug('mcp request aborted server=' + server.label + ' method=' + method);
+      finishRpc('MCP request aborted', null, 0);
+    };
+
+    stage = 'open';
+    request.open('POST', server.url, true);
+    stage = 'headers';
+    request.setRequestHeader('Content-Type', 'application/json');
+    request.setRequestHeader('Accept', 'application/json, text/event-stream');
+    request.setRequestHeader('MCP-Protocol-Version', MCP_PROTOCOL_VERSION);
+    if (server.sessionId) {
+      request.setRequestHeader('Mcp-Session-Id', server.sessionId);
+    }
+    if (authorization) {
+      request.setRequestHeader('Authorization', authorization);
+    }
+    applyMcpCustomHeaders(request, server, authorization);
+    request.timeout = MCP_REQUEST_TIMEOUT_MS;
+
+    stage = 'tracking';
+    requestTracked = true;
+    if (!trackMcpXhr(requestContext, request)) {
+      requestTracked = false;
       return;
     }
 
-    try {
-      json = parseMcpResponse(request.responseText, jsonRpcId);
-    } catch (e2) {
-      callback('Bad MCP JSON response', null, request.status);
-      return;
+    common.logDebug('mcp request server=' + server.label + ' method=' + method + ' id=' + (payload.id || 'notification'));
+    deadlineTimer = setTimeout(timeoutRpc, MCP_REQUEST_TIMEOUT_MS);
+    stage = 'send';
+    request.send(JSON.stringify(payload));
+  } catch (e3) {
+    common.logDebug('mcp request setup failed server=' + server.label + ' method=' + method + ' stage=' + stage);
+    finishRpc('MCP request failed during ' + stage + ' for ' + method, null, 0);
+    if (request) {
+      try {
+        request.abort();
+      } catch (e4) {}
     }
-
-    if (!json) {
-      callback('No matching MCP response', null, request.status);
-      return;
-    }
-
-    if (json.error) {
-      callback(json.error.message || common.safeJson(json.error), null, request.status);
-      return;
-    }
-
-    callback(null, json.result || {}, request.status);
-  };
-
-  request.onerror = function() {
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-    common.logDebug('mcp network error server=' + server.label + ' method=' + method);
-    callback('MCP network error', null, 0);
-  };
-
-  request.ontimeout = function() {
-    watch.untrackXhr(requestId, request);
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-    common.logDebug('mcp timeout server=' + server.label + ' method=' + method);
-    callback('MCP request timed out', null, 0);
-  };
-
-  request.onabort = function() {
-    watch.untrackXhr(requestId, request);
-  };
-
-  request.send(JSON.stringify(payload));
+  }
 }
 
 function initializeMcpServer(server, requestId, callback) {
@@ -595,6 +910,7 @@ function initializeMcpServer(server, requestId, callback) {
 
     caps = result && result.capabilities;
     if (caps && typeof caps === 'object' && !caps.tools) {
+      updateMcpCacheSession(server);
       callback(null, { noTools: true });
       return;
     }
@@ -604,66 +920,416 @@ function initializeMcpServer(server, requestId, callback) {
         callback(initError);
         return;
       }
+      updateMcpCacheSession(server);
       callback(null, null);
     });
   });
 }
 
-function capMcpResult(text) {
-  var value = String(text || '');
+function capMcpResult(text, truncated) {
+  var value = String(text === undefined || text === null ? '' : text);
 
-  if (value.length <= MCP_MAX_RESULT_CHARS) {
+  if (value.length <= MCP_MAX_RESULT_CHARS && !truncated) {
     return value;
   }
-
   return value.substring(0, MCP_MAX_RESULT_CHARS - MCP_RESULT_TRUNCATION_SUFFIX.length) + MCP_RESULT_TRUNCATION_SUFFIX;
 }
 
-function formatMcpToolResult(result) {
-  var text = common.collectTextFromContent(result && result.content);
-
-  if (text) {
-    return capMcpResult(text);
+function boundedMcpMetadata(value) {
+  var text;
+  if (typeof value !== 'string') {
+    return '';
   }
-
-  if (result && result.structuredContent !== undefined && result.structuredContent !== null) {
-    return capMcpResult(common.safeJson(result.structuredContent));
+  text = value;
+  if (text.length > MCP_MAX_RESULT_METADATA_CHARS) {
+    text = text.substring(0, MCP_MAX_RESULT_METADATA_CHARS - MCP_RESULT_TRUNCATION_SUFFIX.length) + MCP_RESULT_TRUNCATION_SUFFIX;
   }
-
-  return capMcpResult(common.safeJson(result || {}));
+  return text;
 }
 
-function mcpCacheKey(servers) {
-  var entries = [];
-  var i;
-  var s;
+function mcpBlockMetadata(block, nested) {
+  var parts = [];
+  var uri = boundedMcpMetadata(block.uri || nested && nested.uri);
+  var mimeType = boundedMcpMetadata(block.mimeType || block.mime_type || nested && (nested.mimeType || nested.mime_type));
 
-  for (i = 0; i < servers.length; i += 1) {
-    s = servers[i];
-    entries.push({
-      displayLabel: s.displayLabel,
-      label: s.label,
-      url: s.url,
-      description: s.description,
-      allowedTools: s.allowedTools,
-      maxToolCalls: s.maxToolCalls,
-      authorization: s.authorization,
-      headers: s.headers
-    });
+  if (uri) {
+    parts.push('uri=' + uri);
+  }
+  if (mimeType) {
+    parts.push('mimeType=' + mimeType);
+  }
+  return parts.length ? ' (' + parts.join('; ') + ')' : '';
+}
+
+function formatMcpContentBlock(block) {
+  var type;
+  var nested;
+  var metadata;
+
+  if (!block || typeof block !== 'object' || Object.prototype.toString.call(block) === '[object Array]') {
+    return '[MCP unsupported content block: malformed entry]';
+  }
+  type = typeof block.type === 'string' ? boundedMcpMetadata(block.type) : '';
+  nested = block.resource && typeof block.resource === 'object' ? block.resource : {};
+  metadata = mcpBlockMetadata(block, nested);
+
+  if (type === 'text') {
+    return typeof block.text === 'string' ? block.text : '[MCP text block omitted: invalid text]';
+  }
+  if (type === 'resource' && typeof nested.text === 'string') {
+    return 'MCP embedded resource text' + metadata + ':\n' + nested.text;
+  }
+  if (type === 'image' || type === 'audio') {
+    return '[MCP ' + type + ' content omitted' + metadata + '; binary data omitted]';
+  }
+  if (type === 'resource') {
+    return '[MCP resource content omitted' + metadata + '; binary or unavailable content omitted]';
+  }
+  if (type === 'resource_link') {
+    return '[MCP resource_link reference only' + metadata + '; content not fetched]';
+  }
+  return '[MCP unsupported content block' + (type ? ' type=' + type : '') + metadata + '; payload omitted]';
+}
+
+function appendMcpContentPart(state, part) {
+  var separator = state.hasPart ? '\n\n' : '';
+  var available = MCP_MAX_RESULT_CHARS - state.text.length - separator.length;
+
+  if (available <= 0) {
+    state.truncated = true;
+    return;
+  }
+  if (part.length > available) {
+    state.text += separator + part.substring(0, available);
+    state.hasPart = true;
+    state.truncated = true;
+    return;
+  }
+  state.text += separator + part;
+  state.hasPart = true;
+}
+
+function collectMcpContent(content) {
+  var state = { text: '', hasPart: false, hasBlocks: false, truncated: false, omittedBlocks: 0 };
+  var count;
+  var i;
+
+  if (content === undefined || content === null) {
+    return state;
+  }
+  if (Object.prototype.toString.call(content) !== '[object Array]') {
+    state.hasBlocks = true;
+    appendMcpContentPart(state, '[MCP content omitted: malformed content list]');
+    return state;
   }
 
-  return JSON.stringify(entries);
+  state.hasBlocks = content.length > 0;
+  count = Math.min(content.length, MCP_MAX_CONTENT_BLOCKS);
+  for (i = 0; i < count; i += 1) {
+    appendMcpContentPart(state, formatMcpContentBlock(content[i]));
+  }
+  if (content.length > count) {
+    state.omittedBlocks = content.length - count;
+    state.truncated = true;
+    appendMcpContentPart(state, '[MCP content omitted: ' + state.omittedBlocks + ' additional blocks]');
+  }
+  return state;
+}
+
+function appendMcpSerialized(state, value) {
+  if (state.length + value.length > state.limit) {
+    return false;
+  }
+  state.parts.push(value);
+  state.length += value.length;
+  return true;
+}
+
+function writeMcpStructuredValue(value, state, stack, depth, inArray) {
+  var type = typeof value;
+  var isArray;
+  var key;
+  var keyText;
+  var count = 0;
+  var first = true;
+  var i;
+  var item;
+
+  state.nodes += 1;
+  if (state.nodes > MCP_MAX_STRUCTURED_NODES || depth > MCP_MAX_STRUCTURED_DEPTH) {
+    return false;
+  }
+  if (value === null) {
+    return appendMcpSerialized(state, 'null');
+  }
+  if (type === 'string') {
+    if (value.length > state.limit - state.length) {
+      return false;
+    }
+    return appendMcpSerialized(state, JSON.stringify(value));
+  }
+  if (type === 'number' || type === 'boolean') {
+    return appendMcpSerialized(state, JSON.stringify(value));
+  }
+  if (type === 'undefined' || type === 'function' || type === 'symbol') {
+    return inArray ? appendMcpSerialized(state, 'null') : false;
+  }
+  if (type !== 'object') {
+    return false;
+  }
+
+  isArray = Object.prototype.toString.call(value) === '[object Array]';
+  if (stack.indexOf(value) !== -1) {
+    return false;
+  }
+  stack.push(value);
+  if (isArray) {
+    if (!appendMcpSerialized(state, '[')) {
+      stack.pop();
+      return false;
+    }
+    for (i = 0; i < value.length; i += 1) {
+      if (!first && !appendMcpSerialized(state, ',')) {
+        stack.pop();
+        return false;
+      }
+      first = false;
+      if (!writeMcpStructuredValue(value[i], state, stack, depth + 1, true)) {
+        stack.pop();
+        return false;
+      }
+    }
+    stack.pop();
+    return appendMcpSerialized(state, ']');
+  }
+
+  if (!appendMcpSerialized(state, '{')) {
+    stack.pop();
+    return false;
+  }
+  for (key in value) {
+    if (!hasOwn(value, key)) {
+      continue;
+    }
+    count += 1;
+    if (count > MCP_MAX_STRUCTURED_NODES || typeof value[key] === 'undefined' || typeof value[key] === 'function' || typeof value[key] === 'symbol') {
+      if (count > MCP_MAX_STRUCTURED_NODES) {
+        stack.pop();
+        return false;
+      }
+      continue;
+    }
+    if (key.length > state.limit - state.length) {
+      stack.pop();
+      return false;
+    }
+    keyText = JSON.stringify(key);
+    if ((!first && !appendMcpSerialized(state, ',')) || !appendMcpSerialized(state, keyText) || !appendMcpSerialized(state, ':')) {
+      stack.pop();
+      return false;
+    }
+    first = false;
+    item = value[key];
+    if (!writeMcpStructuredValue(item, state, stack, depth + 1, false)) {
+      stack.pop();
+      return false;
+    }
+  }
+  stack.pop();
+  return appendMcpSerialized(state, '}');
+}
+
+function serializeMcpStructuredValue(value, limit) {
+  var state = { limit: limit, length: 0, nodes: 0, parts: [] };
+  var serialized;
+  try {
+    if (!writeMcpStructuredValue(value, state, [], 0, false)) {
+      return null;
+    }
+    serialized = state.parts.join('');
+    return serialized.length <= limit ? serialized : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function buildMcpResultEnvelope(text, structuredJson, flags) {
+  var fields = ['"mcpResult":true', '"text":' + JSON.stringify(text), '"structuredContent":' + structuredJson];
+
+  if (flags.textTruncated) {
+    fields.push('"textTruncated":true');
+  }
+  if (flags.structuredContentOmitted) {
+    fields.push('"structuredContentOmitted":true');
+  }
+  if (flags.omittedBlocks) {
+    fields.push('"omittedBlocks":' + flags.omittedBlocks);
+  }
+  return '{' + fields.join(',') + '}';
+}
+
+function truncateMcpTextToFit(text, structuredJson, flags, limit) {
+  var low = 0;
+  var high = text.length;
+  var middle;
+  var candidate;
+  var best = '';
+
+  flags.textTruncated = true;
+  while (low <= high) {
+    middle = Math.floor((low + high) / 2);
+    if (middle > 0 && middle < text.length && text.charCodeAt(middle - 1) >= 0xD800 && text.charCodeAt(middle - 1) <= 0xDBFF &&
+        text.charCodeAt(middle) >= 0xDC00 && text.charCodeAt(middle) <= 0xDFFF) {
+      middle -= 1;
+    }
+    candidate = buildMcpResultEnvelope(text.substring(0, middle), structuredJson, flags);
+    if (candidate.length <= limit) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
+}
+
+function formatMcpToolResult(result) {
+  var content = collectMcpContent(result && result.content);
+  var hasStructured = !!result && hasOwn(result, 'structuredContent') && result.structuredContent !== undefined;
+  var structuredValue;
+  var serialized;
+  var omission = { error: 'Structured MCP result omitted: result exceeds safe size or serialization limits' };
+  var flags;
+  var baseLength;
+  var envelope;
+
+  if (hasStructured && content.hasBlocks) {
+    structuredValue = serializeMcpStructuredValue(result.structuredContent, MCP_MAX_RESULT_CHARS);
+    if (structuredValue === null) {
+      structuredValue = JSON.stringify(omission);
+      flags = { textTruncated: content.truncated, structuredContentOmitted: true, omittedBlocks: content.omittedBlocks };
+    } else {
+      flags = { textTruncated: content.truncated, omittedBlocks: content.omittedBlocks };
+    }
+    baseLength = buildMcpResultEnvelope('', 'null', { textTruncated: true }).length;
+    if (structuredValue.length + baseLength - 'null'.length > MCP_MAX_RESULT_CHARS) {
+      structuredValue = JSON.stringify(omission);
+      flags.structuredContentOmitted = true;
+    }
+    envelope = buildMcpResultEnvelope(content.text, structuredValue, flags);
+    if (envelope.length > MCP_MAX_RESULT_CHARS) {
+      envelope = truncateMcpTextToFit(content.text, structuredValue, flags, MCP_MAX_RESULT_CHARS);
+    }
+    if (!envelope) {
+      envelope = buildMcpResultEnvelope('', JSON.stringify(omission), {
+        textTruncated: content.text.length > 0 || content.truncated,
+        structuredContentOmitted: true,
+        omittedBlocks: content.omittedBlocks
+      });
+    }
+    return { text: envelope, structured: true, mcpEnvelope: true };
+  }
+
+  if (content.hasBlocks) {
+    return { text: capMcpResult(content.text, content.truncated), structured: false, mcpEnvelope: false };
+  }
+
+  if (hasStructured) {
+    structuredValue = serializeMcpStructuredValue(result.structuredContent, MCP_MAX_RESULT_CHARS);
+    if (structuredValue === null) {
+      structuredValue = JSON.stringify(omission);
+    }
+    return { text: structuredValue, structured: true, mcpEnvelope: false };
+  }
+
+  serialized = serializeMcpStructuredValue(result || {}, MCP_MAX_RESULT_CHARS);
+  if (serialized === null) {
+    serialized = JSON.stringify(omission);
+  }
+  return { text: serialized, structured: true, mcpEnvelope: false };
+}
+
+function mcpCacheKey(server) {
+  return JSON.stringify({
+    displayLabel: server.displayLabel,
+    label: server.label,
+    limitKey: server.limitKey,
+    url: server.url,
+    description: server.description,
+    allowedTools: server.allowedTools,
+    maxToolCalls: server.maxToolCalls,
+    authorization: server.authorization,
+    headers: server.headers
+  });
+}
+
+function mcpCacheStorageKey(key) {
+  return 'mcp:' + key;
+}
+
+function removeMcpCacheKey(storageKey) {
+  var index = s_mcp_cache_keys.indexOf(storageKey);
+
+  if (hasOwn(s_mcp_cache, storageKey)) {
+    delete s_mcp_cache[storageKey];
+  }
+  if (index !== -1) {
+    s_mcp_cache_keys.splice(index, 1);
+  }
 }
 
 function lookupMcpCache(key) {
-  if (!s_mcp_cache || s_mcp_cache.key !== key) {
+  var storageKey = mcpCacheStorageKey(key);
+  var entry = s_mcp_cache[storageKey];
+  var index;
+
+  if (!entry) {
     return null;
   }
-  if (Date.now() - s_mcp_cache.time > MCP_CACHE_TTL_MS) {
-    s_mcp_cache = null;
+  if (Date.now() - entry.time > MCP_CACHE_TTL_MS) {
+    removeMcpCacheKey(storageKey);
     return null;
   }
-  return s_mcp_cache;
+  entry.lastUsed = Date.now();
+  index = s_mcp_cache_keys.indexOf(storageKey);
+  if (index !== -1) {
+    s_mcp_cache_keys.splice(index, 1);
+  }
+  s_mcp_cache_keys.push(storageKey);
+  return entry;
+}
+
+function cloneMcpValue(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (e) {
+    return null;
+  }
+}
+
+function cloneMcpToolList(tools) {
+  return cloneMcpValue(tools || []) || [];
+}
+
+function storeMcpCache(server, tools, noTools) {
+  var storageKey = mcpCacheStorageKey(server._mcpCacheKey);
+  var index;
+
+  s_mcp_cache[storageKey] = {
+    time: Date.now(),
+    lastUsed: Date.now(),
+    sessionId: server.sessionId || '',
+    noTools: noTools === true,
+    tools: cloneMcpToolList(tools)
+  };
+  index = s_mcp_cache_keys.indexOf(storageKey);
+  if (index !== -1) {
+    s_mcp_cache_keys.splice(index, 1);
+  }
+  s_mcp_cache_keys.push(storageKey);
+  while (s_mcp_cache_keys.length > MCP_MAX_CACHE_ENTRIES) {
+    removeMcpCacheKey(s_mcp_cache_keys[0]);
+  }
 }
 
 function cloneTools(tools) {
@@ -688,10 +1354,132 @@ function cloneToolMap(toolMap) {
   return copy;
 }
 
-function listAllMcpTools(server, requestId, callback) {
+function cloneBoundedMcpSchema(value, budget, depth) {
+  var serialized;
+  var result;
+  var key;
+  var item;
+  var first;
+  var i;
+
+  if (depth > MCP_MAX_SCHEMA_DEPTH) {
+    return MCP_INVALID_SCHEMA;
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    serialized = JSON.stringify(value);
+    if (serialized === undefined || budget.chars + serialized.length > MCP_MAX_INPUTSCHEMA_CHARS) {
+      return MCP_INVALID_SCHEMA;
+    }
+    budget.chars += serialized.length;
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (value.length > MCP_MAX_INPUTSCHEMA_CHARS) {
+      return MCP_INVALID_SCHEMA;
+    }
+    serialized = JSON.stringify(value);
+    if (budget.chars + serialized.length > MCP_MAX_INPUTSCHEMA_CHARS) {
+      return MCP_INVALID_SCHEMA;
+    }
+    budget.chars += serialized.length;
+    return value;
+  }
+  if (Array.isArray(value)) {
+    result = [];
+    budget.chars += 2;
+    if (budget.chars > MCP_MAX_INPUTSCHEMA_CHARS) {
+      return MCP_INVALID_SCHEMA;
+    }
+    for (i = 0; i < value.length; i += 1) {
+      if (i > 0) {
+        budget.chars += 1;
+      }
+      item = cloneBoundedMcpSchema(value[i], budget, depth + 1);
+      if (item === MCP_INVALID_SCHEMA) {
+        return MCP_INVALID_SCHEMA;
+      }
+      result.push(item);
+    }
+    return result;
+  }
+  if (typeof value === 'object') {
+    result = Object.create(null);
+    budget.chars += 2;
+    if (budget.chars > MCP_MAX_INPUTSCHEMA_CHARS) {
+      return MCP_INVALID_SCHEMA;
+    }
+    first = true;
+    for (key in value) {
+      if (!hasOwn(value, key)) {
+        continue;
+      }
+      if (key.length > MCP_MAX_INPUTSCHEMA_CHARS) {
+        return MCP_INVALID_SCHEMA;
+      }
+      serialized = JSON.stringify(key);
+      budget.chars += (first ? 0 : 1) + serialized.length + 1;
+      if (budget.chars > MCP_MAX_INPUTSCHEMA_CHARS) {
+        return MCP_INVALID_SCHEMA;
+      }
+      item = cloneBoundedMcpSchema(value[key], budget, depth + 1);
+      if (item === MCP_INVALID_SCHEMA) {
+        return MCP_INVALID_SCHEMA;
+      }
+      result[key] = item;
+      first = false;
+    }
+    return result;
+  }
+  return MCP_INVALID_SCHEMA;
+}
+
+function sanitizeMcpToolDefinition(tool, server) {
+  var name;
+  var description;
+  var inputSchema;
+  var schemaBudget = { chars: 0 };
+  var schema;
+  var size;
+
+  tool = tool || {};
+  name = typeof tool.name === 'string' ? tool.name : '';
+  if (!name) {
+    return null;
+  }
+  if (name.length > MCP_MAX_TOOL_NAME_CHARS) {
+    common.logDebug('mcp tool skipped oversized name server=' + server.label + ' chars=' + name.length);
+    return null;
+  }
+
+  description = typeof tool.description === 'string' ? tool.description : '';
+  if (description.length > MCP_MAX_DESCRIPTION_CHARS * 2) {
+    description = description.substring(0, MCP_MAX_DESCRIPTION_CHARS * 2);
+  }
+  description = common.trim(description);
+  if (description.length > MCP_MAX_DESCRIPTION_CHARS) {
+    description = description.substring(0, MCP_MAX_DESCRIPTION_CHARS);
+  }
+
+  inputSchema = tool.inputSchema || { type: 'object', properties: {} };
+  schema = cloneBoundedMcpSchema(inputSchema, schemaBudget, 0);
+  if (schema === MCP_INVALID_SCHEMA) {
+    common.logDebug('mcp tool skipped oversized inputSchema server=' + server.label + ' tool=' + name + ' limit=' + MCP_MAX_INPUTSCHEMA_CHARS);
+    return null;
+  }
+
+  size = JSON.stringify(name).length + JSON.stringify(description).length + schemaBudget.chars + 40;
+  return {
+    tool: { name: name, description: description, inputSchema: schema },
+    chars: size
+  };
+}
+
+function listAllMcpTools(server, requestContext, callback) {
   var allTools = [];
   var done = false;
   var pageCount = 0;
+  var toolCount = 0;
+  var cachedChars = 0;
 
   function finish(error, tools) {
     if (done) {
@@ -712,11 +1500,11 @@ function listAllMcpTools(server, requestId, callback) {
     }
     pageCount += 1;
 
-    mcpJsonRpc(server, 'tools/list', params, true, requestId, function(listError, result) {
+    mcpJsonRpc(server, 'tools/list', params, true, requestContext, function(listError, result) {
       var serverTools;
       var nextCursor;
 
-      if (!watch.isCurrentRequest(requestId)) {
+      if (!isCurrentMcpContext(requestContext)) {
         return;
       }
       if (listError) {
@@ -724,14 +1512,26 @@ function listAllMcpTools(server, requestId, callback) {
         return;
       }
 
-      serverTools = (result && result.tools) || [];
+      serverTools = result && Array.isArray(result.tools) ? result.tools : [];
       for (i = 0; i < serverTools.length; i += 1) {
-        if (allTools.length >= MCP_MAX_TOOLS_PER_SERVER) {
+        var sanitized;
+
+        if (toolCount >= MCP_MAX_TOOLS_PER_SERVER) {
           common.logDebug('mcp tools/list per-server limit reached server=' + server.label);
           finish(null, allTools);
           return;
         }
-        allTools.push(serverTools[i]);
+        toolCount += 1;
+        sanitized = sanitizeMcpToolDefinition(serverTools[i], server);
+        if (!sanitized) {
+          continue;
+        }
+        if (cachedChars + sanitized.chars > MCP_MAX_SERVER_CACHE_CHARS) {
+          common.logDebug('mcp tool skipped server cache character limit server=' + server.label + ' tool=' + sanitized.tool.name + ' limit=' + MCP_MAX_SERVER_CACHE_CHARS);
+          continue;
+        }
+        cachedChars += sanitized.chars;
+        allTools.push(sanitized.tool);
       }
 
       nextCursor = result && result.nextCursor;
@@ -746,25 +1546,129 @@ function listAllMcpTools(server, requestId, callback) {
   fetchPage(null);
 }
 
-function discoverMcpTools(settings, requestId, callback) {
-  var servers = parseMcpServers(settings);
-  var cacheKey = mcpCacheKey(servers);
-  var cached;
+function finishMcpServerDiscovery(pending, error, tools, noTools) {
+  var key = mcpCacheStorageKey(pending.key);
+  var i;
+
+  if (pending.done) {
+    return;
+  }
+  pruneMcpWaiters(pending);
+  if (!pending.waiters.length) {
+    cancelMcpServerDiscovery(pending, 'MCP discovery canceled');
+    return;
+  }
+
+  pending.done = true;
+  delete s_mcp_pending[key];
+  s_mcp_pending_count -= 1;
+  pending.context.active = false;
+  if (!error) {
+    storeMcpCache(pending.server, tools, noTools);
+  }
+
+  for (i = 0; i < pending.waiters.length; i += 1) {
+    var waiter = pending.waiters[i];
+    if (!isCurrentMcpWaiter(waiter)) {
+      settleMcpWaiter(waiter, 'MCP discovery canceled', null, false);
+      continue;
+    }
+    waiter.server.sessionId = pending.server.sessionId || '';
+    waiter.server._mcpCacheKey = pending.key;
+    settleMcpWaiter(waiter, error, error ? null : tools, noTools === true);
+  }
+}
+
+function discoverMcpServer(server, requestContext, callback) {
+  var key = server._mcpCacheKey || mcpCacheKey(server);
+  var storageKey = mcpCacheStorageKey(key);
+  var cached = lookupMcpCache(key);
+  var pending = s_mcp_pending[storageKey];
+  var waiter = makeMcpWaiter(requestContext, server, callback);
+  var context;
+
+  if (!isCurrentMcpWaiter(waiter)) {
+    settleMcpWaiter(waiter, 'MCP discovery canceled', null, false);
+    return;
+  }
+  if (cached) {
+    server.sessionId = cached.sessionId || '';
+    settleMcpWaiter(waiter, null, cloneMcpToolList(cached.tools), cached.noTools === true);
+    return;
+  }
+  if (pending) {
+    pruneMcpWaiters(pending);
+    if (pending.done || s_mcp_pending[storageKey] !== pending) {
+      pending = null;
+    }
+  }
+  if (pending) {
+    if (pending.waiters.length >= MCP_MAX_PENDING_WAITERS) {
+      settleMcpWaiter(waiter, 'MCP discovery busy', null, false);
+      return;
+    }
+    pending.waiters.push(waiter);
+    return;
+  }
+  cancelUnobservedMcpDiscoveries(requestContext && requestContext.warmGeneration);
+  if (s_mcp_pending_count >= MCP_MAX_PENDING_DISCOVERIES) {
+    settleMcpWaiter(waiter, 'MCP discovery busy', null, false);
+    return;
+  }
+
+  context = { background: true, active: true, requests: [] };
+  pending = {
+    key: key,
+    server: server,
+    context: context,
+    waiters: [waiter],
+    done: false
+  };
+  s_mcp_pending[storageKey] = pending;
+  s_mcp_pending_count += 1;
+
+  initializeMcpServer(server, context, function(initError, initResult) {
+    var noTools = initResult && initResult.noTools;
+
+    if (pending.done) {
+      return;
+    }
+    if (initError) {
+      common.logDebug('mcp initialize failed server=' + server.label);
+      finishMcpServerDiscovery(pending, initError, null, false);
+      return;
+    }
+    if (noTools) {
+      common.logDebug('mcp server declares no tools capability server=' + server.label);
+      finishMcpServerDiscovery(pending, null, [], true);
+      return;
+    }
+
+    common.logDebug('mcp initialized server=' + server.label);
+    listAllMcpTools(server, context, function(listError, serverTools) {
+      if (pending.done) {
+        return;
+      }
+      if (listError) {
+        common.logDebug('mcp tools/list failed server=' + server.label);
+        finishMcpServerDiscovery(pending, listError, null, false);
+        return;
+      }
+      common.logDebug('mcp tools/list ok server=' + server.label + ' count=' + serverTools.length);
+      finishMcpServerDiscovery(pending, null, serverTools, false);
+    });
+  });
+}
+
+function discoverMcpTools(settings, requestContext, callback, serverList) {
+  var servers = serverList || parseMcpServers(settings);
   var tools = [];
   var toolMap = Object.create(null);
   var usedNames = Object.create(null);
   var results = [];
   var remaining = servers.length;
-  var hadError = false;
 
   common.logDebug('mcp discover start servers=' + servers.length);
-
-  cached = lookupMcpCache(cacheKey);
-  if (cached) {
-    common.logDebug('mcp cache hit');
-    callback(null, cloneTools(cached.tools), cloneToolMap(cached.toolMap));
-    return;
-  }
 
   function addTools(server, serverTools) {
     var i;
@@ -833,20 +1737,14 @@ function discoverMcpTools(settings, requestId, callback) {
     var i;
     var entry;
 
+    if (!isCurrentMcpContext(requestContext)) {
+      return;
+    }
     for (i = 0; i < results.length; i += 1) {
       entry = results[i];
       if (entry && entry.tools) {
         addTools(entry.server, entry.tools);
       }
-    }
-
-    if (!hadError) {
-      s_mcp_cache = {
-        key: cacheKey,
-        time: Date.now(),
-        tools: cloneTools(tools),
-        toolMap: cloneToolMap(toolMap)
-      };
     }
 
     callback(null, cloneTools(tools), cloneToolMap(toolMap));
@@ -858,52 +1756,16 @@ function discoverMcpTools(settings, requestId, callback) {
   }
 
   servers.forEach(function(server, index) {
-    initializeMcpServer(server, requestId, function(initError, initResult) {
-      var noTools = initResult && initResult.noTools;
-
-      if (!watch.isCurrentRequest(requestId)) {
-        return;
-      }
-      if (initError) {
-        common.logDebug('mcp initialize failed server=' + server.label + ' error=' + initError);
-        hadError = true;
+    discoverMcpServer(server, requestContext, function(discoveryError, serverTools) {
+      if (discoveryError) {
         results[index] = null;
-        remaining -= 1;
-        if (remaining <= 0) {
-          finalize();
-        }
-        return;
+      } else {
+        results[index] = { server: server, tools: serverTools || [] };
       }
-
-      if (noTools) {
-        common.logDebug('mcp server declares no tools capability server=' + server.label);
-        results[index] = { server: server, tools: [] };
-        remaining -= 1;
-        if (remaining <= 0) {
-          finalize();
-        }
-        return;
+      remaining -= 1;
+      if (remaining <= 0) {
+        finalize();
       }
-
-      common.logDebug('mcp initialized server=' + server.label);
-
-      listAllMcpTools(server, requestId, function(listError, serverTools) {
-        if (!watch.isCurrentRequest(requestId)) {
-          return;
-        }
-        if (listError) {
-          common.logDebug('mcp tools/list failed server=' + server.label + ' error=' + listError);
-          hadError = true;
-          results[index] = null;
-        } else {
-          results[index] = { server: server, tools: serverTools };
-          common.logDebug('mcp tools/list ok server=' + server.label + ' count=' + serverTools.length);
-        }
-        remaining -= 1;
-        if (remaining <= 0) {
-          finalize();
-        }
-      });
     });
   });
 }
@@ -1027,7 +1889,7 @@ function callGeolocationBuiltin(args, requestId, callback) {
 }
 
 function getTimelineToken(callback) {
-  if (!Pebble.getTimelineToken) {
+  if (typeof Pebble === 'undefined' || !Pebble.getTimelineToken) {
     callback('Timeline token API unavailable');
     return;
   }
@@ -1062,17 +1924,28 @@ function firstTimelineValue(args, keys) {
   return undefined;
 }
 
-function validateTimelineArgShape(args) {
+function validateTimelineArgShape(args, allowStoredReminders) {
   var key;
 
   for (key in args) {
     if (args.hasOwnProperty(key)) {
-      if (TIMELINE_RAW_PIN_ARG_KEYS[key]) {
+      if (TIMELINE_RAW_PIN_ARG_KEYS[key] && !(allowStoredReminders && key === 'reminders')) {
         return 'Use structured timeline arguments, not raw Pebble pin JSON';
       }
     }
   }
 
+  return '';
+}
+
+function timelineCreationIdError(args) {
+  if (!args || typeof args !== 'object') {
+    return '';
+  }
+  if (hasOwn(args, 'id') || hasOwn(args, 'pinId') || hasOwn(args, 'pin_id') ||
+      (args.pin && typeof args.pin === 'object' && hasOwn(args.pin, 'id'))) {
+    return 'Timeline creation generates a new pin id. Omit id; use pebble_timeline_edit_pin to change an existing pin.';
+  }
   return '';
 }
 
@@ -1202,11 +2075,48 @@ function normalizeTimelineStringArray(value) {
 }
 
 function generateTimelinePinId(title) {
-  var base = slugify(title || 'reminder').toLowerCase();
-  var suffix = String(new Date().getTime()) + '_' + String(Math.floor(Math.random() * 10000));
-  var prefix = 'llm_' + base.substring(0, 28) + '_';
+  var base = slugify(title || 'reminder').toLowerCase().substring(0, 20);
+  var prefix = 'llm_' + base + '_' + new Date().getTime().toString(36) + '_';
+  var attempt;
+  var sequence;
+  var id;
 
-  return (prefix + suffix).substring(0, 64);
+  for (attempt = 0; attempt < TIMELINE_PIN_ID_MAX_ATTEMPTS; attempt += 1) {
+    sequence = timelineStore.nextTimelinePinIdSequence();
+    id = (prefix + sequence.toString(36)).substring(0, 64);
+    if (!timelineStore.getTimelinePin(id) && !hasOwn(s_timeline_pending_pin_ids, id)) {
+      reserveTimelinePinId(id);
+      return id;
+    }
+  }
+
+  return '';
+}
+
+function reserveTimelinePinId(id) {
+  var oldest;
+
+  if (hasOwn(s_timeline_pending_pin_ids, id)) {
+    return;
+  }
+  while (s_timeline_pending_pin_id_order.length >= TIMELINE_PIN_ID_MAX_PENDING) {
+    oldest = s_timeline_pending_pin_id_order.shift();
+    delete s_timeline_pending_pin_ids[oldest];
+  }
+  s_timeline_pending_pin_ids[id] = true;
+  s_timeline_pending_pin_id_order.push(id);
+}
+
+function releaseTimelinePinId(id) {
+  var index;
+  if (!hasOwn(s_timeline_pending_pin_ids, id)) {
+    return;
+  }
+  delete s_timeline_pending_pin_ids[id];
+  index = s_timeline_pending_pin_id_order.indexOf(id);
+  if (index !== -1) {
+    s_timeline_pending_pin_id_order.splice(index, 1);
+  }
 }
 
 function buildTimelinePinLayout(args, errors) {
@@ -1292,16 +2202,25 @@ function buildTimelineNotification(prefix, args) {
 function buildTimelineReminderTime(reminderArgs, defaultArgs, pinTime, errors) {
   var reminderTime = normalizeTimelineDateTime(firstTimelineValue(reminderArgs, ['time', 'reminderTime']));
   var minutesBefore;
+  var hasReminderTime = hasToolArgValue(firstTimelineValue(reminderArgs, ['time', 'reminderTime']));
+  var hasMinutesBefore;
   var pinUnix;
-
-  if (reminderTime) {
-    return reminderTime;
-  }
 
   minutesBefore = firstTimelineValue(reminderArgs, ['minutesBefore', 'remindMinutesBefore']);
   if (!hasToolArgValue(minutesBefore)) {
     minutesBefore = firstTimelineValue(defaultArgs, ['minutesBefore', 'remindMinutesBefore']);
   }
+  hasMinutesBefore = hasToolArgValue(minutesBefore);
+
+  if (hasReminderTime && hasMinutesBefore) {
+    errors.push('Use either reminderTime or remindMinutesBefore, not both');
+    return '';
+  }
+
+  if (reminderTime) {
+    return reminderTime;
+  }
+
   if (hasToolArgValue(minutesBefore)) {
     minutesBefore = optionalTimelineInteger(minutesBefore, 'minutesBefore', 0, 43200, errors);
     pinUnix = parseUnixTimeArg(pinTime);
@@ -1346,11 +2265,15 @@ function buildTimelineReminder(reminderArgs, defaultArgs, pinTime, errors) {
   return reminder;
 }
 
-function buildTimelineReminders(args, pinTime, forceReminder, errors) {
+function buildTimelineReminders(args, pinTime, forceReminder, errors, suppressReminder) {
   var reminders = [];
   var raw = parseObjectArg(args.reminders);
   var i;
   var reminder;
+
+  if (suppressReminder) {
+    return reminders;
+  }
 
   if (isTimelineArray(raw)) {
     if (raw.length > 3) {
@@ -1507,7 +2430,7 @@ function buildTimelinePin(args, options) {
       error: 'Timeline arguments must be an object'
     };
   }
-  validationError = validateTimelineArgShape(args);
+  validationError = validateTimelineArgShape(args, options.allowStoredReminders);
   if (validationError) {
     return {
       error: validationError
@@ -1515,7 +2438,7 @@ function buildTimelinePin(args, options) {
   }
 
   pin = {
-    id: common.trim(args.id || args.pinId) || generateTimelinePinId(args.title || args.reminderTitle),
+    id: common.trim(args.id || args.pinId),
     time: normalizeTimelineDateTime(firstTimelineValue(args, ['time', 'eventTime', 'pinTime'])),
     layout: buildTimelinePinLayout(args, errors)
   };
@@ -1529,7 +2452,7 @@ function buildTimelinePin(args, options) {
     pin.duration = duration;
   }
 
-  reminders = buildTimelineReminders(args, pin.time, options.forceReminder, errors);
+  reminders = buildTimelineReminders(args, pin.time, options.forceReminder, errors, options.suppressReminder);
   if (reminders.length) {
     pin.reminders = reminders;
   }
@@ -1552,6 +2475,15 @@ function buildTimelinePin(args, options) {
     return {
       error: errors[0]
     };
+  }
+
+  if (!pin.id) {
+    pin.id = generateTimelinePinId(args.title || args.reminderTitle);
+    if (!pin.id) {
+      return {
+        error: 'Unable to generate a unique Timeline pin id'
+      };
+    }
   }
 
   return {
@@ -1642,23 +2574,52 @@ function validateTimelinePin(pin) {
 }
 
 function timelinePinRequest(method, id, pin, requestId, callback) {
+  var pebble = typeof Pebble !== 'undefined' ? Pebble : null;
+  var localMethod = method === 'DELETE' ? 'deleteTimelinePin' : 'insertTimelinePin';
+  var finished = false;
+
+  function finish(error, isLocal) {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    callback(error, isLocal === true);
+  }
+
+  if (!watch.isCurrentRequest(requestId)) {
+    return;
+  }
+
+  if (pebble && typeof pebble[localMethod] === 'function') {
+    try {
+      if (method === 'DELETE') {
+        pebble.deleteTimelinePin(id);
+      } else {
+        pebble.insertTimelinePin(pin);
+      }
+    } catch (e) {
+      finish('Local Timeline API error: ' + (e && e.message ? e.message : String(e || 'unknown error')));
+      return;
+    }
+
+    if (!watch.isCurrentRequest(requestId)) {
+      return;
+    }
+
+    // These APIs are synchronous void calls; PebbleKit JS does not report
+    // whether the pin was subsequently delivered to the watch.
+    finish(null, true);
+    return;
+  }
+
   getTimelineToken(function(tokenError, token) {
-    var finished = false;
 
     if (!watch.isCurrentRequest(requestId)) {
       return;
     }
     if (tokenError) {
-      callback(tokenError);
+      finish(tokenError);
       return;
-    }
-
-    function finish(error, result) {
-      if (finished) {
-        return;
-      }
-      finished = true;
-      callback(error, result);
     }
 
     function retryDelay(request) {
@@ -1711,7 +2672,7 @@ function timelinePinRequest(method, id, pin, requestId, callback) {
           return;
         }
         if (method === 'DELETE' && attempt > 0 && request.status === 404) {
-          finish(null, 'Timeline pin deleted successfully.');
+          finish(null, false);
           return;
         }
         if (request.status < 200 || request.status >= 300) {
@@ -1719,7 +2680,7 @@ function timelinePinRequest(method, id, pin, requestId, callback) {
           return;
         }
 
-        finish(null, method === 'DELETE' ? 'Timeline pin deleted successfully.' : 'Timeline pin saved successfully.');
+        finish(null, false);
       };
 
       request.onerror = function() {
@@ -1785,25 +2746,33 @@ function cloneTimelineValue(value) {
   }
 }
 
-function buildTimelineSuccessResult(pin, editable, warning) {
+function buildTimelineSuccessResult(pin, editable, warning, isLocal) {
   var payload = {
-    status: 'success',
+    status: isLocal ? 'accepted' : 'success',
     id: pin.id,
     title: pin.layout && pin.layout.title ? String(pin.layout.title) : '',
     time: pin.time,
     editable: !!editable
   };
+  if (isLocal) {
+    payload.deliveryAcknowledged = false;
+    payload.message = 'Local Timeline API call completed; watch delivery is not acknowledged.';
+  }
   if (warning) {
     payload.warning = warning;
   }
   return common.safeJson(payload);
 }
 
-function buildTimelineDeleteResult(id, warning) {
+function buildTimelineDeleteResult(id, warning, isLocal) {
   var payload = {
-    status: 'deleted',
+    status: isLocal ? 'accepted' : 'deleted',
     id: id
   };
+  if (isLocal) {
+    payload.deliveryAcknowledged = false;
+    payload.message = 'Local Timeline API call completed; watch delivery is not acknowledged.';
+  }
   if (warning) {
     payload.warning = warning;
   }
@@ -1820,23 +2789,38 @@ function saveTimelineRecord(kind, pin, args) {
   }
 }
 
-function finishTimelineSave(kind, pin, args, callback) {
+function finishTimelineSave(kind, pin, args, callback, isLocal) {
   var editable = saveTimelineRecord(kind, pin, args);
+  var warnings = [];
   var warning = '';
 
+  if (isLocal && (pin.createNotification || pin.updateNotification)) {
+    warnings.push('Local pins ignore createNotification/updateNotification; no notification was created.');
+  }
+
   if (!editable) {
-    warning = 'Pin saved but storage failed; not editable';
+    warnings.push('Pin saved but storage failed; not editable');
     common.logDebug('timeline store save failed id=' + pin.id);
   }
-  callback(null, buildTimelineSuccessResult(pin, editable, warning));
+  if (warnings.length) {
+    warning = common.truncate(warnings.join(' '), TIMELINE_RESULT_WARNING_MAX_CHARS);
+  }
+  releaseTimelinePinId(pin.id);
+  callback(null, buildTimelineSuccessResult(pin, editable, warning, isLocal));
 }
 
-function callTimelineUpsertBuiltin(args, requestId, callback) {
-  var built = buildTimelinePin(args, { forceReminder: false });
+function callTimelineCreatePinBuiltin(args, requestId, callback) {
+  var idError = timelineCreationIdError(args);
+  var built;
   var pin;
   var validationError;
   var argsForStore;
 
+  if (idError) {
+    callback(idError);
+    return;
+  }
+  built = buildTimelinePin(args, { forceReminder: false });
   if (built.error) {
     callback(built.error);
     return;
@@ -1846,6 +2830,7 @@ function callTimelineUpsertBuiltin(args, requestId, callback) {
   validationError = validateTimelinePin(pin);
 
   if (validationError) {
+    releaseTimelinePinId(pin.id);
     callback(validationError);
     return;
   }
@@ -1853,21 +2838,28 @@ function callTimelineUpsertBuiltin(args, requestId, callback) {
   argsForStore = cloneTimelineValue(args) || {};
   argsForStore.id = pin.id;
 
-  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error, isLocal) {
     if (error) {
+      releaseTimelinePinId(pin.id);
       callback(error);
       return;
     }
-    finishTimelineSave('pin', pin, argsForStore, callback);
+    finishTimelineSave('pin', pin, argsForStore, callback, isLocal);
   });
 }
 
 function callTimelineReminderBuiltin(args, requestId, callback) {
-  var built = buildTimelinePin(args, { forceReminder: true });
+  var idError = timelineCreationIdError(args);
+  var built;
   var pin;
   var validationError;
   var argsForStore;
 
+  if (idError) {
+    callback(idError);
+    return;
+  }
+  built = buildTimelinePin(args, { forceReminder: true });
   if (built.error) {
     callback(built.error);
     return;
@@ -1877,6 +2869,7 @@ function callTimelineReminderBuiltin(args, requestId, callback) {
   validationError = validateTimelinePin(pin);
 
   if (validationError) {
+    releaseTimelinePinId(pin.id);
     callback(validationError);
     return;
   }
@@ -1884,12 +2877,13 @@ function callTimelineReminderBuiltin(args, requestId, callback) {
   argsForStore = cloneTimelineValue(args) || {};
   argsForStore.id = pin.id;
 
-  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error, isLocal) {
     if (error) {
+      releaseTimelinePinId(pin.id);
       callback(error);
       return;
     }
-    finishTimelineSave('reminder', pin, argsForStore, callback);
+    finishTimelineSave('reminder', pin, argsForStore, callback, isLocal);
   });
 }
 
@@ -1912,7 +2906,7 @@ function callTimelineDeleteBuiltin(args, requestId, callback) {
     stored = null;
   }
 
-  timelinePinRequest('DELETE', id, null, requestId, function(error) {
+  timelinePinRequest('DELETE', id, null, requestId, function(error, isLocal) {
     var removed = false;
     var warning = '';
 
@@ -1927,18 +2921,86 @@ function callTimelineDeleteBuiltin(args, requestId, callback) {
       warning = 'Pin deleted but stored edit record could not be removed';
       common.logDebug('timeline store remove failed id=' + id);
     }
-    callback(null, buildTimelineDeleteResult(id, warning));
+    callback(null, buildTimelineDeleteResult(id, warning, isLocal));
   });
 }
 
 function callTimelineListBuiltin(args, requestId, callback) {
   var pins = [];
+  var items = [];
+  var fingerprintParts = [];
+  var i;
+  var pin;
+  var rawTitle;
+  var rawTime;
+  var title;
+  var time;
+  var page;
   try {
     pins = timelineStore.listTimelinePins();
   } catch (e) {
     pins = [];
   }
-  callback(null, common.safeJson(pins));
+  pins.sort(function(a, b) {
+    var aUpdated = a && typeof a.updatedAt === 'number' ? a.updatedAt : 0;
+    var bUpdated = b && typeof b.updatedAt === 'number' ? b.updatedAt : 0;
+    var aId = String(a && a.id || '');
+    var bId = String(b && b.id || '');
+    if (bUpdated !== aUpdated) { return bUpdated - aUpdated; }
+    return aId < bId ? -1 : (aId > bId ? 1 : 0);
+  });
+  for (i = 0; i < pins.length; i += 1) {
+    pin = pins[i] || {};
+    rawTitle = typeof pin.title === 'string' ? pin.title : String(pin.title || '');
+    rawTime = typeof pin.time === 'string' ? pin.time : String(pin.time || '');
+    fingerprintParts.push(String(pin.id || ''), String(pin.kind || ''), rawTitle, rawTime,
+      String(pin.createdAt || 0), String(pin.updatedAt || 0));
+    title = boundedTimelineField(rawTitle, 384);
+    time = boundedTimelineField(rawTime, 128);
+    items.push({
+      id: String(pin.id || '').substring(0, 64),
+      kind: pin.kind === 'reminder' ? 'reminder' : 'pin',
+      title: title.value,
+      titleTruncated: title.truncated,
+      time: time.value,
+      timeTruncated: time.truncated,
+      createdAt: typeof pin.createdAt === 'number' && isFinite(pin.createdAt) ? pin.createdAt : 0,
+      updatedAt: typeof pin.updatedAt === 'number' && isFinite(pin.updatedAt) ? pin.updatedAt : 0
+    });
+  }
+  items.sort(function(a, b) {
+    if (b.updatedAt !== a.updatedAt) { return b.updatedAt - a.updatedAt; }
+    return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+  });
+  page = toolPagination.paginate(items, {
+    scope: 'timeline_list',
+    query: '',
+    datasetHash: toolPagination.hashParts(fingerprintParts),
+    cursor: args && args.cursor,
+    limit: args && args.limit,
+    defaultLimit: 5,
+    maxLimit: 64
+  });
+  if (page.error) { callback(page.error); return; }
+  callback(null, common.safeJson(page.value));
+}
+
+function boundedTimelineField(value, maximum) {
+  var text = typeof value === 'string' ? value : String(value || '');
+  var clipped;
+  if (text.length <= maximum) { return { value: text, truncated: false }; }
+  clipped = text.substring(0, maximum);
+  if (clipped.length && clipped.charCodeAt(clipped.length - 1) >= 0xd800 && clipped.charCodeAt(clipped.length - 1) <= 0xdbff) {
+    clipped = clipped.substring(0, clipped.length - 1);
+  }
+  return { value: clipped, truncated: true };
+}
+
+function clearTimelineReminderScheduleArgs(args) {
+  delete args.reminderTime;
+  delete args.remindMinutesBefore;
+  delete args.minutesBefore;
+  delete args.reminders;
 }
 
 function callTimelineEditBuiltin(args, requestId, callback) {
@@ -1949,6 +3011,10 @@ function callTimelineEditBuiltin(args, requestId, callback) {
   var i;
   var key;
   var forceReminder;
+  var hasNewReminderTime;
+  var hasNewMinutesBefore;
+  var clearReminder;
+  var reminderRemoved;
   var built;
   var pin;
   var validationError;
@@ -1973,20 +3039,61 @@ function callTimelineEditBuiltin(args, requestId, callback) {
     return;
   }
 
+  hasNewReminderTime = hasToolArgValue(args.reminderTime);
+  hasNewMinutesBefore = hasToolArgValue(firstTimelineValue(args, ['minutesBefore', 'remindMinutesBefore']));
+  clearReminder = args.clearReminder === true;
+  if (args.clearReminder !== undefined && typeof args.clearReminder !== 'boolean') {
+    callback('clearReminder must be a boolean');
+    return;
+  }
+  if (hasNewReminderTime && hasNewMinutesBefore) {
+    callback('Use either reminderTime or remindMinutesBefore, not both');
+    return;
+  }
+  if (clearReminder && (hasNewReminderTime || hasNewMinutesBefore)) {
+    callback('clearReminder cannot be combined with reminderTime or remindMinutesBefore');
+    return;
+  }
+
   mergedArgs = cloneTimelineValue(stored.args) || {};
   for (i = 0; i < allowedFields.length; i += 1) {
     key = allowedFields[i];
     if (hasOwn(args, key)) {
+      if ((key === 'reminderTime' || key === 'remindMinutesBefore') && !hasToolArgValue(args[key])) {
+        continue;
+      }
       mergedArgs[key] = cloneTimelineValue(args[key]);
       if (mergedArgs[key] === null && args[key] !== null) {
         mergedArgs[key] = args[key];
       }
     }
   }
+
+  if (clearReminder) {
+    clearTimelineReminderScheduleArgs(mergedArgs);
+    mergedArgs._timelineReminderRemoved = true;
+  } else if (hasNewReminderTime) {
+    delete mergedArgs.remindMinutesBefore;
+    delete mergedArgs.minutesBefore;
+    delete mergedArgs.reminders;
+    delete mergedArgs._timelineReminderRemoved;
+  } else if (hasNewMinutesBefore) {
+    delete mergedArgs.reminderTime;
+    delete mergedArgs.minutesBefore;
+    delete mergedArgs.reminders;
+    delete mergedArgs._timelineReminderRemoved;
+  }
+  delete mergedArgs.clearReminder;
+
   mergedArgs.id = stored.id;
 
-  forceReminder = stored.kind === 'reminder';
-  built = buildTimelinePin(mergedArgs, { forceReminder: forceReminder });
+  reminderRemoved = mergedArgs._timelineReminderRemoved === true;
+  forceReminder = stored.kind === 'reminder' && !reminderRemoved;
+  built = buildTimelinePin(mergedArgs, {
+    forceReminder: forceReminder,
+    suppressReminder: reminderRemoved,
+    allowStoredReminders: true
+  });
   if (built.error) {
     callback(built.error);
     return;
@@ -2002,12 +3109,12 @@ function callTimelineEditBuiltin(args, requestId, callback) {
   argsForStore = cloneTimelineValue(mergedArgs) || {};
   argsForStore.id = pin.id;
 
-  timelinePinRequest('PUT', pin.id, pin, requestId, function(error) {
+  timelinePinRequest('PUT', pin.id, pin, requestId, function(error, isLocal) {
     if (error) {
       callback(error);
       return;
     }
-    finishTimelineSave(stored.kind, pin, argsForStore, callback);
+    finishTimelineSave(stored.kind, pin, argsForStore, callback, isLocal);
   });
 }
 
@@ -2359,8 +3466,26 @@ function callMemorySaveBuiltin(args, requestId, callback) {
 
 function callMemorySearchBuiltin(args, requestId, callback) {
   var query = args && typeof args.query === 'string' ? args.query : '';
-  var limit = args && typeof args.limit === 'number' ? args.limit : undefined;
-  callback(null, JSON.stringify({ memories: memoryStore.searchMemories(query, limit) }));
+  var limit = args && args.limit !== undefined ? args.limit : undefined;
+  var normalizedQuery = query.trim().toLowerCase();
+  var memories = memoryStore.searchMemories(query, memoryStore.MAX_SEARCH_RESULTS);
+  var fingerprintParts = [];
+  var i;
+  var page;
+  for (i = 0; i < memories.length; i += 1) {
+    fingerprintParts.push(memories[i].id, memories[i].text, memories[i].createdAt, memories[i].updatedAt);
+  }
+  page = toolPagination.paginate(memories, {
+    scope: 'memory_search',
+    query: normalizedQuery,
+    datasetHash: toolPagination.hashParts(fingerprintParts),
+    cursor: args && args.cursor,
+    limit: limit,
+    defaultLimit: 4,
+    maxLimit: memoryStore.MAX_SEARCH_RESULTS
+  });
+  if (page.error) { callback(page.error); return; }
+  callback(null, JSON.stringify(page.value));
 }
 
 function callMemoryDeleteBuiltin(args, requestId, callback) {
@@ -2388,6 +3513,9 @@ while (hasOwn(toolMap, exposedName)) {
   toolMap[exposedName] = {
     kind: 'builtin',
     name: exposedName,
+    builtinName: baseName,
+    executionClass: definition.executionClass || TOOL_EXECUTION_SERIAL,
+    structuredResult: definition.structuredResult !== false,
     label: definition.label,
     parameters: definition.parameters,
     call: definition.call
@@ -2412,13 +3540,14 @@ function addBuiltinTools(settings, tools, toolMap) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_memory_search',
       label: 'Memory',
-      description: 'Search intentional notes saved by the user. Search when a prior intentional note may help answer the request; omit query to list recent notes.',
+      description: 'Search intentional notes saved by the user. Search when a prior intentional note may help answer the request; omit query to list recent notes. Results are paged; continue with nextCursor until hasMore is false.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
           query: { type: 'string', maxLength: 500, description: 'Optional text to find in saved notes.' },
-          limit: { type: 'integer', minimum: 1, maximum: 32, description: 'Optional maximum result count.' }
+          limit: { type: 'integer', minimum: 1, maximum: 32, description: 'Optional page size. Defaults to 4.' },
+          cursor: { type: 'string', maxLength: 512, description: 'Opaque cursor from previous page for same query.' }
         }
       },
       call: callMemorySearchBuiltin
@@ -2439,6 +3568,8 @@ function addBuiltinTools(settings, tools, toolMap) {
   if (settings.WebSearchEnabled) {
     addBuiltinTool(tools, toolMap, {
       name: 'web_fetch',
+      structuredResult: false,
+      executionClass: TOOL_EXECUTION_INDEPENDENT_READ,
       label: 'Web Fetch',
       description: 'Fetch and read an HTTP(S) web page as Markdown. Use offset and limit character ranges; fetch pages in chunks when needed. Do not assume content outside returned range.',
       parameters: {
@@ -2461,6 +3592,7 @@ function addBuiltinTools(settings, tools, toolMap) {
       description: 'Get the phone current geolocation. Use only when user request needs current location.',
       parameters: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           enableHighAccuracy: { type: 'boolean', description: 'Use GPS/high accuracy when available. Default false.' },
           timeoutMs: { type: 'integer', minimum: 1000, maximum: 60000, description: 'Maximum wait time in milliseconds. Default 10000.' },
@@ -2475,36 +3607,35 @@ function addBuiltinTools(settings, tools, toolMap) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_create_reminder',
       label: 'Timeline',
-      description: 'Create a Pebble timeline pin with a scheduled reminder alert. Use this for reminder, alarm, alert, and "remind me" requests. Do not use this for general calendar events or timeline pins that do not need a reminder alert. Provide structured fields only; the phone builds the Pebble reminders array with layout.type genericReminder and icon system://images/NOTIFICATION_REMINDER.',
+      description: 'Create a new Pebble timeline pin with a scheduled reminder notification attached to the pin. Use for reminder and "remind me" requests; use pebble_timeline_create_pin for events without a reminder. Each call generates a new id; do not supply an id. For an existing pin, use pebble_timeline_list_pins then pebble_timeline_edit_pin. Set reminderTime for an exact notification time, remindMinutesBefore for a relative time (0 means at pin time), or omit both to use time. This does not create an OS/system alarm. Result includes id; editable indicates whether future edits are available. Local acceptance does not confirm watch delivery.',
       parameters: {
         type: 'object',
+        additionalProperties: false,
         properties: {
-          id: { type: 'string', maxLength: 64, description: 'Optional pin id. If absent, a unique id is generated. Do not reuse ids for deleted pins.' },
           title: { type: 'string', description: 'Reminder/pin title shown on the watch.' },
-          time: { type: 'string', description: 'Event time as ISO date-time with timezone, parseable date-time, or Unix seconds. For simple reminders, this is the reminder time.' },
-          reminderTime: { type: 'string', description: 'Optional exact reminder alert time. Defaults to time unless remindMinutesBefore is provided.' },
-          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before time to show reminder. Use instead of reminderTime for "10 minutes before" requests.' },
+          time: { type: 'string', description: 'Pin time as ISO date-time with timezone, parseable date-time, or Unix seconds. Also the reminder notification time when neither reminder mode is supplied.' },
+          reminderTime: { type: 'string', description: 'Optional exact scheduled reminder notification time; omitted means time. Do not combine with remindMinutesBefore.' },
+          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before time for the scheduled reminder notification. Use instead of reminderTime for relative timing; 0 means at time.' },
           durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes.' },
           body: { type: 'string', maxLength: 512, description: 'Optional detail text for the timeline pin.' },
           locationName: { type: 'string', description: 'Optional location shown on the reminder.' },
           pinIcon: { type: 'string', description: 'Optional Pebble icon name or URI for the pin. Default NOTIFICATION_REMINDER. Example: NOTIFICATION_REMINDER, ALARM_CLOCK, TIMELINE_CALENDAR.' },
           reminderIcon: { type: 'string', description: 'Optional Pebble icon name or URI for the reminder. Default NOTIFICATION_REMINDER.' },
-          createNotificationTitle: { type: 'string', description: 'Optional notification title shown when pin is first delivered. This is not the scheduled reminder.' },
-          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional notification body shown when pin is first delivered.' }
+          createNotificationTitle: { type: 'string', description: 'Optional create notification title for the legacy HTTP Timeline API only; ignored on local pins. This is not the scheduled reminder.' },
+          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional create notification body for the legacy HTTP Timeline API only; ignored on local pins.' }
         },
         required: ['title', 'time']
       },
       call: callTimelineReminderBuiltin
     });
     addBuiltinTool(tools, toolMap, {
-      name: 'pebble_timeline_create_or_update_pin',
+      name: 'pebble_timeline_create_pin',
       label: 'Timeline',
-      description: 'Create or update one of this app\'s non-reminder Pebble timeline, calendar, sports, or weather pins from simple arguments. Do not use this for simple "remind me" requests; use pebble_timeline_create_reminder instead. Do not provide raw Pebble pin JSON, layout objects, reminders arrays, action objects, or Pebble Timeline API payloads; the phone builds the final pin JSON. Updating uses the same id. Deleted pin ids should not be reused. Use reminderTime or remindMinutesBefore only when the user asks for an alert attached to this non-reminder pin.',
+      description: 'Create a new Pebble timeline pin for calendar events, schedule items, or other non-reminder entries. Use pebble_timeline_create_reminder when user asks for a scheduled reminder alert. Each call generates a new id; do not supply an id. To change an existing pin, first find it with pebble_timeline_list_pins, then call pebble_timeline_edit_pin with its id. Use reminderTime or remindMinutesBefore only for an alert attached to this pin. Result includes id; editable indicates whether future edits are available. Local acceptance does not confirm watch delivery.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
-          id: { type: 'string', maxLength: 64, description: 'Optional pin id. Required when updating an existing pin. Generated when omitted for new pins.' },
           time: { type: 'string', description: 'Pin event start time as ISO date-time with timezone, parseable date-time, or Unix seconds.' },
           durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes.' },
           pinType: { type: 'string', enum: ['generic', 'calendar', 'sports', 'weather'], description: 'Kind of timeline pin. Default generic.' },
@@ -2513,14 +3644,14 @@ function addBuiltinTools(settings, tools, toolMap) {
           body: { type: 'string', maxLength: 512, description: 'Optional pin body text.' },
           locationName: { type: 'string', description: 'Optional location. Required for weatherPin and useful for reminders/calendar pins.' },
           icon: { type: 'string', description: 'Optional Pebble icon name or URI. Default NOTIFICATION_REMINDER except calendar pins. Example: NOTIFICATION_REMINDER, NOTIFICATION_FLAG, ALARM_CLOCK, TIMELINE_CALENDAR.' },
-          reminderTime: { type: 'string', description: 'Optional single scheduled reminder time. Creates reminders[0].' },
-          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before pin time for a single scheduled reminder.' },
+          reminderTime: { type: 'string', description: 'Optional single scheduled reminder time. Creates reminders[0]. Do not combine with remindMinutesBefore.' },
+          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before pin time for a single scheduled reminder; 0 means at pin time.' },
           reminderTitle: { type: 'string', description: 'Optional title for the single scheduled reminder. Defaults to title.' },
           reminderIcon: { type: 'string', description: 'Optional icon for scheduled reminder. Default NOTIFICATION_REMINDER.' }
         },
         required: ['title', 'time']
       },
-      call: callTimelineUpsertBuiltin
+      call: callTimelineCreatePinBuiltin
     });
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_delete_pin',
@@ -2528,6 +3659,7 @@ function addBuiltinTools(settings, tools, toolMap) {
       description: 'Delete one of this app\'s Pebble timeline pins by id.',
       parameters: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           id: { type: 'string', description: 'Pin id to delete.' }
         },
@@ -2538,18 +3670,21 @@ function addBuiltinTools(settings, tools, toolMap) {
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_list_pins',
       label: 'Timeline',
-      description: 'List LLM-created Pebble timeline pins stored on the phone for editing. Returns compact JSON with id, kind, title, time for editable pins. Use this to find a target before calling pebble_timeline_edit_pin. No network request.',
+      description: 'List Pebble timeline pins created by this app that can be edited. Pages include id, kind, title, time, and titleTruncated/timeTruncated flags. When hasMore is true, pass nextCursor for next page. Use a listed id with pebble_timeline_edit_pin to change a pin. No network request.',
       parameters: {
         type: 'object',
         additionalProperties: false,
-        properties: {}
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 64, description: 'Optional page size. Defaults to 5.' },
+          cursor: { type: 'string', maxLength: 512, description: 'Opaque cursor from previous page.' }
+        }
       },
       call: callTimelineListBuiltin
     });
     addBuiltinTool(tools, toolMap, {
       name: 'pebble_timeline_edit_pin',
       label: 'Timeline',
-      description: 'Edit an existing LLM-created Pebble timeline pin by id. PUTs full pin JSON to the same id, replacing the existing pin entirely. Load the target with pebble_timeline_list_pins first. Only supplied fields change; other fields are preserved from the stored pin. Empty strings clear optional fields.',
+      description: 'Edit an existing pin created by this app. First find its id with pebble_timeline_list_pins. Only supplied fields change; all other stored fields are preserved. Empty string clears supported optional text fields, such as subtitle and body; locationName is required for weather pins. Empty string cannot clear integer or enum fields; use clearReminder:true to remove all scheduled alerts. Use either reminderTime or remindMinutesBefore (0 means at pin time); supplying one replaces the other. Do not combine either mode with clearReminder:true. clearReminder:false does not restore a removed alert; supply a reminder mode to add one again. Local acceptance does not confirm watch delivery.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -2557,19 +3692,20 @@ function addBuiltinTools(settings, tools, toolMap) {
           id: { type: 'string', maxLength: 64, description: 'Pin id to edit. Must be an existing LLM-created pin. Use pebble_timeline_list_pins to find ids.' },
           title: { type: 'string', description: 'Pin title shown on the watch.' },
           time: { type: 'string', description: 'Pin event start time as ISO date-time with timezone, parseable date-time, or Unix seconds.' },
-          durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes.' },
-          pinType: { type: 'string', enum: ['generic', 'calendar', 'sports', 'weather'], description: 'Kind of timeline pin.' },
-          subtitle: { type: 'string', description: 'Optional subtitle.' },
+          durationMinutes: { type: 'integer', minimum: 0, maximum: 1440, description: 'Optional event duration in minutes. Empty string is invalid; this field has no clear value.' },
+          pinType: { type: 'string', enum: ['generic', 'calendar', 'sports', 'weather'], description: 'Kind of timeline pin. Empty string is not a valid enum value.' },
+          subtitle: { type: 'string', description: 'Optional subtitle. Empty string clears.' },
           body: { type: 'string', maxLength: 512, description: 'Optional pin body text. Empty string clears.' },
-          locationName: { type: 'string', description: 'Optional location. Empty string clears.' },
-          icon: { type: 'string', description: 'Optional Pebble icon name or URI. Empty string clears to default.' },
-          pinIcon: { type: 'string', description: 'Optional Pebble icon name or URI for the pin. Empty string clears.' },
-          reminderTime: { type: 'string', description: 'Optional exact reminder alert time.' },
-          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before time to show reminder.' },
-          reminderTitle: { type: 'string', description: 'Optional title for the single scheduled reminder. Empty string clears.' },
-          reminderIcon: { type: 'string', description: 'Optional icon for scheduled reminder. Empty string clears.' },
-          createNotificationTitle: { type: 'string', description: 'Optional notification title shown when pin is first delivered. Empty string clears.' },
-          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional notification body shown when pin is first delivered. Empty string clears.' }
+          locationName: { type: 'string', description: 'Optional location. Empty string clears unless required for a weather pin.' },
+          icon: { type: 'string', description: 'Optional Pebble icon name or URI. Empty string resets to default icon.' },
+          pinIcon: { type: 'string', description: 'Optional Pebble icon name or URI for the pin. Empty string resets to default icon.' },
+          reminderTime: { type: 'string', description: 'Optional exact reminder alert time. Supplying this replaces any stored remindMinutesBefore mode. Empty string does not remove the alert; use clearReminder:true.' },
+          remindMinutesBefore: { type: 'integer', minimum: 0, maximum: 43200, description: 'Optional minutes before time to show reminder, including 0 for pin time. Supplying this replaces any stored reminderTime mode. Cannot be cleared with an empty string; use clearReminder:true.' },
+          clearReminder: { type: 'boolean', description: 'Set true to remove every scheduled reminder. Do not combine true with reminderTime or remindMinutesBefore. False alone does not restore a previously removed reminder.' },
+          reminderTitle: { type: 'string', description: 'Optional title for the scheduled reminder. Empty string resets it to the pin title.' },
+          reminderIcon: { type: 'string', description: 'Optional icon for the scheduled reminder. Empty string resets to default icon.' },
+          createNotificationTitle: { type: 'string', description: 'Optional create notification title for the legacy HTTP Timeline API only; ignored on local pins. Empty string uses the fallback title "Timeline update" if notification remains.' },
+          createNotificationBody: { type: 'string', maxLength: 512, description: 'Optional create notification body for the legacy HTTP Timeline API only; ignored on local pins. Empty string clears body.' }
         },
         required: ['id']
       },
@@ -2587,7 +3723,7 @@ function addBuiltinTools(settings, tools, toolMap) {
         additionalProperties: false,
         required: ['metrics'],
         properties: {
-          metrics: { type: 'array', minItems: 1, uniqueItems: true, description: 'Nonempty unique health metrics to request.', items: { type: 'string', enum: ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'] } },
+          metrics: { type: 'array', minItems: 1, maxItems: 10, uniqueItems: true, description: 'Nonempty unique health metrics to request.', items: { type: 'string', enum: ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'] } },
           range: { type: 'string', enum: ['today', 'yesterday', 'last_24h', 'last_7d', 'custom'], description: 'Health time range. Default today.' },
           startTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range start.' },
           endTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range end. Default now.' },
@@ -2624,22 +3760,75 @@ function discoverPhoneTools(settings, requestId, callback) {
   });
 }
 
+function warmMcpTools(settings, callback) {
+  var normalizedSettings = settings || {};
+  var maxToolCalls = parseInt(normalizedSettings.MaxToolCalls, 10);
+  var servers = parseMcpServers(normalizedSettings);
+  var previousGeneration = s_mcp_warm_generation;
+  var generation = {
+    id: s_mcp_warm_generation_id,
+    active: true,
+    serverKeys: Object.create(null),
+    context: null
+  };
+  var context;
+  var i;
+
+  s_mcp_warm_generation_id += 1;
+  if (previousGeneration) {
+    previousGeneration.active = false;
+    if (previousGeneration.context) {
+      previousGeneration.context.active = false;
+    }
+  }
+  s_mcp_warm_generation = generation;
+
+  if (!isNaN(maxToolCalls) && maxToolCalls <= 0) {
+    servers = [];
+  }
+  for (i = 0; i < servers.length; i += 1) {
+    generation.serverKeys[mcpCacheStorageKey(servers[i]._mcpCacheKey)] = true;
+  }
+
+  context = { background: true, active: true, warmGeneration: generation };
+  generation.context = context;
+  cancelUnobservedMcpDiscoveries(generation);
+  if (!servers.length) {
+    cancelUnobservedMcpDiscoveries();
+    context.active = false;
+    if (callback) {
+      callback(null, { serverCount: 0, tools: [] });
+    }
+    return;
+  }
+
+  discoverMcpTools(normalizedSettings, context, function(error, tools) {
+    context.active = false;
+    if (callback) {
+      callback(error, { serverCount: servers.length, tools: tools || [] });
+    }
+  }, servers);
+  if (s_mcp_warm_generation === generation) {
+    cancelUnobservedMcpDiscoveries();
+  }
+}
+
 function callMcpTool(toolInfo, args, requestId, callback) {
   var called = false;
   var retried = false;
 
-  function once(error, resultText) {
+  function once(error, resultText, resultInfo) {
     if (called) {
       return;
     }
     called = true;
     if (error) {
-      common.logDebug('mcp tool error server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' error=' + error);
+      common.logDebug('mcp tool error server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName);
       callback(error);
       return;
     }
     common.logDebug('mcp tool result server=' + toolInfo.server.label + ' tool=' + toolInfo.toolName + ' chars=' + String(resultText || '').length);
-    callback(null, resultText);
+    callback(null, resultText, resultInfo);
   }
 
   function doCall() {
@@ -2648,6 +3837,7 @@ function callMcpTool(toolInfo, args, requestId, callback) {
       name: toolInfo.toolName,
       arguments: args || {}
     }, true, requestId, function(error, result, httpStatus) {
+      var formatted;
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
@@ -2655,6 +3845,7 @@ function callMcpTool(toolInfo, args, requestId, callback) {
         retried = true;
         common.logDebug('mcp tool 404 reinitialize server=' + toolInfo.server.label);
         toolInfo.server.sessionId = '';
+        updateMcpCacheSession(toolInfo.server);
         initializeMcpServer(toolInfo.server, requestId, function(initError) {
           if (!watch.isCurrentRequest(requestId)) {
             return;
@@ -2672,10 +3863,14 @@ function callMcpTool(toolInfo, args, requestId, callback) {
         return;
       }
       if (result && result.isError === true) {
-        once(formatMcpToolResult(result));
+        once(formatMcpToolResult(result).text || 'MCP tool reported an error');
         return;
       }
-      once(null, formatMcpToolResult(result));
+      formatted = formatMcpToolResult(result);
+      once(null, formatted.text, {
+        structured: formatted.structured,
+        mcpResultEnvelope: formatted.mcpEnvelope === true
+      });
     });
   }
 
@@ -2695,7 +3890,7 @@ function callBuiltinTool(toolInfo, args, requestId, callback) {
     }
 
     common.logDebug('builtin tool result name=' + toolInfo.name + ' chars=' + String(resultText || '').length);
-    callback(null, resultText);
+    callback(null, resultText, { structured: toolInfo.structuredResult === true });
   });
 }
 
@@ -2762,12 +3957,8 @@ function argValuesEqual(a, b) {
   if (typeof a !== typeof b) {
     return false;
   }
-  if (typeof a === 'object' && a !== null && b !== null) {
-    try {
-      return JSON.stringify(a) === JSON.stringify(b);
-    } catch (e) {
-      return false;
-    }
+  if (a === null || b === null || typeof a === 'object') {
+    return a === b;
   }
   return a === b;
 }
@@ -2779,13 +3970,159 @@ function articleFor(type) {
   return 'a';
 }
 
-function validateToolArgValue(value, schema, key) {
+function joinToolArgPath(parent, child) {
+  return parent ? parent + '.' + child : child;
+}
+
+function consumeToolValidationWork(state, amount, key) {
+  state.work += amount;
+  if (state.work > TOOL_VALIDATION_MAX_WORK) {
+    return (key || 'Tool arguments') + ' exceeds validation work limit ' + TOOL_VALIDATION_MAX_WORK;
+  }
+  return '';
+}
+
+function consumeToolSignatureChars(state, amount, key) {
+  state.signatureChars += amount;
+  if (state.signatureChars > TOOL_VALIDATION_MAX_SIGNATURE_CHARS) {
+    return (key || 'Tool arguments') + ' exceeds validation signature limit ' + TOOL_VALIDATION_MAX_SIGNATURE_CHARS;
+  }
+  return '';
+}
+
+function toolArgValueSignature(value, state, key, depth) {
+  var type = typeof value;
+  var token;
+  var parts;
+  var keys;
+  var childKey;
+  var childPath;
+  var child;
+  var item;
+  var count = 0;
+  var sortWork;
+  var i;
+  var error;
+
+  if (depth > TOOL_VALIDATION_MAX_DEPTH) {
+    return { error: (key || 'Tool arguments') + ' exceeds maximum validation depth ' + TOOL_VALIDATION_MAX_DEPTH };
+  }
+  error = consumeToolValidationWork(state, 1, key);
+  if (error) {
+    return { error: error };
+  }
+
+  if (value === null) {
+    token = 'null';
+    error = consumeToolSignatureChars(state, token.length, key);
+    return error ? { error: error } : { value: token };
+  }
+  if (type === 'string' || type === 'number' || type === 'boolean') {
+    if (type === 'string' && value.length > TOOL_VALIDATION_MAX_SIGNATURE_CHARS - state.signatureChars) {
+      return { error: (key || 'Tool arguments') + ' exceeds validation signature limit ' + TOOL_VALIDATION_MAX_SIGNATURE_CHARS };
+    }
+    try {
+      token = JSON.stringify(value);
+    } catch (e) {
+      token = undefined;
+    }
+    if (token === undefined) {
+      token = type + ':' + String(value);
+    }
+    error = consumeToolSignatureChars(state, token.length, key);
+    return error ? { error: error } : { value: token };
+  }
+  if (isArrayValue(value)) {
+    parts = [];
+    for (i = 0; i < value.length; i += 1) {
+      item = toolArgValueSignature(value[i], state, key + '[' + i + ']', depth + 1);
+      if (item.error) {
+        return item;
+      }
+      parts.push(item.value);
+    }
+    error = consumeToolSignatureChars(state, parts.length + 1, key);
+    return error ? { error: error } : { value: '[' + parts.join(',') + ']' };
+  }
+  if (isObjectValue(value)) {
+    parts = [];
+    keys = [];
+    for (childKey in value) {
+      if (!hasOwn(value, childKey)) {
+        continue;
+      }
+      count += 1;
+      if (count > TOOL_VALIDATION_MAX_OBJECT_PROPERTIES) {
+        return { error: (key || 'Tool arguments') + ' exceeds validation property limit ' + TOOL_VALIDATION_MAX_OBJECT_PROPERTIES };
+      }
+      keys.push(childKey);
+    }
+    sortWork = count > 1 ? count * Math.ceil(Math.log(count) / Math.LN2) : count;
+    error = consumeToolValidationWork(state, sortWork, key);
+    if (error) {
+      return { error: error };
+    }
+    keys.sort();
+    for (i = 0; i < keys.length; i += 1) {
+      childKey = keys[i];
+      childPath = joinToolArgPath(key, childKey);
+      if (childKey.length > TOOL_VALIDATION_MAX_SIGNATURE_CHARS - state.signatureChars) {
+        return { error: childPath + ' exceeds validation signature limit ' + TOOL_VALIDATION_MAX_SIGNATURE_CHARS };
+      }
+      try {
+        token = JSON.stringify(childKey);
+      } catch (e2) {
+        token = undefined;
+      }
+      if (token === undefined) {
+        token = String(childKey);
+      }
+      error = consumeToolSignatureChars(state, token.length + 1, childPath);
+      if (error) {
+        return { error: error };
+      }
+      child = toolArgValueSignature(value[childKey], state, childPath, depth + 1);
+      if (child.error) {
+        return child;
+      }
+      parts.push(token + ':' + child.value);
+    }
+    error = consumeToolSignatureChars(state, parts.length + 1, key);
+    return error ? { error: error } : { value: '{' + parts.join(',') + '}' };
+  }
+
+  token = type + ':' + String(value);
+  error = consumeToolSignatureChars(state, token.length, key);
+  return error ? { error: error } : { value: token };
+}
+
+function validateToolArgValue(value, schema, key, state, depth, root) {
   var type;
+  var required;
+  var properties;
+  var itemSchema;
   var i;
   var matched;
+  var childKey;
+  var childPath;
+  var collectionCount;
+  var argError;
+  var hasObjectShape;
+  var seenUniqueItems;
+  var signature;
+  var enumCandidate;
+  var enumValueSignature;
+  var enumCandidateSignature;
 
   if (!isObjectValue(schema)) {
     return '';
+  }
+  if (depth > TOOL_VALIDATION_MAX_DEPTH) {
+    return (key || 'Tool arguments') + ' exceeds maximum validation depth ' + TOOL_VALIDATION_MAX_DEPTH;
+  }
+  argError = consumeToolValidationWork(state, 1, key);
+  if (argError) {
+    return argError;
   }
 
   type = schema.type;
@@ -2799,18 +4136,43 @@ function validateToolArgValue(value, schema, key) {
         }
       }
       if (!matched) {
+        if (root) {
+          return 'Tool arguments must be a JSON object';
+        }
         return key + ' must be ' + type.join(' or ');
       }
     } else if (!valueMatchesType(value, type)) {
+      if (root && type === 'object') {
+        return 'Tool arguments must be a JSON object';
+      }
       return key + ' must be ' + articleFor(type) + ' ' + type;
     }
   }
 
   if (isArrayValue(schema.enum) && schema.enum.length) {
     matched = false;
+    enumValueSignature = null;
     for (i = 0; i < schema.enum.length; i += 1) {
-      if (argValuesEqual(value, schema.enum[i])) {
-        matched = true;
+      enumCandidate = schema.enum[i];
+      if (value !== null && enumCandidate !== null && typeof value === 'object' && typeof enumCandidate === 'object') {
+        if (isArrayValue(value) !== isArrayValue(enumCandidate)) {
+          continue;
+        }
+        if (!enumValueSignature) {
+          enumValueSignature = toolArgValueSignature(value, state, key, depth + 1);
+          if (enumValueSignature.error) {
+            return enumValueSignature.error;
+          }
+        }
+        enumCandidateSignature = toolArgValueSignature(enumCandidate, state, key, depth + 1);
+        if (enumCandidateSignature.error) {
+          return enumCandidateSignature.error;
+        }
+        matched = enumValueSignature.value === enumCandidateSignature.value;
+      } else {
+        matched = argValuesEqual(value, enumCandidate);
+      }
+      if (matched) {
         break;
       }
     }
@@ -2825,82 +4187,144 @@ function validateToolArgValue(value, schema, key) {
   if (schema.maximum !== undefined && typeof value === 'number' && value > schema.maximum) {
     return key + ' must be ' + schema.maximum + ' or less';
   }
+  if (schema.minLength !== undefined && typeof value === 'string' && value.length < schema.minLength) {
+    return key + ' must have length ' + schema.minLength + ' or greater';
+  }
   if (schema.maxLength !== undefined && typeof value === 'string' && value.length > schema.maxLength) {
     return key + ' exceeds max length ' + schema.maxLength;
+  }
+
+  if (isArrayValue(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      if (schema.minItems === 1 && value.length === 0) {
+        return key + ' must be nonempty';
+      }
+      return key + ' must contain at least ' + schema.minItems + ' item(s)';
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      return key + ' must contain no more than ' + schema.maxItems + ' item(s)';
+    }
+    itemSchema = schema.items;
+    if (isObjectValue(itemSchema)) {
+      for (i = 0; i < value.length; i += 1) {
+        argError = validateToolArgValue(value[i], itemSchema, key + '[' + i + ']', state, depth + 1, false);
+        if (argError) {
+          return argError;
+        }
+      }
+    } else if (schema.uniqueItems !== true) {
+      argError = consumeToolValidationWork(state, value.length, key);
+      if (argError) {
+        return argError;
+      }
+    }
+    if (schema.uniqueItems === true) {
+      seenUniqueItems = Object.create(null);
+      for (i = 0; i < value.length; i += 1) {
+        signature = toolArgValueSignature(value[i], state, key + '[' + i + ']', depth + 1);
+        if (signature.error) {
+          return signature.error;
+        }
+        if (hasOwn(seenUniqueItems, signature.value)) {
+          return key + ' must contain unique items';
+        }
+        seenUniqueItems[signature.value] = true;
+      }
+    }
+  }
+
+  required = isArrayValue(schema.required) ? schema.required : [];
+  properties = isObjectValue(schema.properties) ? schema.properties : {};
+  hasObjectShape = schema.type === 'object' || schema.properties !== undefined || required.length > 0;
+  if (hasObjectShape && !isObjectValue(value)) {
+    if (type && isArrayValue(type) && value === null && valueMatchesType(value, type[0])) {
+      return '';
+    }
+    if (!type) {
+      return root ? 'Tool arguments must be a JSON object' : key + ' must be an object';
+    }
+  }
+
+  if (isObjectValue(value)) {
+    if (required.length > TOOL_VALIDATION_MAX_OBJECT_PROPERTIES) {
+      return (key || 'Tool arguments') + ' schema exceeds validation property limit ' + TOOL_VALIDATION_MAX_OBJECT_PROPERTIES;
+    }
+    for (i = 0; i < required.length; i += 1) {
+      childPath = joinToolArgPath(key, required[i]);
+      if (!hasToolArgValue(value[required[i]])) {
+        return 'Missing required tool argument: ' + childPath;
+      }
+    }
+
+    if (schema.additionalProperties === false) {
+      collectionCount = 0;
+      for (childKey in value) {
+        if (!hasOwn(value, childKey)) {
+          continue;
+        }
+        collectionCount += 1;
+        if (collectionCount > TOOL_VALIDATION_MAX_OBJECT_PROPERTIES) {
+          return (key || 'Tool arguments') + ' exceeds validation property limit ' + TOOL_VALIDATION_MAX_OBJECT_PROPERTIES;
+        }
+        childPath = joinToolArgPath(key, childKey);
+        if (!hasOwn(properties, childKey)) {
+          return 'Unsupported tool argument: ' + childPath;
+        }
+        argError = validateToolArgValue(value[childKey], properties[childKey], childPath, state, depth + 1, false);
+        if (argError) {
+          return argError;
+        }
+      }
+    } else {
+      collectionCount = 0;
+      for (childKey in properties) {
+        if (!hasOwn(properties, childKey) || !hasOwn(value, childKey)) {
+          continue;
+        }
+        collectionCount += 1;
+        if (collectionCount > TOOL_VALIDATION_MAX_OBJECT_PROPERTIES) {
+          return (key || 'Tool arguments') + ' schema exceeds validation property limit ' + TOOL_VALIDATION_MAX_OBJECT_PROPERTIES;
+        }
+        childPath = joinToolArgPath(key, childKey);
+        argError = validateToolArgValue(value[childKey], properties[childKey], childPath, state, depth + 1, false);
+        if (argError) {
+          return argError;
+        }
+      }
+    }
   }
 
   return '';
 }
 
 function validateToolArgs(args, schema) {
-  var required;
-  var properties;
-  var i;
-  var key;
-  var argError;
+  return validateToolArgValue(args, schema || {}, '', { work: 0, signatureChars: 0 }, 0, true);
+}
 
-  schema = schema || {};
-  required = isArrayValue(schema.required) ? schema.required : [];
-  properties = schema.properties || {};
-
-  if ((schema.type === 'object' || required.length || schema.properties) && !isObjectValue(args)) {
-    return 'Tool arguments must be a JSON object';
-  }
-
-  for (i = 0; i < required.length; i += 1) {
-    key = required[i];
-    if (!hasToolArgValue(args[key])) {
-      return 'Missing required tool argument: ' + key;
-    }
-  }
-
-  if (schema.additionalProperties === false) {
-    for (key in args) {
-      if (hasOwn(args, key) && !hasOwn(properties, key)) {
-        return 'Unsupported tool argument: ' + key;
-      }
-    }
-  }
-
-  for (key in args) {
-    if (!hasOwn(args, key)) {
-      continue;
-    }
-    if (hasOwn(properties, key)) {
-      argError = validateToolArgValue(args[key], properties[key], key);
-      if (argError) {
-        return argError;
-      }
-    }
-  }
-
-  return '';
+function isIndependentReadTool(toolInfo) {
+  return !!toolInfo && toolInfo.kind === 'builtin' &&
+    toolInfo.builtinName === 'web_fetch' &&
+    toolInfo.executionClass === TOOL_EXECUTION_INDEPENDENT_READ;
 }
 
 function runToolCalls(requestId, toolCalls, toolMap, callback) {
+  var jobs = [];
   var results = [];
-  var index = 0;
+  var nextIndex = 0;
+  var completed = 0;
+  var callbackCalled = false;
+  var i;
 
-  function next() {
-    var call;
+  function createJob(call, index) {
     var name;
     var args;
-    var parsedArgs;
-    var toolInfo;
-    var validationError;
     var callId;
+    var toolInfo;
+    var parsedArgs;
+    var validationError;
+    var progressId;
 
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-
-    if (index >= toolCalls.length) {
-      callback(results);
-      return;
-    }
-
-    call = toolCalls[index] || {};
-    index += 1;
+    call = call || {};
     if (call.function && typeof call.function === 'object') {
       name = call.function.name || call.name || call.tool;
       args = call.function.arguments || call.arguments || call.args || {};
@@ -2908,87 +4332,238 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
       name = call.name || call.tool || call.function;
       args = call.arguments || call.args || {};
     }
-    callId = call.call_id || call.id || name || String(index);
-
+    callId = call.call_id || call.id || name || String(index + 1);
     toolInfo = hasOwn(toolMap, name) ? toolMap[name] : null;
+
     if (!toolInfo) {
-      watch.progressDone(requestId, String(name || 'unknown'), 'unknown tool');
-      results.push({
+      return {
+        index: index,
         id: callId,
-        call_id: callId,
         name: name || 'unknown',
         error: 'Unknown or unavailable tool'
-      });
-      next();
-      return;
+      };
     }
+    progressId = 'tool-call-' + s_tool_execution_id;
+    s_tool_execution_id += 1;
 
     parsedArgs = parseToolArgsValue(args);
     if (parsedArgs.error) {
-      watch.progressToolStart(requestId, formatToolLabel(toolInfo), 'invalid arguments');
-      watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + parsedArgs.error);
-      results.push({
+      return {
+        index: index,
         id: callId,
-        call_id: callId,
         name: name,
+        toolInfo: toolInfo,
+        progressId: progressId,
         error: parsedArgs.error
-      });
-      next();
-      return;
+      };
     }
     args = parsedArgs.args;
-
+    if (toolInfo.kind === 'builtin' &&
+        (toolInfo.builtinName === 'pebble_timeline_create_pin' || toolInfo.builtinName === 'pebble_timeline_create_reminder')) {
+      validationError = timelineCreationIdError(args);
+      if (validationError) {
+        return {
+          index: index,
+          id: callId,
+          name: name,
+          toolInfo: toolInfo,
+          progressId: progressId,
+          error: validationError
+        };
+      }
+    }
     validationError = validateToolArgs(args, toolInfo.parameters);
     if (validationError) {
-      watch.progressToolStart(requestId, formatToolLabel(toolInfo), 'invalid arguments');
-      watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + validationError);
-      results.push({
+      return {
+        index: index,
         id: callId,
-        call_id: callId,
         name: name,
+        toolInfo: toolInfo,
+        progressId: progressId,
         error: validationError
-      });
-      next();
-      return;
+      };
     }
 
-    function finishToolCall(error, resultText) {
+    return {
+      index: index,
+      id: callId,
+      name: name,
+      args: args,
+      toolInfo: toolInfo,
+      progressId: progressId
+    };
+  }
+
+  function recordResult(job, error, resultText, resultInfo) {
+    if (job.settled) {
+      return false;
+    }
+    job.settled = true;
+    if (!watch.isCurrentRequest(requestId)) {
+      return false;
+    }
+
+    if (error) {
+      watch.progressDone(requestId, formatToolLabel(job.toolInfo), 'error: ' + common.truncate(error, 90), job.progressId);
+      results[job.index] = {
+        id: job.id,
+        call_id: job.id,
+        name: job.name,
+        error: error
+      };
+    } else {
+      results[job.index] = {
+        id: job.id,
+        call_id: job.id,
+        name: job.name,
+        result: resultText
+      };
+      if (resultInfo && resultInfo.structured) {
+        results[job.index]._structuredResult = true;
+      }
+      if (resultInfo && resultInfo.mcpResultEnvelope === true) {
+        results[job.index]._mcpResultEnvelope = true;
+      }
+      watch.progressDone(requestId, formatToolLabel(job.toolInfo), String(resultText || '').length + ' chars', job.progressId);
+    }
+    completed += 1;
+    return true;
+  }
+
+  function executeJob(job, done) {
+    var settled = false;
+
+    function finishToolCall(error, resultText, resultInfo) {
+      if (settled) {
+        return;
+      }
+      settled = true;
       if (!watch.isCurrentRequest(requestId)) {
         return;
       }
-      if (error) {
-        watch.progressDone(requestId, formatToolLabel(toolInfo), 'error: ' + common.truncate(error, 90));
-        results.push({
-          id: callId,
-          call_id: callId,
-          name: name,
-          error: error
-        });
-      } else {
-        results.push({
-          id: callId,
-          call_id: callId,
-          name: name,
-          result: resultText
-        });
-        watch.progressDone(requestId, formatToolLabel(toolInfo), String(resultText || '').length + ' chars');
+      if (recordResult(job, error, resultText, resultInfo)) {
+        done();
       }
-      next();
     }
 
-    watch.progressToolStart(requestId, formatToolLabel(toolInfo), formatToolCallDetail(name, args, toolInfo));
-    if (toolInfo.kind === 'builtin') {
-      callBuiltinTool(toolInfo, args, requestId, finishToolCall);
-    } else {
-      callMcpTool(toolInfo, args, requestId, finishToolCall);
+    if (!watch.isCurrentRequest(requestId)) {
+      return;
+    }
+    watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), formatToolCallDetail(job.name, job.args, job.toolInfo), job.progressId);
+    try {
+      if (job.toolInfo.kind === 'builtin') {
+        callBuiltinTool(job.toolInfo, job.args, requestId, finishToolCall);
+      } else {
+        callMcpTool(job.toolInfo, job.args, requestId, finishToolCall);
+      }
+    } catch (e) {
+      finishToolCall(e && e.message ? e.message : String(e || 'Tool call failed'));
     }
   }
 
+  function reportImmediateError(job) {
+    if (!watch.isCurrentRequest(requestId)) {
+      return;
+    }
+    if (job.toolInfo) {
+      watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), 'invalid arguments', job.progressId);
+      watch.progressDone(requestId, formatToolLabel(job.toolInfo), 'error: ' + job.error, job.progressId);
+    } else {
+      watch.progressDone(requestId, String(job.name || 'unknown'), 'unknown tool');
+    }
+    results[job.index] = {
+      id: job.id,
+      call_id: job.id,
+      name: job.name,
+      error: job.error
+    };
+    completed += 1;
+  }
+
+  function finishIfComplete() {
+    if (!callbackCalled && completed === jobs.length && watch.isCurrentRequest(requestId)) {
+      callbackCalled = true;
+      callback(results);
+    }
+  }
+
+  function runIndependentBatch(start, end) {
+    var batchIndex = start;
+    var active = 0;
+    var remaining = end - start;
+    var pumping = false;
+
+    function pump() {
+      var job;
+
+      if (pumping) {
+        return;
+      }
+      pumping = true;
+      while (active < TOOL_READ_CONCURRENCY && batchIndex < end && watch.isCurrentRequest(requestId)) {
+        job = jobs[batchIndex];
+        batchIndex += 1;
+        active += 1;
+        executeJob(job, function() {
+          active -= 1;
+          remaining -= 1;
+          if (remaining === 0) {
+            next();
+          } else {
+            pump();
+          }
+        });
+      }
+      pumping = false;
+    }
+
+    nextIndex = end;
+    pump();
+  }
+
+  function next() {
+    var job;
+    var batchEnd;
+
+    if (!watch.isCurrentRequest(requestId)) {
+      return;
+    }
+    if (nextIndex >= jobs.length) {
+      finishIfComplete();
+      return;
+    }
+
+    job = jobs[nextIndex];
+    if (job.error) {
+      nextIndex += 1;
+      reportImmediateError(job);
+      next();
+      return;
+    }
+
+    if (isIndependentReadTool(job.toolInfo)) {
+      batchEnd = nextIndex + 1;
+      while (batchEnd < jobs.length && !jobs[batchEnd].error && isIndependentReadTool(jobs[batchEnd].toolInfo)) {
+        batchEnd += 1;
+      }
+      runIndependentBatch(nextIndex, batchEnd);
+      return;
+    }
+
+    nextIndex += 1;
+    executeJob(job, next);
+  }
+
+  for (i = 0; i < toolCalls.length; i += 1) {
+    jobs.push(createJob(toolCalls[i], i));
+  }
   next();
 }
 
 module.exports = {
   discoverPhoneTools: discoverPhoneTools,
+  warmMcpTools: warmMcpTools,
+  cancelMcpRequest: cancelMcpRequest,
   runToolCalls: runToolCalls,
   formatToolCallLabel: formatToolCallLabel,
   formatToolWords: formatToolWords

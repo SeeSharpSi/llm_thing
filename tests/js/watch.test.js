@@ -37,7 +37,7 @@ test('syncWatchSettings sends normalized watch-facing dictionary', function() {
     BackgroundColor: 2,
     PromptBackgroundColor: 3,
     BoldTextColor: 4
-  });
+  }, true);
 
   assert.deepEqual(global.Pebble.messages[0], {
     FontSize: 24,
@@ -54,6 +54,129 @@ test('syncWatchSettings sends normalized watch-facing dictionary', function() {
     PromptBackgroundColor: 3,
     BoldTextColor: 4
   });
+});
+
+test('syncWatchSettings skips semantically unchanged settings and sends changed settings', function() {
+  var watch = freshWatch();
+  var settings = {
+    FontSize: 24,
+    BuzzStrength: 2,
+    SpeakerFeedbackEnabled: true,
+    ScrollLines: 4,
+    TouchScrollEnabled: true,
+    ShowInputContextSize: false,
+    ShowOutputContextSize: true,
+    PreserveChats: true,
+    StartDictationQuickLaunch: false,
+    TextColor: 1,
+    BackgroundColor: 2,
+    PromptBackgroundColor: 3,
+    BoldTextColor: 4
+  };
+
+  watch.syncWatchSettings(settings, true);
+  assert.equal(watch.syncWatchSettings({
+    FontSize: '24',
+    BuzzStrength: '2',
+    SpeakerFeedbackEnabled: 1,
+    ScrollLines: '4',
+    TouchScrollEnabled: 1,
+    ShowInputContextSize: 0,
+    ShowOutputContextSize: 1,
+    PreserveChats: 1,
+    StartDictationQuickLaunch: 0,
+    TextColor: '1',
+    BackgroundColor: '2',
+    PromptBackgroundColor: '3',
+    BoldTextColor: '4'
+  }), false);
+  assert.equal(global.Pebble.messages.length, 1, 'normalized equivalent save does not transmit');
+
+  settings.FontSize = 28;
+  assert.equal(watch.syncWatchSettings(settings), true);
+  assert.equal(global.Pebble.messages.length, 2);
+  assert.equal(global.Pebble.messages[1].FontSize, 28);
+
+  assert.equal(watch.syncWatchSettings(settings, true), true, 'startup force resends full snapshot for a new watch session');
+  assert.equal(global.Pebble.messages.length, 3);
+  assert.deepEqual(global.Pebble.messages[2], global.Pebble.messages[1]);
+});
+
+test('failed watch settings send does not cache snapshot and later save retries it', function() {
+  var timers = installFakeTimers();
+  var watch;
+  var settings = { FontSize: 24 };
+
+  try {
+    watch = freshWatch();
+    global.Pebble.queueSendFailure({ error: 'one' });
+    global.Pebble.queueSendFailure({ error: 'two' });
+    global.Pebble.queueSendFailure({ error: 'three' });
+    watch.syncWatchSettings(settings, true);
+    timers.runAll();
+    timers.runAll();
+
+    assert.equal(global.Pebble.messages.length, 3, 'initial send exhausts existing retries');
+    assert.equal(watch.syncWatchSettings(settings), true);
+    assert.equal(global.Pebble.messages.length, 4, 'failed snapshot is eligible for next save retry');
+    assert.equal(watch.syncWatchSettings(settings), false, 'successful retry is deduplicated');
+    assert.equal(global.Pebble.messages.length, 4);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('failed changed settings invalidate prior acknowledgement confidence', function() {
+  var timers = installFakeTimers();
+  var watch;
+  var settingsA = { FontSize: 24 };
+
+  try {
+    watch = freshWatch();
+    watch.syncWatchSettings(settingsA, true);
+    global.Pebble.queueSendFailure({ error: 'one' });
+    global.Pebble.queueSendFailure({ error: 'two' });
+    global.Pebble.queueSendFailure({ error: 'three' });
+    watch.syncWatchSettings({ FontSize: 28 });
+    timers.runAll();
+    timers.runAll();
+
+    assert.equal(global.Pebble.messages.length, 4, 'changed snapshot exhausts bounded retries');
+    assert.equal(watch.syncWatchSettings(settingsA), true, 'return to old ACK state is resent after ambiguous failure');
+    assert.equal(global.Pebble.messages.length, 5);
+    assert.equal(global.Pebble.messages[4].FontSize, 24);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('forced startup sync queues another full snapshot for a reconnect during an in-flight send', function() {
+  var watch = freshWatch({ manualSends: true });
+  var settings = { FontSize: 24 };
+
+  watch.syncWatchSettings(settings, true);
+  watch.syncWatchSettings(settings, true);
+  watch.syncWatchSettings({ FontSize: '24' });
+  assert.equal(global.Pebble.messages.length, 1);
+  global.Pebble.flushNextSend();
+  assert.equal(global.Pebble.messages.length, 2);
+  assert.deepEqual(global.Pebble.messages[1], global.Pebble.messages[0]);
+  global.Pebble.flushNextSend();
+  assert.equal(global.Pebble.pendingSendCount(), 0);
+});
+
+test('normal sync updates forced pending snapshot without dropping force intent', function() {
+  var watch = freshWatch({ manualSends: true });
+
+  watch.syncWatchSettings({ FontSize: 24 }, true);
+  watch.syncWatchSettings({ FontSize: 28 }, true);
+  watch.syncWatchSettings({ FontSize: '24' });
+  global.Pebble.flushNextSend();
+
+  assert.equal(global.Pebble.messages.length, 2);
+  assert.equal(global.Pebble.messages[1].FontSize, 24, 'latest normalized desired state replaces differing queued snapshot');
+  global.Pebble.flushNextSend();
+  assert.equal(global.Pebble.pendingSendCount(), 0);
 });
 
 test('sendResponse serializes reset, formatted chunks, and done', function() {
@@ -219,7 +342,7 @@ test('late canceled AppMessage acknowledgement fails transfer once and releases 
 
   assert.equal(watch.cancelRequestLifecycle(31), true);
   watch.beginRequestLifecycle(32);
-  watch.syncWatchSettings({ FontSize: 20 });
+  watch.syncWatchSettings({ FontSize: 24 });
   watch.sendMessage({ RequestId: 32, ProgressText: 'fresh' });
 
   assert.equal(completions.length, 1, 'cancellation settles transfer without waiting for unsendable ACK');
@@ -235,7 +358,7 @@ test('late canceled AppMessage acknowledgement fails transfer once and releases 
   assert.equal(completions.length, 1, 'late ACK cannot complete transfer twice');
   assert.equal(global.Pebble.messages.length, 3);
   assert.deepEqual(global.Pebble.messages[0], { ResponseReset: 1, RequestId: 31 });
-  assert.equal(global.Pebble.messages[1].FontSize, 20);
+  assert.equal(global.Pebble.messages[1].FontSize, 24);
   assert.equal(global.Pebble.messages[2].RequestId, 32);
   assert.equal(global.Pebble.messages[2].ProgressText, 'fresh');
 });
@@ -321,6 +444,18 @@ test('sendError settles after terminal reset retry failure', function() {
   }
 });
 
+test('sendError carries retry eligibility with terminal error', function() {
+  var watch = freshWatch();
+
+  watch.beginRequestLifecycle(41);
+  watch.sendError(41, 'safe to retry', null, true);
+
+  assert.deepEqual(global.Pebble.messages, [
+    { ResponseReset: 1, RequestId: 41 },
+    { ResponseError: 'safe to retry', RetryAvailable: 1, RequestId: 41 }
+  ]);
+});
+
 test('progress messages track tools, history, and context for current request', function() {
   var watch = freshWatch();
 
@@ -337,6 +472,32 @@ test('progress messages track tools, history, and context for current request', 
   assert.equal(global.Pebble.messages[global.Pebble.messages.length - 1].ProgressHistory, 'MCP Search 2x');
   assert.equal(global.Pebble.messages[global.Pebble.messages.length - 1].ProgressInputContextSize, '100');
   assert.equal(global.Pebble.messages.some(function(message) { return message.ProgressText === 'stale'; }), false);
+});
+
+test('identified overlapping tool progress counts each completion and retains active detail', function() {
+  var watch = freshWatch();
+  var latest;
+
+  watch.beginRequestLifecycle(50);
+  watch.progressStart(50, 'thinking', 'start');
+  watch.progressToolStart(50, 'Web Fetch', 'web_fetch: { url: first }', 'fetch-call-1');
+  watch.progressToolStart(50, 'Web Fetch', 'web_fetch: { url: second }', 'fetch-call-2');
+
+  watch.progressDone(50, 'Web Fetch', '12 chars', 'fetch-call-2');
+  latest = global.Pebble.messages[global.Pebble.messages.length - 1];
+  assert.equal(latest.ProgressHistory, 'Web Fetch');
+  assert.equal(latest.ProgressText, 'Web Fetch');
+  assert.match(latest.ProgressDetail, /first/);
+  assert.doesNotMatch(latest.ProgressDetail, /12 chars/);
+
+  watch.progressDone(50, 'Web Fetch', '12 chars', 'fetch-call-2');
+  watch.progressDone(50, 'Web Fetch', '10 chars', 'fetch-call-1');
+  watch.progressDone(50);
+
+  latest = global.Pebble.messages[global.Pebble.messages.length - 1];
+  assert.equal(latest.ProgressHistory, 'Web Fetch 2x');
+  assert.equal(latest.ProgressText, 'Web Fetch');
+  assert.match(latest.ProgressDetail, /first/);
 });
 
 test('Health Info request handles response and timeout', function() {

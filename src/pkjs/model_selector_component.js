@@ -2,12 +2,12 @@ var settingsTheme = require('./settings_theme');
 
 module.exports = {
   name: 'model_selector',
-  template: '<div class="component component-model-selector"><span class="model-selector-label">{{{label}}}</span><div class="model-selector-controls"><button type="button" data-model-load>Load Models</button><select data-model-select disabled><option value="">Load models to choose</option></select></div><label class="model-selector-custom" data-model-custom-row><span>Custom model</span><input type="text" data-model-custom placeholder="{{placeholder}}" /></label><div class="model-selector-status" data-model-status>{{{description}}}</div><input data-manipulator-target type="hidden" /></div>',
+  template: '<div class="component component-model-selector"><span class="model-selector-label">{{{label}}}</span><div class="model-selector-controls"><button type="button" data-model-load>Save &amp; Refresh Models</button><select data-model-select disabled><option value="">Load models to choose</option></select></div><label class="model-selector-custom" data-model-custom-row><span>Custom model</span><input type="text" data-model-custom placeholder="{{placeholder}}" /></label><div class="model-selector-status" data-model-status>{{{description}}}</div><input data-manipulator-target type="hidden" /></div>',
   style: settingsTheme + '.component-model-selector{padding:.9rem 1rem}.component-model-selector .model-selector-label{display:block;margin-bottom:.5rem;color:#f2f5f8;font-size:.94rem}.component-model-selector .model-selector-controls{display:flex;align-items:stretch;gap:.5rem}.component-model-selector button{flex:0 0 auto;min-width:8.25rem;min-height:44px;margin:0;padding:.55rem .75rem;background:#263648;border:1px solid #52657b;border-radius:.4rem;color:#f5f7fa;font:inherit;font-weight:600;text-transform:none}.component-model-selector button:disabled{opacity:.55}.component-model-selector select,.component-model-selector input{box-sizing:border-box;width:100%;min-height:44px;padding:.55rem .65rem;background:#0f1822;border:1px solid #405064;border-radius:.4rem;color:#f5f7fa;font:inherit}.component-model-selector select{min-width:0;flex:1 1 auto}.component-model-selector select:focus,.component-model-selector input:focus,.component-model-selector button:focus{border-color:#f0a94b;box-shadow:0 0 0 2px rgba(240,169,75,.25);outline:0}.component-model-selector input::-webkit-input-placeholder{color:#8492a2}.component-model-selector input::placeholder{color:#8492a2;opacity:1}.component-model-selector .model-selector-custom{display:block;margin-top:.65rem;padding:0}.component-model-selector .model-selector-custom span{display:block;margin-bottom:.3rem;color:#aeb9c7;font-size:.8rem}.component-model-selector .model-selector-status{min-height:1.05rem;margin-top:.5rem;color:#aeb9c7;font-size:.78rem;line-height:1.4}@media(max-width:34rem){.component-model-selector .model-selector-controls{display:block}.component-model-selector .model-selector-controls button{width:100%;margin-bottom:.5rem}.component-model-selector .model-selector-controls select{display:block;width:100%}}',
   defaults: {
     label: 'Model',
     placeholder: 'gpt-4.1-mini',
-    description: 'Enter a model or load models from the endpoint.',
+    description: 'Enter a model manually, or save and refresh the list. Reopen settings to choose refreshed models.',
     modelsEncoded: '',
     modelsStatus: ''
   },
@@ -53,7 +53,7 @@ module.exports = {
       }
       option = root.ownerDocument.createElement('option');
       option.value = '';
-      option.textContent = 'Load models to choose';
+      option.textContent = 'Refresh and reopen settings to choose';
       select.appendChild(option);
       select.disabled = true;
       select.value = '';
@@ -124,11 +124,11 @@ module.exports = {
       var submitButton = root.ownerDocument.querySelector('.component-submit button');
 
       if (!configActionItem || !submitButton) {
-        setStatus('Save settings, then reopen them to refresh models.');
+        setStatus('Save settings and reopen them to refresh models.');
         return;
       }
       loadButton.disabled = true;
-      setStatus('Saving settings and loading models...');
+      setStatus('Saving settings and refreshing models. Reopen settings to select the updated list.');
       configActionItem.set('reload_models');
       submitButton.click();
     };
@@ -158,7 +158,7 @@ module.exports = {
         var endpointItem = clay.getItemByMessageKey('Endpoint');
         var apiKeyItem = clay.getItemByMessageKey('ApiKey');
         var invalidate = function() {
-          item.invalidateModels('Endpoint or API key changed. Select Load Models to save and refresh.');
+          item.invalidateModels('Endpoint or API key changed. Save & Refresh Models, then reopen settings to select an updated list.');
         };
 
         if (endpointItem && endpointItem.on) {

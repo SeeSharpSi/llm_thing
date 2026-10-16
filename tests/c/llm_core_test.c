@@ -5,6 +5,7 @@
 #include <string.h>
 
 static int s_failures;
+static int s_line_height_calls;
 
 #define EXPECT_TRUE(expression) do { \
   if (!(expression)) { \
@@ -156,6 +157,74 @@ static void test_response_transfer_reset_and_finish(void) {
       LLM_RESPONSE_CHUNK_ACCEPTED);
 }
 
+static void test_request_response_lifecycle_guards(void) {
+  LlmResponseTransfer transfer = {0};
+  uint32_t progress_updates = 0;
+
+  EXPECT_TRUE(llm_response_transfer_start_request(&transfer, 100));
+  EXPECT_TRUE(llm_response_transfer_is_active_for_request(&transfer, 100));
+  if (llm_response_transfer_is_active_for_request(&transfer, 100)) {
+    llm_response_transfer_reset(&transfer);
+  }
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+
+  // Late reset, chunk 0, done, and progress are all rejected after terminal.
+  EXPECT_TRUE(!llm_response_transfer_is_active_for_request(&transfer, 100));
+  if (llm_response_transfer_is_active_for_request(&transfer, 100)) {
+    llm_response_transfer_reset(&transfer);
+  }
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_IGNORED);
+  EXPECT_TRUE(!llm_response_transfer_is_active_for_request(&transfer, 100));
+  EXPECT_TRUE(!llm_response_transfer_finish(&transfer));
+  if (llm_response_transfer_is_active_for_request(&transfer, 100)) {
+    progress_updates += 1;
+  }
+  EXPECT_EQ_INT(progress_updates, 0);
+  EXPECT_TRUE(!llm_response_transfer_start_request(&transfer, 100));
+
+  // ResponseError has same terminal behavior as ResponseDone.
+  EXPECT_TRUE(llm_response_transfer_start_request(&transfer, 101));
+  EXPECT_TRUE(llm_response_transfer_is_active_for_request(&transfer, 101));
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+  EXPECT_TRUE(!llm_response_transfer_is_active_for_request(&transfer, 101));
+  if (llm_response_transfer_is_active_for_request(&transfer, 101)) {
+    llm_response_transfer_reset(&transfer);
+    progress_updates += 1;
+  }
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_IGNORED);
+  EXPECT_TRUE(!llm_response_transfer_finish(&transfer));
+  EXPECT_EQ_INT(progress_updates, 0);
+
+  // Cancellation also closes transfer before request ID advances.
+  EXPECT_TRUE(llm_response_transfer_start_request(&transfer, 102));
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+  EXPECT_TRUE(!llm_response_transfer_is_active_for_request(&transfer, 102));
+  if (llm_response_transfer_is_active_for_request(&transfer, 102)) {
+    llm_response_transfer_reset(&transfer);
+    progress_updates += 1;
+  }
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_IGNORED);
+  EXPECT_TRUE(!llm_response_transfer_finish(&transfer));
+  EXPECT_EQ_INT(progress_updates, 0);
+
+  // New RequestId starts fresh receive state and accepts its reset/chunk/done.
+  EXPECT_TRUE(llm_response_transfer_start_request(&transfer, 103));
+  EXPECT_EQ_INT(transfer.next_index, 0);
+  EXPECT_TRUE(llm_response_transfer_is_active_for_request(&transfer, 103));
+  if (llm_response_transfer_is_active_for_request(&transfer, 103)) {
+    llm_response_transfer_reset(&transfer);
+  }
+  EXPECT_EQ_INT(transfer.next_index, 0);
+  EXPECT_EQ_INT(llm_response_transfer_accept_chunk(&transfer, 0),
+      LLM_RESPONSE_CHUNK_ACCEPTED);
+  EXPECT_TRUE(llm_response_transfer_finish(&transfer));
+}
+
 static void test_scroll_bounds(void) {
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 100, 32000), 0);
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 500, 32000), -332);
@@ -163,6 +232,27 @@ static void test_scroll_bounds(void) {
   EXPECT_EQ_INT(llm_clamp_scroll_offset_y(10, 168, 500, 32000), 0);
   EXPECT_EQ_INT(llm_clamp_scroll_offset_y(-100, 168, 500, 32000), -100);
   EXPECT_EQ_INT(llm_clamp_scroll_offset_y(-500, 168, 500, 32000), -332);
+}
+
+static int16_t test_line_height_provider(void *context) {
+  int16_t *height = context;
+  s_line_height_calls += 1;
+  return *height;
+}
+
+static void test_progress_scroll_does_not_read_layout_metrics(void) {
+  int16_t source_height = 22;
+  int16_t height = 0;
+
+  s_line_height_calls = 0;
+  EXPECT_TRUE(!llm_get_scroll_line_height(true, test_line_height_provider,
+      &source_height, &height));
+  EXPECT_EQ_INT(s_line_height_calls, 0);
+
+  EXPECT_TRUE(llm_get_scroll_line_height(false, test_line_height_provider,
+      &source_height, &height));
+  EXPECT_EQ_INT(s_line_height_calls, 1);
+  EXPECT_EQ_INT(height, source_height);
 }
 
 int main(void) {
@@ -174,7 +264,9 @@ int main(void) {
   test_response_trim();
   test_response_transfer_chunks();
   test_response_transfer_reset_and_finish();
+  test_request_response_lifecycle_guards();
   test_scroll_bounds();
+  test_progress_scroll_does_not_read_layout_metrics();
 
   if (s_failures != 0) {
     fprintf(stderr, "%d C test assertion(s) failed\n", s_failures);

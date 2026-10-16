@@ -106,8 +106,27 @@ Official OpenAI Responses requests use `store: false`. Reasoning requests also
 request encrypted reasoning content so tool-loop replay remains stateless.
 Compatible third-party endpoints do not receive these OpenAI-specific fields.
 
+Model choices load from the phone's saved cache when settings open, so showing
+settings does not wait for a provider request. Choose **Save & Refresh Models**
+to save current settings, close the settings page, and refresh the model list;
+reopen settings to select the updated list. Manual model entry remains
+available. Cached lists are bounded and scoped to the configured models
+endpoint and API credential identity; raw API keys are not stored in the model
+cache. Failed refreshes retain the last successful list and show failure status
+when settings reopen.
+
 Chat history is limited by message count, per-message length, and a 12,000
 character total. Tool output is also capped per result and across each request.
+Structured tool results remain valid JSON when capped; plain-text results may be
+truncated with a marker.
+
+Memory search and the Timeline pin list return `{items, hasMore, nextCursor}`
+pages. Memory search defaults to four items, and Timeline listing defaults to
+five; callers may request larger bounded pages. Pass `nextCursor` unchanged on
+the next call, keeping memory query unchanged. Cursors expire after 30 minutes
+and are rejected when their query or underlying dataset changes. Each serialized
+page stays within 6,000 characters. Legacy Timeline titles and times over field
+limits are explicitly shortened with `titleTruncated` or `timeTruncated`.
 
 ## Tools And MCP
 
@@ -116,20 +135,89 @@ Geolocation, Timeline, Health, and each MCP server remain disabled until enabled
 in settings. Use each MCP server's allowed-tool list and per-request call limit
 to constrain automatic execution.
 
+Within one model tool batch, independent built-in `web_fetch` reads run with a
+maximum concurrency of two. Results retain model call order. Every other tool,
+including MCP, memory, geolocation, Timeline, and Health, stays serial; each
+serial call forms a barrier before later reads start.
+
 MCP uses Streamable HTTP and protocol version `2025-06-18`. The client supports
 JSON and multi-event SSE responses, session IDs, negotiated capabilities,
 paginated tool discovery, structured tool errors, bounded schemas/results, and
-one reinitialization after an expired-session HTTP 404. Successful sessions and
-tool definitions are cached in memory for five minutes. Remote servers require
-HTTPS; HTTP is accepted only for localhost development.
+one reinitialization after an expired-session HTTP 404. Each server's successful
+session and sanitized tool definitions are cached independently in memory for five
+minutes, with bounded cache and pending-discovery sizes. Cache identity includes
+server URL, credentials, custom headers, label, allowed tools, and call limit;
+changing those settings starts a fresh discovery. The app warms enabled MCP
+servers after startup and settings saves, and overlapping warmup and foreground
+discovery share pending work. A failed server does not discard successful
+results from other servers. Remote servers require HTTPS; HTTP is accepted only
+for localhost development.
+
+MCP text blocks are joined with blank lines. Text-only results stay plain text;
+structured-only results stay JSON. Mixed results use a bounded JSON envelope
+with `mcpResult: true`, `text`, and `structuredContent`, so both are available to
+every model provider. Embedded resource text is included; image, audio, resource
+references, and unknown blocks receive explicit summaries without copying binary
+payloads. Each result is capped at 6,000 characters and all results share a
+12,000-character model-context budget. When a mixed result exceeds its available
+space, fitting structured content is kept before text is shortened; oversized
+structured content becomes an explicit omission object. MCP `isError` results
+remain tool errors.
 
 Timeline pins are validated against Pebble's supported range of at most two
-days in the past and one year in the future. Idempotent Timeline requests retry
-once after transient network, timeout, HTTP 408, HTTP 429, or HTTP 5xx failures.
-Successful LLM-created pins are persisted phone-side (up to 64) for same-ID
-full-replacement edits through `pebble_timeline_list_pins` and
-`pebble_timeline_edit_pin`. PUT to the same `/v1/user/pins/{id}` replaces the
-pin entirely.
+days in the past and one year in the future. When available, the app uses
+`Pebble.insertTimelinePin(pin)` and `Pebble.deleteTimelinePin(id)` directly,
+without a Timeline token or HTTP request. Pins belong to the originating phone,
+which syncs them to its paired watch. The methods return no delivery
+acknowledgement, so tool results report that the local call completed without
+claiming that the pin reached the watch. If the matching direct method is
+unavailable, the app falls back to the Timeline HTTP API; those idempotent
+requests retry once after transient network, timeout, HTTP 408, HTTP 429, or
+HTTP 5xx failures.
+
+Local pins support reminders, but ignore `createNotification`,
+`updateNotification`, `actions`, `primaryColor`, `secondaryColor`, and
+`backgroundColor`. Successful LLM-created pins are persisted phone-side (up to
+64). Use `pebble_timeline_create_pin` or `pebble_timeline_create_reminder` only
+to create new pins; both generate ids and reject supplied ids. To edit an
+existing app-created pin, call `pebble_timeline_list_pins`, then pass a listed
+id to `pebble_timeline_edit_pin`. Edits change only supplied fields and preserve
+all other stored fields; the API receives the complete updated pin under its
+existing id.
+
+`pebble_timeline_create_reminder` creates a scheduled Pebble Timeline reminder
+notification attached to a pin; it does not create an OS/system alarm. Supply
+`reminderTime` for an exact notification time, `remindMinutesBefore` for relative
+timing, or neither to use the pin's `time`. Local pin acceptance has no watch
+delivery acknowledgement, so it does not confirm that a reminder notification
+was delivered.
+
+For edits, empty strings clear supported optional text fields such as `subtitle`
+and `body`; `locationName` is required for weather pins. Empty strings cannot
+clear integer or enum fields. Empty icon strings reset icons to defaults; an
+empty reminder title resets to the pin title. To remove scheduled reminders,
+set `clearReminder: true`; do not combine it with `reminderTime` or
+`remindMinutesBefore`. Either reminder mode replaces the other (`0` means pin
+time). `clearReminder: false` does not restore a removed reminder; supply a
+reminder mode to add one again.
+
+## Request Controls And Recovery
+
+While a request runs, the watch shows its current stage or tool, compact tool
+history, and elapsed seconds. Press **BACK** to cancel. **SELECT** is ignored
+while work is active; after an eligible error, the watch shows `SELECT retry`.
+Errors appear under a labeled **Error** heading. Cancellation stops remaining
+work but cannot undo a side effect already completed by a phone-side tool.
+
+Retry reuses the failed prompt and existing conversation history. Setup errors
+can be retried after correcting phone settings. If a model request fails before
+any tool runs, retry starts the model request again. If a failure happens after
+tool execution begins, retry sends recorded bounded tool results to the model
+for a final answer only; it does not execute tools again. A failed watch
+delivery retries the already prepared response without another model or tool
+request. Retry capsules are capped at 64 KiB, 4,096 nodes, and 32 levels; retry
+is disabled when complete recovery data cannot fit. Canceled requests and stale
+retry actions are rejected.
 
 ## Watch Transport
 
