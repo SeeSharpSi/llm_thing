@@ -1,4 +1,4 @@
-# llm_thing
+# LLM Thing
 
 Pebble watchapp that sends dictated prompts through the phone to an
 OpenAI-compatible API and displays responses on the watch. Phone-side tools
@@ -31,8 +31,8 @@ pebble install --emulator emery --logs
 pebble install --phone <ip>
 ```
 
-`pebble build` compiles every target listed in `package.json`: `aplite`,
-`basalt`, `chalk`, `diorite`, `emery`, `flint`, and `gabbro`.
+`pebble build` compiles every target listed in `package.json`: `basalt`,
+`chalk`, `diorite`, `emery`, `flint`, and `gabbro`.
 
 ## Tests
 

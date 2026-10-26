@@ -1,7 +1,7 @@
 {
   "name": "llm_thing",
-  "author": "MakeAwesomeHappen",
-  "version": "1.0.0",
+  "author": "SilasT",
+  "version": "0.0.1",
   "keywords": [
     "pebble-app"
   ],
@@ -20,7 +20,7 @@
     "@rebble/clay": "1.0.10"
   },
   "pebble": {
-    "displayName": "llm_thing",
+    "displayName": "LLM Thing",
     "uuid": "cfee9469-e9db-4f5b-a219-b4d438d35f17",
     "sdkVersion": "3",
     "enableMultiJS": true,
@@ -30,7 +30,6 @@
       "health"
     ],
     "targetPlatforms": [
-      "aplite",
       "basalt",
       "chalk",
       "diorite",

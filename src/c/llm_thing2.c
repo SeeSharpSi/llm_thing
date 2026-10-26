@@ -993,7 +993,7 @@ static void prv_draw_home_screen(GContext *ctx, GRect bounds) {
   graphics_context_set_fill_color(ctx, s_background_color);
   graphics_fill_rect(ctx, card, HOME_CARD_RADIUS, GCornersAll);
 
-  prv_draw_home_centered_text(ctx, "llm_thing", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
+  prv_draw_home_centered_text(ctx, "LLM Thing", fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
       GRect(card.origin.x + 8, y, card.size.w - 16, 28));
   y += 34;
 

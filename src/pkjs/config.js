@@ -1,7 +1,7 @@
 module.exports = [
   {
     "type": "heading",
-    "defaultValue": "llm_thing"
+    "defaultValue": "LLM Thing"
   },
   {
     "type": "text",
