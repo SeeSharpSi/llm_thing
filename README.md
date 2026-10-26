@@ -253,6 +253,16 @@ Health Info stays disabled by default. Enabling it allows requested health data
 to be sent to the configured model provider. Raw per-minute movement,
 orientation, and light records are not exposed.
 
+## Settings Backup
+
+**Settings Backup** in the app settings copies all non-secret settings to the
+clipboard as JSON and can import a pasted backup. API keys, MCP authorization
+tokens, custom header values, and Pebble Memory notes are not exported. Import
+fills the configuration form; tap **Save Settings** to apply it. Imported API
+keys are ignored, and existing MCP credentials are kept for servers with a
+matching URL when the imported values are blank. Endpoint URLs are exported as
+entered, so do not embed credentials in them.
+
 ## Data Storage
 
 Settings, API keys, MCP authorization values, custom headers, optional saved
@@ -280,6 +290,7 @@ and scope API/MCP credentials to the minimum permissions needed.
   full-replacement edits.
 - `src/pkjs/config.js`: Clay configuration schema.
 - `src/pkjs/mcp_servers_component.js`: custom MCP server configuration UI.
+- `src/pkjs/settings_io_component.js`: non-secret settings export/import UI.
 - `tests/js/`: phone-side unit, regression, contract, and DOM tests.
 - `tests/c/`: host-C unit tests.
 - `tests/integration/`: generated PebbleKit bundle smoke test.

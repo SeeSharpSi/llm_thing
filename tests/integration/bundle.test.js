@@ -135,11 +135,17 @@ test('built PebbleKit bundle loads and registers runtime handlers', function() {
   assert.match(pebble.openedUrls[0], /^data:text\/html/);
   var configHtml = decodeURIComponent(pebble.openedUrls[0].split(',').slice(1).join(','));
   var componentEnd = configHtml.indexOf('item.reloadModels = function');
+  var settingsIoMarker = configHtml.indexOf('item.buildExportSettings = buildExportSettings');
   var firstScriptEnd = configHtml.indexOf('</script>');
 
   assert.ok(componentEnd > 0, 'model selector source missing');
   assert.ok(componentEnd < firstScriptEnd, 'model selector source escaped its script');
   assert.match(configHtml, /Health Info/);
+
+  assert.ok(configHtml.indexOf('Settings Backup') !== -1, 'settings backup section missing');
+  assert.ok(configHtml.indexOf('component-settings-io') !== -1, 'settings backup component missing');
+  assert.ok(settingsIoMarker > 0, 'settings backup component source missing');
+  assert.ok(settingsIoMarker < firstScriptEnd, 'settings backup component source escaped its script');
 });
 
 test('built PebbleKit bundle syncs stored Response Sound setting on ready', function() {

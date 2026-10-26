@@ -1,6 +1,7 @@
 var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var builtinToolsComponent = require('./builtin_tools_component');
+var settingsIoComponent = require('./settings_io_component');
 var mcpServersComponent = require('./mcp_servers_component');
 var memoryManagerComponent = require('./memory_manager_component');
 var modelDiscovery = require('./model_discovery');
@@ -115,6 +116,7 @@ clay.registerComponent(mcpServersComponent);
 clay.registerComponent(modelSelectorComponent);
 clay.registerComponent(memoryManagerComponent);
 clay.registerComponent(builtinToolsComponent);
+clay.registerComponent(settingsIoComponent);
 
 function findConfigItem(items, messageKey) {
   var found = null;

@@ -366,6 +366,20 @@ module.exports = [
     "type": "section",
     "items": [
       {
+        "type": "heading",
+        "defaultValue": "Settings Backup"
+      },
+      {
+        "type": "settings_io",
+        "id": "SettingsIo",
+        "defaultValue": ""
+      }
+    ]
+  },
+  {
+    "type": "section",
+    "items": [
+      {
         "type": "mcp_servers",
         "messageKey": "McpServersJson",
         "defaultValue": "[]"

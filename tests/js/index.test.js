@@ -100,6 +100,7 @@ function createHarness(options) {
     './config': config,
     './mcp_servers_component': { name: 'mcp_servers' },
     './builtin_tools_component': { name: 'builtin_tools' },
+    './settings_io_component': { name: 'settings_io' },
     './model_discovery': modelDiscovery,
     './model_selector_component': { name: 'model_selector' },
     './settings': settings,
@@ -131,6 +132,8 @@ test('opens configuration synchronously from cache without starting model discov
   assert.equal(harness.clay.registered[1].name, 'model_selector');
   assert.equal(harness.clay.registered[2].name, 'memory_manager');
   assert.equal(harness.clay.registered[3].name, 'builtin_tools');
+  assert.equal(harness.clay.registered[4].name, 'settings_io');
+  assert.equal(harness.clay.registered.length, 5);
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');

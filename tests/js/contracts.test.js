@@ -180,6 +180,29 @@ test('Pebble Memory is disabled by default and manager follows MCP Servers', fun
   assert.equal(config[config.length - 1].type, 'submit');
 });
 
+test('settings backup section sits before the final MCP and memory section without a message key', function() {
+  var backupSection = config.filter(function(item) {
+    return item.type === 'section' && item.items.some(function(sectionItem) {
+      return sectionItem.type === 'heading' && sectionItem.defaultValue === 'Settings Backup';
+    });
+  })[0];
+  var backupItem;
+  var finalSection = config[config.length - 2];
+
+  assert.ok(backupSection);
+  assert.equal(config.indexOf(backupSection), config.indexOf(finalSection) - 1);
+  assert.deepEqual(backupSection.items.map(function(item) { return item.type; }), ['heading', 'settings_io']);
+  backupItem = backupSection.items[1];
+  assert.equal(backupItem.id, 'SettingsIo');
+  assert.equal(backupItem.defaultValue, '');
+  assert.ok(!('messageKey' in backupItem));
+  assert.equal(backupSection.items[0].messageKey, undefined);
+  assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
+    'McpServersJson',
+    'MemoriesJson'
+  ]);
+});
+
 test('generated message-key artifacts are internally consistent', function() {
   var expected = packageJson.pebble.messageKeys.slice().sort();
   var appInfo = JSON.parse(fs.readFileSync(path.join(root, 'build/appinfo.json'), 'utf8'));
