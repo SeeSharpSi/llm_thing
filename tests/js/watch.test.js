@@ -330,6 +330,41 @@ test('cancel resumes retained ID-less queue after removing request retry head', 
   }
 });
 
+test('begin new request drains retained ID-less queue after pruning stale retry head', function() {
+  var timers = installFakeTimers();
+  var watch;
+  var failureCount = 0;
+
+  try {
+    watch = freshWatch({ manualSends: true });
+    watch.beginRequestLifecycle(42);
+    watch.sendMessage({ RequestId: 42, ProgressText: 'retry me' }, null, function() {
+      failureCount += 1;
+    });
+    global.Pebble.flushNextSend({ error: 'temporary failure' });
+    assert.equal(timers.timers.filter(function(timer) {
+      return timer.delay === 100 && !timer.cleared;
+    }).length, 1);
+
+    watch.syncWatchSettings({ FontSize: 18 });
+    assert.equal(global.Pebble.messages.length, 1, 'retry delay blocks queued settings until next request lifecycle');
+    assert.equal(global.Pebble.pendingSendCount(), 0);
+
+    watch.beginRequestLifecycle(43);
+
+    assert.equal(failureCount, 1);
+    assert.equal(timers.timers.filter(function(timer) { return timer.delay === 100; })[0].cleared, true);
+    assert.equal(global.Pebble.pendingSendCount(), 1, 'ID-less settings drains immediately without an extra enqueue');
+    assert.equal(global.Pebble.messages.length, 2);
+    assert.equal(global.Pebble.messages[1].FontSize, 18);
+
+    global.Pebble.flushNextSend();
+    assert.equal(global.Pebble.pendingSendCount(), 0, 'retained settings send drains without another trigger');
+  } finally {
+    timers.restore();
+  }
+});
+
 test('late canceled AppMessage acknowledgement fails transfer once and releases queue for next request', function() {
   var watch = freshWatch({ manualSends: true });
   var completions = [];

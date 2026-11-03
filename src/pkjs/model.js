@@ -787,21 +787,14 @@ function rememberDeliveryFailure(context, settings, userText, text, answerText) 
   });
 }
 
-function setModelRetryState(context, settings, conversation, toolDefinitions, toolMap, mode,
-                            round, usedToolCalls, mcpToolCallCounts, thinkingTrace,
-                            remainingToolResultChars, baseConversation) {
+function setModelRetryState(context, settings, conversation, mode, thinkingTrace,
+                            baseConversation) {
   context.retryState = {
     settings: settings,
     conversation: conversation,
     baseConversation: baseConversation || null,
-    toolDefinitions: toolDefinitions,
-    toolMap: toolMap,
     mode: mode,
-    round: round,
-    usedToolCalls: usedToolCalls,
-    mcpToolCallCounts: mcpToolCallCounts,
     thinkingTrace: thinkingTrace,
-    remainingToolResultChars: remainingToolResultChars,
     toolsStarted: context.toolsStarted === true
   };
 }
@@ -2517,8 +2510,7 @@ function isNativeToolRequestError(error) {
 }
 
 function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
-                                  usedToolCalls, mcpToolCallCounts, thinkingTrace,
-                                  remainingToolResultChars, callback) {
+                                  thinkingTrace, callback) {
   var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
   var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
@@ -2526,8 +2518,7 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
     return;
   }
   watch.progressSet(requestId, 'thinking', 'tool call limit reached');
-  setModelRetryState(completionContext, settings, conversation, toolDefinitions, toolMap, mode,
-      0, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars);
+  setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
     var batch;
@@ -2562,8 +2553,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
   watch.progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
-  setModelRetryState(completionContext, settings, conversation, toolDefinitions, toolMap, mode,
-      round, usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars);
+  setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
     var batch;
@@ -2614,7 +2604,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       });
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, skippedResults, true, originalToolCalls.length);
       requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
-          usedToolCalls, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
+          thinkingTrace, callback);
       return;
     }
     budgetPlan = planToolCallsByBudget(originalToolCalls, toolMap, remainingToolCalls, mcpToolCallCounts);
@@ -2644,8 +2634,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
         requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
-            usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace,
-            remainingToolResultChars, callback);
+            thinkingTrace, callback);
         return;
       }
       completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
@@ -2655,14 +2644,16 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
 
 function finishToolCompletion(context, settings, conversation, toolDefinitions, toolMap,
                               mode, completionError, text, meta) {
+  var toolInstructions;
+
   if (!isCurrentCompletion(context)) {
     return;
   }
   if (completionError && meta && meta.nativeUnsupported) {
     common.logDebug('native tool request rejected; retrying text tool fallback');
     markNativeToolsUnsupported(settings);
-    context.toolInstructions = buildToolInstructions(toolDefinitions, settings.MaxToolCalls, false);
-    conversation = buildConversation(settings, context.userText, context.toolInstructions,
+    toolInstructions = buildToolInstructions(toolDefinitions, settings.MaxToolCalls, false);
+    conversation = buildConversation(settings, context.userText, toolInstructions,
         context.historyAtStart);
     completeWithTools(context.requestId, settings, conversation, toolDefinitions, toolMap,
         'text', 0, 0, {}, '', MAX_TOOL_RESULTS_TOTAL_CHARS,
@@ -2683,8 +2674,8 @@ function startCompletion(context, settings) {
   var requestId = context.requestId;
   var userText = context.userText;
   var conversation;
+  var toolInstructions;
 
-  context.settings = settings;
   common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + context.historyAtStart.length);
   watch.progressStart(requestId, 'thinking', '');
 
@@ -2724,11 +2715,9 @@ function startCompletion(context, settings) {
       return;
     }
 
-    context.toolInstructions = buildToolInstructions(discoveredTools, settings.MaxToolCalls,
+    toolInstructions = buildToolInstructions(discoveredTools, settings.MaxToolCalls,
         !isNativeToolsUnsupported(settings));
-    context.toolDefinitions = discoveredTools;
-    context.toolMap = toolMap;
-    conversation = buildConversation(settings, userText, context.toolInstructions,
+    conversation = buildConversation(settings, userText, toolInstructions,
         context.historyAtStart);
     common.logDebug('tools discover done tools=' + discoveredTools.length + ' nativeUnsupported=' + (isNativeToolsUnsupported(settings) ? '1' : '0'));
     watch.progressDone(requestId, 'Tools loaded', discoveredTools.length + ' tools');
@@ -2871,8 +2860,7 @@ function retryCompletion(requestId, failedRequestId) {
 
   if (capsule.kind === 'final-only') {
     appendRecoveryInstruction(conversation, settings);
-    setModelRetryState(context, settings, conversation, [], {}, capsule.mode,
-        0, 0, {}, capsule.thinkingTrace, MAX_TOOL_RESULTS_TOTAL_CHARS,
+    setModelRetryState(context, settings, conversation, capsule.mode, capsule.thinkingTrace,
         capsule.conversation);
     watch.progressStart(requestId, 'thinking', 'summarizing recorded tool results');
     requestModel(settings, conversation, requestId, {}, function(error, json) {

@@ -64,12 +64,16 @@
 #define PROGRESS_CONTEXT_HEIGHT 18
 #define PROGRESS_CONTEXT_SIDE_PADDING 2
 #define REQUEST_ELAPSED_BUFFER_SIZE 32
+#define PROGRESS_DISPLAY_BUFFER_SIZE (PROGRESS_DETAIL_BUFFER_SIZE + REQUEST_ELAPSED_BUFFER_SIZE + 16)
 #define PROGRESS_TEXT_SIDE_PADDING 6
 #define PROGRESS_TEXT_GAP 4
 #define PROGRESS_TITLE_MIN_HEIGHT 32
 #define PROGRESS_TITLE_MAX_HEIGHT 60
 #define PROGRESS_DETAIL_MIN_HEIGHT 22
 #define PROGRESS_DETAIL_MAX_HEIGHT 72
+// Elapsed line plus up to two wrapped tool-detail lines: min(MAX, 3 * MIN).
+#define PROGRESS_DETAIL_RESERVED_HEIGHT 66
+#define PROGRESS_DETAIL_FONT_KEY FONT_KEY_GOTHIC_18_BOLD
 #define PROGRESS_HISTORY_MAX_HEIGHT 240
 #define HOME_CARD_MARGIN 8
 #define HOME_CARD_RADIUS 8
@@ -182,6 +186,9 @@ static int32_t s_latest_prompt_y;
 #if defined(PBL_MICROPHONE)
 static uint16_t s_past_chat_count;
 static char s_request_elapsed[REQUEST_ELAPSED_BUFFER_SIZE];
+static char s_progress_display[PROGRESS_DISPLAY_BUFFER_SIZE];
+static int16_t s_progress_detail_first_line_height;
+static int16_t s_progress_detail_line_pitch;
 static uint32_t s_request_started_at;
 static uint32_t s_request_elapsed_seconds;
 static bool s_request_active;
@@ -1180,6 +1187,44 @@ static int16_t prv_clamp_int16(int16_t value, int16_t min, int16_t max) {
   return value;
 }
 
+#if defined(PBL_MICROPHONE)
+static void prv_measure_progress_detail_lines(void) {
+  GFont font = fonts_get_system_font(PROGRESS_DETAIL_FONT_KEY);
+  GRect measure_box;
+  GSize one_line;
+  GSize two_lines;
+
+  if (s_progress_width <= 0) {
+    return;
+  }
+
+  measure_box = GRect(0, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT);
+  one_line = graphics_text_layout_get_content_size("Ag", font, measure_box,
+      GTextOverflowModeWordWrap, GTextAlignmentCenter);
+  two_lines = graphics_text_layout_get_content_size("Ag\nAg", font, measure_box,
+      GTextOverflowModeWordWrap, GTextAlignmentCenter);
+  if (one_line.h > 0 && two_lines.h > one_line.h) {
+    s_progress_detail_first_line_height = one_line.h;
+    s_progress_detail_line_pitch = two_lines.h - one_line.h;
+  }
+}
+
+static int16_t prv_progress_detail_line_cap(int16_t max_height) {
+  int16_t height;
+
+  if (s_progress_detail_first_line_height <= 0 || s_progress_detail_line_pitch <= 0 ||
+      max_height < s_progress_detail_first_line_height) {
+    return max_height;
+  }
+
+  height = s_progress_detail_first_line_height;
+  while (height + s_progress_detail_line_pitch <= max_height) {
+    height += s_progress_detail_line_pitch;
+  }
+  return height;
+}
+#endif
+
 static void prv_update_progress_text(void) {
   int16_t history_height = 0;
   int16_t title_height;
@@ -1187,6 +1232,10 @@ static void prv_update_progress_text(void) {
   int16_t title_y;
   int16_t detail_available;
   int16_t max_y;
+  const char *detail_text = s_progress_detail;
+#if defined(PBL_MICROPHONE)
+  bool detail_whole_lines = false;
+#endif
 
   if (s_progress_history_layer) {
     text_layer_set_size(s_progress_history_layer, GSize(s_progress_width, PROGRESS_HISTORY_MAX_HEIGHT));
@@ -1196,23 +1245,13 @@ static void prv_update_progress_text(void) {
     text_layer_set_size(s_progress_title_layer, GSize(s_progress_width, PROGRESS_TITLE_MAX_HEIGHT));
     text_layer_set_text(s_progress_title_layer, s_progress_title);
   }
-  if (s_progress_detail_layer) {
-    text_layer_set_size(s_progress_detail_layer, GSize(s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
-    text_layer_set_text(s_progress_detail_layer, s_progress_detail);
-  }
 
   if (!s_progress_title_layer || !s_progress_detail_layer || s_progress_width <= 0 || s_progress_height <= 0) {
     return;
   }
 
+  text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeWordWrap);
   title_height = prv_clamp_int16(text_layer_get_content_size(s_progress_title_layer).h, PROGRESS_TITLE_MIN_HEIGHT, PROGRESS_TITLE_MAX_HEIGHT);
-  if (s_progress_detail[0] != '\0'
-#if defined(PBL_MICROPHONE)
-      || s_request_active
-#endif
-      ) {
-    detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
-  }
   if (s_progress_history_layer && s_progress_history[0] != '\0') {
     history_height = prv_clamp_int16(text_layer_get_content_size(s_progress_history_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_HISTORY_MAX_HEIGHT);
   }
@@ -1229,13 +1268,59 @@ static void prv_update_progress_text(void) {
     title_y = 0;
   }
 
-  if (detail_height) {
-    detail_available = s_progress_height - PROGRESS_LOADING_HEIGHT - (title_y + title_height + PROGRESS_TEXT_GAP);
-    if (detail_available < PROGRESS_DETAIL_MIN_HEIGHT) {
-      detail_height = 0;
-    } else if (detail_height > detail_available) {
+#if defined(PBL_MICROPHONE)
+  if (s_request_active && s_progress_detail[0] != '\0') {
+    // Keep elapsed visible and reserve up to two wrapped detail lines for tool output.
+    int16_t reserved_title_y = s_progress_height - PROGRESS_LOADING_HEIGHT -
+        PROGRESS_TEXT_GAP - title_height - PROGRESS_DETAIL_RESERVED_HEIGHT;
+    if (reserved_title_y < 0) {
+      reserved_title_y = 0;
+    }
+    if (title_y > reserved_title_y) {
+      title_y = reserved_title_y;
+    }
+  }
+#endif
+
+  detail_available = s_progress_height - PROGRESS_LOADING_HEIGHT - (title_y + title_height + PROGRESS_TEXT_GAP);
+
+#if defined(PBL_MICROPHONE)
+  if (s_request_active && s_request_elapsed[0] != '\0') {
+    if (s_progress_detail[0] == '\0') {
+      snprintf(s_progress_display, sizeof(s_progress_display), "%s", s_request_elapsed);
+    } else if (detail_available >= (PROGRESS_DETAIL_MIN_HEIGHT * 2)) {
+      // Reserve the elapsed/cancel line above wrapped tool detail.
+      snprintf(s_progress_display, sizeof(s_progress_display), "%s\n%s",
+          s_request_elapsed, s_progress_detail);
+    } else {
+      // One line only: keep elapsed/cancel visible and ellipsize tool detail.
+      snprintf(s_progress_display, sizeof(s_progress_display), "%s | %s",
+          s_request_elapsed, s_progress_detail);
+      text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeTrailingEllipsis);
+    }
+    detail_text = s_progress_display;
+    detail_whole_lines = true;
+  }
+#endif
+
+  text_layer_set_size(s_progress_detail_layer, GSize(s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
+  text_layer_set_text(s_progress_detail_layer, detail_text);
+  if (detail_text[0] != '\0' && detail_available >= PROGRESS_DETAIL_MIN_HEIGHT) {
+    detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h,
+        PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
+    if (detail_height > detail_available) {
       detail_height = detail_available;
     }
+#if defined(PBL_MICROPHONE)
+    if (detail_whole_lines) {
+      int16_t line_limit = detail_available < PROGRESS_DETAIL_MAX_HEIGHT ?
+          detail_available : PROGRESS_DETAIL_MAX_HEIGHT;
+      int16_t line_cap = prv_progress_detail_line_cap(line_limit);
+      if (detail_height > line_cap) {
+        detail_height = line_cap;
+      }
+    }
+#endif
   }
 
   if (s_progress_history_layer) {
@@ -1249,11 +1334,6 @@ static void prv_update_progress_text(void) {
   if (detail_height) {
     layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
   }
-#if defined(PBL_MICROPHONE)
-  if (s_request_active && s_progress_detail_layer) {
-    text_layer_set_text(s_progress_detail_layer, s_request_elapsed);
-  }
-#endif
 }
 
 #if defined(PBL_MICROPHONE)
@@ -1266,9 +1346,7 @@ static void prv_update_request_elapsed(void) {
   s_request_elapsed_seconds = elapsed;
   snprintf(s_request_elapsed, sizeof(s_request_elapsed), "%lus | BACK cancel",
       (unsigned long)elapsed);
-  if (s_progress_detail_layer) {
-    text_layer_set_text(s_progress_detail_layer, s_request_elapsed);
-  }
+  prv_update_progress_text();
 }
 #endif
 
@@ -1893,11 +1971,11 @@ static void prv_send_retry_request(void) {
   prv_set_progress_detail("waiting for phone");
 }
 
-static void prv_cancel_active_request(void) {
+static bool prv_abort_active_request(void) {
   uint32_t old_request_id;
 
   if (!s_request_active) {
-    return;
+    return false;
   }
   old_request_id = s_request_id;
   prv_send_cancel_message(old_request_id);
@@ -1908,6 +1986,13 @@ static void prv_cancel_active_request(void) {
   s_request_started_at = 0;
   speaker_feedback_stop();
   prv_show_response_view();
+  return true;
+}
+
+static void prv_cancel_active_request(void) {
+  if (!prv_abort_active_request()) {
+    return;
+  }
   prv_rewind_request(false);
   prv_set_status("Canceled");
 }
@@ -2733,15 +2818,7 @@ static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "inbox dropped reason=%d", reason);
   prv_set_status("Message dropped");
 #if defined(PBL_MICROPHONE)
-  if (s_request_active) {
-    prv_send_cancel_message(s_request_id);
-    llm_response_transfer_finish(&s_response_transfer);
-    s_request_id += 1;
-    s_request_active = false;
-    s_retry_available = false;
-    s_request_started_at = 0;
-    speaker_feedback_stop();
-    prv_show_response_view();
+  if (prv_abort_active_request()) {
     prv_rewind_request(true);
     prv_append_error_block("Response message dropped. Retry unavailable.", false);
     return;
@@ -2784,15 +2861,7 @@ static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult
 #if defined(PBL_MICROPHONE)
   if (iter && (dict_find(iter, MESSAGE_KEY_RequestText) ||
       dict_find(iter, MESSAGE_KEY_RequestRetry))) {
-    if (s_request_active) {
-      prv_send_cancel_message(s_request_id);
-      llm_response_transfer_finish(&s_response_transfer);
-      s_request_id += 1;
-      s_request_active = false;
-      s_retry_available = false;
-      s_request_started_at = 0;
-      speaker_feedback_stop();
-      prv_show_response_view();
+    if (prv_abort_active_request()) {
       prv_rewind_request(true);
     }
     prv_append_error_block("Phone connection failed. Safe retry unavailable.", false);
@@ -2827,6 +2896,9 @@ static void prv_window_load(Window *window) {
   s_min_text_height = bounds.size.h;
   s_progress_width = bounds.size.w - (PROGRESS_TEXT_SIDE_PADDING * 2);
   s_progress_height = bounds.size.h;
+#if defined(PBL_MICROPHONE)
+  prv_measure_progress_detail_lines();
+#endif
 
   s_text_layer = layer_create(GRect(0, 0, s_text_layer_width, s_min_text_height));
   layer_set_update_proc(s_text_layer, prv_text_layer_update_proc);
@@ -2855,7 +2927,7 @@ static void prv_window_load(Window *window) {
   s_progress_detail_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
   text_layer_set_background_color(s_progress_detail_layer, GColorClear);
   text_layer_set_text_color(s_progress_detail_layer, s_text_color);
-  text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  text_layer_set_font(s_progress_detail_layer, fonts_get_system_font(PROGRESS_DETAIL_FONT_KEY));
   text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_progress_detail_layer, GTextAlignmentCenter);
   layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_detail_layer));

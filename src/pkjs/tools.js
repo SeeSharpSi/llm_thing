@@ -26,20 +26,31 @@ var MAX_HEALTH_RANGE_SECONDS = 7 * 24 * 60 * 60;
 var MAX_HEALTH_HOUR_RANGE_SECONDS = 24 * 60 * 60;
 var MAX_HEALTH_SESSIONS = 32;
 var MAX_HEALTH_BUCKET_VALUES = 64;
-var HEALTH_METRIC_BITS = {
-  steps: 1,
-  active_time: 2,
-  distance: 4,
-  sleep: 8,
-  restful_sleep: 16,
-  resting_calories: 32,
-  active_calories: 64,
-  heart_rate: 128
-};
-var HEALTH_SESSION_BITS = {
-  sleep_sessions: 512 | 1024,
-  activity_sessions: 2048 | 4096 | 8192
-};
+var HEALTH_METRICS = [
+  { name: 'steps', bit: 1, responseField: 'stepCount', outputField: 'steps' },
+  { name: 'active_time', bit: 2, responseField: 'activeSeconds', outputField: 'activeSeconds' },
+  { name: 'distance', bit: 4, responseField: 'walkedDistanceMeters', outputField: 'distanceMeters' },
+  { name: 'sleep', bit: 8, responseField: 'sleepSeconds', outputField: 'sleepSeconds' },
+  { name: 'restful_sleep', bit: 16, responseField: 'sleepRestfulSeconds', outputField: 'restfulSleepSeconds' },
+  { name: 'resting_calories', bit: 32, responseField: 'restingKCalories', outputField: 'restingCaloriesKcal' },
+  { name: 'active_calories', bit: 64, responseField: 'activeKCalories', outputField: 'activeCaloriesKcal' },
+  { name: 'heart_rate', bit: 128 },
+  { name: 'activity_sessions', bit: 2048 | 4096 | 8192 },
+  { name: 'sleep_sessions', bit: 512 | 1024 }
+];
+var HEALTH_METRIC_MAP = Object.create(null);
+var HEALTH_METRIC_NAMES = [];
+
+(function initHealthMetricMetadata() {
+  var i;
+  var metric;
+  for (i = 0; i < HEALTH_METRICS.length; i += 1) {
+    metric = HEALTH_METRICS[i];
+    HEALTH_METRIC_MAP[metric.name] = metric;
+    HEALTH_METRIC_NAMES.push(metric.name);
+  }
+}());
+
 var HEALTH_ACTIVITY_TYPES = {
   1: 'sleep',
   2: 'restful_sleep',
@@ -2809,7 +2820,7 @@ function finishTimelineSave(kind, pin, args, callback, isLocal) {
   callback(null, buildTimelineSuccessResult(pin, editable, warning, isLocal));
 }
 
-function callTimelineCreatePinBuiltin(args, requestId, callback) {
+function callTimelineCreateBuiltin(kind, args, requestId, callback) {
   var idError = timelineCreationIdError(args);
   var built;
   var pin;
@@ -2820,7 +2831,7 @@ function callTimelineCreatePinBuiltin(args, requestId, callback) {
     callback(idError);
     return;
   }
-  built = buildTimelinePin(args, { forceReminder: false });
+  built = buildTimelinePin(args, { forceReminder: kind === 'reminder' });
   if (built.error) {
     callback(built.error);
     return;
@@ -2844,47 +2855,16 @@ function callTimelineCreatePinBuiltin(args, requestId, callback) {
       callback(error);
       return;
     }
-    finishTimelineSave('pin', pin, argsForStore, callback, isLocal);
+    finishTimelineSave(kind, pin, argsForStore, callback, isLocal);
   });
 }
 
+function callTimelineCreatePinBuiltin(args, requestId, callback) {
+  callTimelineCreateBuiltin('pin', args, requestId, callback);
+}
+
 function callTimelineReminderBuiltin(args, requestId, callback) {
-  var idError = timelineCreationIdError(args);
-  var built;
-  var pin;
-  var validationError;
-  var argsForStore;
-
-  if (idError) {
-    callback(idError);
-    return;
-  }
-  built = buildTimelinePin(args, { forceReminder: true });
-  if (built.error) {
-    callback(built.error);
-    return;
-  }
-
-  pin = built.pin;
-  validationError = validateTimelinePin(pin);
-
-  if (validationError) {
-    releaseTimelinePinId(pin.id);
-    callback(validationError);
-    return;
-  }
-
-  argsForStore = cloneTimelineValue(args) || {};
-  argsForStore.id = pin.id;
-
-  timelinePinRequest('PUT', pin.id, pin, requestId, function(error, isLocal) {
-    if (error) {
-      releaseTimelinePinId(pin.id);
-      callback(error);
-      return;
-    }
-    finishTimelineSave('reminder', pin, argsForStore, callback, isLocal);
-  });
+  callTimelineCreateBuiltin('reminder', args, requestId, callback);
 }
 
 function callTimelineDeleteBuiltin(args, requestId, callback) {
@@ -3207,16 +3187,8 @@ function buildHealthInfoWindow(args) {
 }
 
 function healthMetricValue(response, metric) {
-  var values = {
-    steps: response.stepCount,
-    active_time: response.activeSeconds,
-    distance: response.walkedDistanceMeters,
-    sleep: response.sleepSeconds,
-    restful_sleep: response.sleepRestfulSeconds,
-    resting_calories: response.restingKCalories,
-    active_calories: response.activeKCalories
-  };
   var result = {};
+  var value;
 
   if (metric === 'heart_rate') {
     if (response.heartRateCurrentBPM !== undefined) { result.currentBpm = response.heartRateCurrentBPM; }
@@ -3225,19 +3197,12 @@ function healthMetricValue(response, metric) {
     if (response.heartRateMaxBPM !== undefined) { result.maxBpm = response.heartRateMaxBPM; }
     return Object.keys(result).length ? result : undefined;
   }
-  if (values[metric] !== undefined && values[metric] !== null) {
-    return values[metric];
+  if (!HEALTH_METRIC_MAP[metric]) { return undefined; }
+  value = response[HEALTH_METRIC_MAP[metric].responseField];
+  if (value !== undefined && value !== null) {
+    return value;
   }
   return undefined;
-}
-
-function healthFriendlyMetricName(metric) {
-  var names = {
-    steps: 'steps', active_time: 'activeSeconds', distance: 'distanceMeters',
-    sleep: 'sleepSeconds', restful_sleep: 'restfulSleepSeconds',
-    resting_calories: 'restingCaloriesKcal', active_calories: 'activeCaloriesKcal'
-  };
-  return names[metric];
 }
 
 function healthValues(response, metrics) {
@@ -3254,7 +3219,7 @@ function healthValues(response, metrics) {
     if (metric === 'heart_rate') {
       heartRate = value;
     } else {
-      values[healthFriendlyMetricName(metric)] = value;
+      values[HEALTH_METRIC_MAP[metric].outputField] = value;
     }
   }
   if (heartRate) { values.heartRate = heartRate; }
@@ -3270,7 +3235,7 @@ function healthUnavailable(response, metrics, scope) {
 
   for (i = 0; i < metrics.length; i += 1) {
     metric = metrics[i];
-    bit = HEALTH_METRIC_BITS[metric] || HEALTH_SESSION_BITS[metric];
+    bit = HEALTH_METRIC_MAP[metric] && HEALTH_METRIC_MAP[metric].bit;
     reason = '';
     if (bit && (Number(response.unp) & bit)) { reason = 'permission_denied'; }
     else if (bit && (Number(response.uns) & bit)) { reason = 'not_supported'; }
@@ -3310,7 +3275,6 @@ function healthHourBuckets(startUnix, endUnix) {
 }
 
 function callHealthInfoBuiltin(args, requestId, callback) {
-  var metricNames = ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'];
   var scalarMetrics = [];
   var sessionMetrics = [];
   var range;
@@ -3335,7 +3299,7 @@ function callHealthInfoBuiltin(args, requestId, callback) {
   }
   for (i = 0; i < args.metrics.length; i += 1) {
     metric = args.metrics[i];
-    if (typeof metric !== 'string' || metricNames.indexOf(metric) < 0) {
+    if (typeof metric !== 'string' || !HEALTH_METRIC_MAP[metric]) {
       callback('metrics must contain supported metric strings');
       return;
     }
@@ -3344,7 +3308,7 @@ function callHealthInfoBuiltin(args, requestId, callback) {
       return;
     }
     if (metric === 'activity_sessions' || metric === 'sleep_sessions') { sessionMetrics.push(metric); }
-    else { scalarMetrics.push(metric); totalMask |= HEALTH_METRIC_BITS[metric]; }
+    else { scalarMetrics.push(metric); totalMask |= HEALTH_METRIC_MAP[metric].bit; }
   }
   range = buildHealthInfoWindow(args);
   if (range.error) { callback(range.error); return; }
@@ -3357,7 +3321,7 @@ function callHealthInfoBuiltin(args, requestId, callback) {
     return;
   }
 
-  for (i = 0; i < sessionMetrics.length; i += 1) { sessionMask |= HEALTH_SESSION_BITS[sessionMetrics[i]]; }
+  for (i = 0; i < sessionMetrics.length; i += 1) { sessionMask |= HEALTH_METRIC_MAP[sessionMetrics[i]].bit; }
   if (scalarMetrics.length) { queries.push({ kind: 'total', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: totalMask, averageScope: 0 }); }
   if (sessionMetrics.length) { queries.push({ kind: 'current', startUnix: range.startUnix, endUnix: range.endUnix, queryMask: 256, averageScope: 0 }); }
   if (granularity !== 'total' && scalarMetrics.length) {
@@ -3723,7 +3687,7 @@ function addBuiltinTools(settings, tools, toolMap) {
         additionalProperties: false,
         required: ['metrics'],
         properties: {
-          metrics: { type: 'array', minItems: 1, maxItems: 10, uniqueItems: true, description: 'Nonempty unique health metrics to request.', items: { type: 'string', enum: ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories', 'heart_rate', 'activity_sessions', 'sleep_sessions'] } },
+          metrics: { type: 'array', minItems: 1, maxItems: HEALTH_METRICS.length, uniqueItems: true, description: 'Nonempty unique health metrics to request.', items: { type: 'string', enum: HEALTH_METRIC_NAMES } },
           range: { type: 'string', enum: ['today', 'yesterday', 'last_24h', 'last_7d', 'custom'], description: 'Health time range. Default today.' },
           startTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range start.' },
           endTime: { type: 'string', description: 'ISO date-time or Unix seconds for custom range end. Default now.' },
@@ -4394,7 +4358,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     };
   }
 
-  function recordResult(job, error, resultText, resultInfo) {
+  function settleJob(job, error, resultText, resultInfo) {
     if (job.settled) {
       return false;
     }
@@ -4404,7 +4368,16 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     }
 
     if (error) {
-      watch.progressDone(requestId, formatToolLabel(job.toolInfo), 'error: ' + common.truncate(error, 90), job.progressId);
+      if (job.toolInfo) {
+        watch.progressDone(
+          requestId,
+          formatToolLabel(job.toolInfo),
+          'error: ' + (job.error !== undefined ? job.error : common.truncate(error, 90)),
+          job.progressId
+        );
+      } else {
+        watch.progressDone(requestId, String(job.name || 'unknown'), 'unknown tool');
+      }
       results[job.index] = {
         id: job.id,
         call_id: job.id,
@@ -4431,17 +4404,8 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
   }
 
   function executeJob(job, done) {
-    var settled = false;
-
     function finishToolCall(error, resultText, resultInfo) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      if (!watch.isCurrentRequest(requestId)) {
-        return;
-      }
-      if (recordResult(job, error, resultText, resultInfo)) {
+      if (settleJob(job, error, resultText, resultInfo)) {
         done();
       }
     }
@@ -4462,22 +4426,10 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
   }
 
   function reportImmediateError(job) {
-    if (!watch.isCurrentRequest(requestId)) {
-      return;
-    }
-    if (job.toolInfo) {
+    if (job.toolInfo && watch.isCurrentRequest(requestId)) {
       watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), 'invalid arguments', job.progressId);
-      watch.progressDone(requestId, formatToolLabel(job.toolInfo), 'error: ' + job.error, job.progressId);
-    } else {
-      watch.progressDone(requestId, String(job.name || 'unknown'), 'unknown tool');
     }
-    results[job.index] = {
-      id: job.id,
-      call_id: job.id,
-      name: job.name,
-      error: job.error
-    };
-    completed += 1;
+    settleJob(job, job.error);
   }
 
   function finishIfComplete() {

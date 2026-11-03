@@ -381,6 +381,46 @@ test('Health Info selects requested totals and omits unrequested fake data', fun
   assert.equal(JSON.parse(results[0].result).totals.activeSeconds, undefined);
 });
 
+test('Health Info maps every scalar metric and requests its exact mask', function() {
+  var harness = createHarness();
+  var results;
+  var toolMap;
+  var metrics = ['steps', 'active_time', 'distance', 'sleep', 'restful_sleep', 'resting_calories', 'active_calories'];
+
+  harness.watch.healthResponse = function() {
+    return {
+      stepCount: 0,
+      activeSeconds: 61,
+      walkedDistanceMeters: 202,
+      sleepSeconds: 303,
+      sleepRestfulSeconds: 0,
+      restingKCalories: 55,
+      activeKCalories: 66,
+      heartRateAverageBPM: 77
+    };
+  };
+  harness.tools.discoverPhoneTools({ McpServersJson: '[]', HealthToolEnabled: true }, 107, function(error, definitions, map) {
+    toolMap = map;
+    harness.tools.runToolCalls(107, [{ id: 'health', name: 'pebble_health_info', arguments: { metrics: metrics } }], map, function(value) { results = value; });
+  });
+  assert.equal(harness.watch.healthQueries[0].queryMask, 127);
+  assert.deepEqual(JSON.parse(results[0].result).totals, {
+    steps: 0,
+    activeSeconds: 61,
+    distanceMeters: 202,
+    sleepSeconds: 303,
+    restfulSleepSeconds: 0,
+    restingCaloriesKcal: 55,
+    activeCaloriesKcal: 66
+  });
+
+  harness.watch.healthResponse = function() {
+    return { stepCount: 5, activeSeconds: null, walkedDistanceMeters: undefined, sleepSeconds: 0 };
+  };
+  harness.tools.runToolCalls(107, [{ id: 'sparse', name: 'pebble_health_info', arguments: { metrics: ['steps', 'active_time', 'distance', 'sleep'] } }], toolMap, function(value) { results = value; });
+  assert.deepEqual(JSON.parse(results[0].result).totals, { steps: 5, sleepSeconds: 0 });
+});
+
 test('Health Info custom hourly range queries contiguous buckets serially', function() {
   var harness = createHarness();
   var results;
@@ -788,6 +828,52 @@ test('validation errors preserve result order and break independent read batches
   assert.deepEqual(results.map(function(item) { return item.id; }), ['first', 'unknown', 'second', 'invalid', 'third']);
   assert.equal(results[1].error, 'Unknown or unavailable tool');
   assert.equal(results[3].error, 'Unsupported tool argument: extra');
+});
+
+test('mixed unknown, invalid, and successful calls report exact progress once in call order', function() {
+  var harness = createHarness();
+  var results;
+  var callbackCount = 0;
+  var toolMap = {
+    echo: {
+      kind: 'builtin',
+      name: 'echo',
+      builtinName: 'echo',
+      label: 'Echo',
+      executionClass: 'serial',
+      parameters: {
+        type: 'object',
+        properties: { text: { type: 'string' } },
+        required: ['text'],
+        additionalProperties: false
+      },
+      call: function(args, requestId, callback) {
+        callback(null, args.text);
+      }
+    }
+  };
+
+  harness.tools.runToolCalls(608, [
+    { id: 'unknown', name: 'missing', arguments: {} },
+    { id: 'invalid', name: 'echo', arguments: {} },
+    { id: 'ok', name: 'echo', arguments: { text: 'hello' } }
+  ], toolMap, function(value) {
+    callbackCount += 1;
+    results = value;
+  });
+
+  assert.equal(callbackCount, 1);
+  assert.deepEqual(results.map(function(item) { return item.id; }), ['unknown', 'invalid', 'ok']);
+  assert.equal(results[0].error, 'Unknown or unavailable tool');
+  assert.equal(results[1].error, 'Missing required tool argument: text');
+  assert.equal(results[2].result, 'hello');
+  assert.deepEqual(harness.watch.progress, [
+    ['done', 'missing', 'unknown tool'],
+    ['start', 'Echo', 'invalid arguments'],
+    ['done', 'Echo', 'error: Missing required tool argument: text'],
+    ['start', 'Echo', 'echo: { text:hello }'],
+    ['done', 'Echo', '5 chars']
+  ]);
 });
 
 test('stale read callbacks cannot start queued reads or mutations', function() {

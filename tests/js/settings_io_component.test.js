@@ -3,6 +3,7 @@
 var test = require('node:test');
 var assert = require('node:assert/strict');
 var JSDOM = require('jsdom').JSDOM;
+var load = require('./helpers/load_with_stubs');
 var component = require('../../src/pkjs/settings_io_component');
 
 function fakeItem(type, config, initialValue) {
@@ -84,18 +85,16 @@ function createHarness(options) {
   var events = [];
   var items = createItems(options);
   var clay = {
+    getAllItemsCalls: 0,
     serialize: function() {
-      var result = {};
-      Object.keys(items).forEach(function(key) {
-        result[key] = { value: items[key].get() };
-      });
-      return result;
+      throw new Error('settings export must read getAllItems, not serialize');
     },
     getAllItems: function() {
+      clay.getAllItemsCalls += 1;
       return Object.keys(items).map(function(key) { return items[key]; });
     },
-    getItemByMessageKey: function(key) {
-      return items[key] || null;
+    getItemByMessageKey: function() {
+      throw new Error('settings import must read getAllItems, not getItemByMessageKey');
     }
   };
   var item = {
@@ -215,6 +214,76 @@ test('export turns malformed MCP JSON into an empty array', function() {
 
   item.items.McpServersJson.set('{bad');
   assert.equal(item.buildExportSettings().settings.McpServersJson, '[]');
+});
+
+test('export and import re-read the current Clay items on every operation', function() {
+  var item = createHarness();
+  var rebuilt;
+  var exported;
+  var result;
+
+  exported = item.buildExportSettings();
+  assert.equal(exported.settings.Endpoint, 'https://api.example/v1/responses');
+  assert.equal(exported.settings.ShowThinking, false);
+  assert.equal(item.clay.getAllItemsCalls, 1);
+
+  item.items.Endpoint.set('https://changed.example/v1/responses');
+  item.items.ShowThinking.set(true);
+  exported = item.buildExportSettings();
+  assert.equal(exported.settings.Endpoint, 'https://changed.example/v1/responses');
+  assert.equal(exported.settings.ShowThinking, true);
+  assert.equal(item.clay.getAllItemsCalls, 2);
+
+  rebuilt = createItems({ Endpoint: 'https://rebuilt.example/v1/responses' });
+  item.clay.getAllItems = function() {
+    item.clay.getAllItemsCalls += 1;
+    return Object.keys(rebuilt).map(function(key) { return rebuilt[key]; });
+  };
+
+  exported = item.buildExportSettings();
+  assert.equal(exported.settings.Endpoint, 'https://rebuilt.example/v1/responses');
+  assert.equal(item.clay.getAllItemsCalls, 3);
+
+  result = item.importSettingsText(JSON.stringify({
+    Endpoint: 'https://imported.example/v1/responses',
+    ShowThinking: true
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.applied, 2);
+  assert.equal(rebuilt.Endpoint.get(), 'https://imported.example/v1/responses');
+  assert.equal(rebuilt.ShowThinking.get(), true);
+  assert.equal(item.clay.getAllItemsCalls, 4);
+
+  result = item.importSettingsText(JSON.stringify({
+    Endpoint: 'https://again.example/v1/responses'
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(rebuilt.Endpoint.get(), 'https://again.example/v1/responses');
+  assert.equal(item.clay.getAllItemsCalls, 5);
+});
+
+test('export and import treat an unbuilt Clay API as having no items', function() {
+  var item = createHarness();
+  var result;
+
+  item.clay.getAllItems = function() {
+    throw new Error('ClayConfig not built. build() must be run first');
+  };
+
+  assert.deepEqual(item.buildExportSettings(), {
+    app: 'llm_thing',
+    version: 1,
+    settings: {}
+  });
+
+  result = item.importSettingsText(JSON.stringify({
+    Endpoint: 'https://unbuilt.example/v1/responses'
+  }));
+  assert.equal(result.ok, false);
+  assert.equal(result.applied, 0);
+  assert.equal(result.skipped, 1);
+  assert.match(item.status.textContent, /No supported settings/);
+  assert.equal(item.items.Endpoint.get(), 'https://api.example/v1/responses');
 });
 
 test('export button fills the visible textarea and writes clipboard text', async function() {
@@ -520,4 +589,199 @@ test('nothing supported produces an error and malformed MCP is skipped', functio
   assert.equal(item.items.Endpoint.get(), 'https://valid.example/v1/responses');
   assert.equal(JSON.parse(item.items.McpServersJson.get())[0].label, 'One');
   assert.match(item.status.textContent, /Ignored 1 unsupported value\./);
+});
+
+function restoreGlobal(name, value) {
+  if (value === undefined) {
+    delete global[name];
+  } else {
+    global[name] = value;
+  }
+}
+
+function createPinnedClay(config) {
+  var host = new JSDOM(
+    '<!doctype html><html><body><form id="main-form" class="inputs"></form></body></html>',
+    { url: 'http://localhost/' }
+  );
+  var previous = {
+    window: global.window,
+    document: global.document,
+    Pebble: global.Pebble
+  };
+  var localStorageDescriptor = Object.getOwnPropertyDescriptor(global, 'localStorage');
+  var Clay;
+  var clay;
+  var url;
+  var html;
+
+  global.window = host.window;
+  global.document = host.window.document;
+  global.localStorage = host.window.localStorage;
+  global.Pebble = {
+    platform: 'phone',
+    addEventListener: function() {}
+  };
+
+  try {
+    Clay = load.loadWithStubs('@rebble/clay/dist/js/index.js', { message_keys: {} });
+    clay = new Clay(config, function() {
+      window.__clay = this;
+    });
+    clay.registerComponent(component);
+    url = clay.generateUrl();
+  } finally {
+    load.clearModule('@rebble/clay/dist/js/index.js');
+    restoreGlobal('window', previous.window);
+    restoreGlobal('document', previous.document);
+    restoreGlobal('Pebble', previous.Pebble);
+    if (localStorageDescriptor) {
+      Object.defineProperty(global, 'localStorage', localStorageDescriptor);
+    } else {
+      delete global.localStorage;
+    }
+    host.window.close();
+  }
+
+  html = decodeURIComponent(url.slice(url.indexOf(',') + 1));
+  host = new JSDOM(html, {
+    runScripts: 'dangerously',
+    url: 'http://localhost/'
+  });
+  return { dom: host, clay: host.window.__clay };
+}
+
+test('pinned Clay 1.0.10 export matches getAllItems item.get and serialize wrappers', function() {
+  var excludedKeys = ['ApiKey', 'ConfigAction', 'MemoriesJson'];
+  var harness = createPinnedClay([{
+    type: 'section',
+    items: [{
+      type: 'input',
+      messageKey: 'Endpoint',
+      defaultValue: 'https://initial.example/v1/responses'
+    }, {
+      type: 'input',
+      messageKey: 'ApiKey',
+      defaultValue: 'sk-pinned-secret'
+    }, {
+      type: 'toggle',
+      messageKey: 'ShowThinking',
+      defaultValue: false
+    }, {
+      type: 'select',
+      messageKey: 'ApiMode',
+      defaultValue: 'auto',
+      options: [
+        { label: 'Auto', value: 'auto' },
+        { label: 'Responses', value: 'responses' }
+      ]
+    }, {
+      type: 'input',
+      messageKey: 'McpServersJson',
+      defaultValue: JSON.stringify([{
+        label: 'One',
+        url: 'https://one.example/mcp',
+        authorization: 'pinned-auth-secret',
+        headers: [{ name: 'X-Key', value: 'pinned-header-secret' }]
+      }])
+    }, {
+      type: 'input',
+      messageKey: 'MemoriesJson',
+      defaultValue: '[{"text":"pinned-memory"}]'
+    }, {
+      type: 'input',
+      messageKey: 'ConfigAction',
+      defaultValue: ''
+    }, {
+      type: 'settings_io',
+      id: 'SettingsIo',
+      defaultValue: ''
+    }]
+  }]);
+
+  try {
+    var clay = harness.clay;
+    var io;
+    var serialized;
+    var exported;
+    var servers;
+    var result;
+
+    assert.ok(clay, 'pinned Clay config page built');
+    io = clay.getItemById('SettingsIo');
+    assert.ok(io);
+    assert.equal(typeof io.buildExportSettings, 'function');
+
+    serialized = clay.serialize();
+    exported = io.buildExportSettings();
+
+    assert.deepEqual(Object.keys(exported.settings).sort(), [
+      'ApiMode',
+      'Endpoint',
+      'McpServersJson',
+      'ShowThinking'
+    ]);
+
+    Object.keys(serialized).forEach(function(key) {
+      if (excludedKeys.indexOf(key) !== -1) {
+        assert.equal(Object.prototype.hasOwnProperty.call(exported.settings, key), false, key);
+        return;
+      }
+      if (key === 'McpServersJson') {
+        return;
+      }
+      assert.equal(exported.settings[key], serialized[key].value, key);
+    });
+
+    servers = JSON.parse(exported.settings.McpServersJson);
+    assert.equal(servers[0].label, 'One');
+    assert.equal(servers[0].url, 'https://one.example/mcp');
+    assert.equal(servers[0].authorization, '');
+    assert.equal(servers[0].headers[0].value, '');
+    assert.equal(
+      JSON.parse(serialized.McpServersJson.value)[0].authorization,
+      'pinned-auth-secret'
+    );
+
+    clay.getItemByMessageKey('Endpoint').set('https://changed.example/v1/responses');
+    clay.getItemByMessageKey('ShowThinking').set(true);
+    serialized = clay.serialize();
+    exported = io.buildExportSettings();
+
+    assert.equal(exported.settings.Endpoint, serialized.Endpoint.value);
+    assert.equal(exported.settings.ShowThinking, serialized.ShowThinking.value);
+    assert.equal(exported.settings.Endpoint, 'https://changed.example/v1/responses');
+    assert.equal(exported.settings.ShowThinking, true);
+
+    result = io.importSettingsText(JSON.stringify({
+      Endpoint: 'https://imported.example/v1/responses',
+      ShowThinking: false,
+      ApiKey: 'pinned-import-secret'
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(result.applied, 2);
+    assert.equal(result.keptApiKey, true);
+    assert.equal(
+      clay.getItemByMessageKey('Endpoint').get(),
+      'https://imported.example/v1/responses'
+    );
+    assert.equal(clay.getItemByMessageKey('ShowThinking').get(), false);
+    assert.equal(clay.getItemByMessageKey('ApiKey').get(), 'sk-pinned-secret');
+    assert.equal(clay.serialize().Endpoint.value, 'https://imported.example/v1/responses');
+
+    result = io.importSettingsText(JSON.stringify({
+      Endpoint: 'https://imported-again.example/v1/responses'
+    }));
+    assert.equal(result.ok, true);
+    assert.equal(
+      clay.getItemByMessageKey('Endpoint').get(),
+      'https://imported-again.example/v1/responses'
+    );
+    assert.equal(
+      io.buildExportSettings().settings.Endpoint,
+      'https://imported-again.example/v1/responses'
+    );
+  } finally {
+    harness.dom.window.close();
+  }
 });

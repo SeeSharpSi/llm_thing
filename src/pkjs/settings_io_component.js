@@ -27,8 +27,7 @@ module.exports = {
     var status = root.querySelector('[data-settings-status]');
     var excludedKeys = ['ApiKey', 'ConfigAction', 'MemoriesJson'];
     var maxBytes = 512 * 1024;
-    var clay = clayInstance || (utils && typeof utils.serialize === 'function' ? utils : null) || item.clay || null;
-    var itemMap = null;
+    var clay = clayInstance || (utils && typeof utils.getAllItems === 'function' ? utils : null) || null;
 
     function trim(value) {
       return String(value === undefined || value === null ? '' : value).replace(/^\s+|\s+$/g, '');
@@ -182,13 +181,6 @@ module.exports = {
       return setItemValue(settingItem, String(value));
     }
 
-    function unwrapSetting(value) {
-      if (isPlainObject(value) && hasOwn(value, 'value')) {
-        return value.value;
-      }
-      return value;
-    }
-
     function parseServerArray(value) {
       var parsed = value;
 
@@ -223,52 +215,50 @@ module.exports = {
       });
     }
 
-    function serializedClayValues(overrideClay) {
-      var serialized;
-      var values = {};
-      var current = overrideClay || clay || item.clay;
-      var items;
+    function itemsByMessageKey() {
+      var items = {};
+      var allItems;
       var i;
 
-      if (current && typeof current.serialize === 'function') {
-        try {
-          serialized = current.serialize() || {};
-        } catch (e) {
-          serialized = {};
-        }
-        Object.keys(serialized).forEach(function(key) {
-          values[key] = unwrapSetting(serialized[key]);
-        });
-        return values;
+      if (!clay || typeof clay.getAllItems !== 'function') {
+        return items;
       }
 
-      if (current && typeof current.getAllItems === 'function') {
-        try {
-          items = current.getAllItems() || [];
-        } catch (e) {
-          items = [];
-        }
-        for (i = 0; i < items.length; i += 1) {
-          if (items[i].messageKey && typeof items[i].get === 'function') {
-            values[items[i].messageKey] = items[i].get();
-          }
+      try {
+        allItems = clay.getAllItems() || [];
+      } catch (e) {
+        allItems = [];
+      }
+
+      for (i = 0; i < allItems.length; i += 1) {
+        if (allItems[i] && allItems[i].messageKey) {
+          items[allItems[i].messageKey] = allItems[i];
         }
       }
-      return values;
+      return items;
     }
 
-    function buildExportSettings(overrideClay) {
-      var values = serializedClayValues(overrideClay || clay);
+    function buildExportSettings() {
+      var items = itemsByMessageKey();
       var settings = {};
 
-      Object.keys(values).forEach(function(key) {
+      Object.keys(items).forEach(function(key) {
+        var value;
+
         if (excludedKeys.indexOf(key) !== -1) {
           return;
         }
+
+        try {
+          value = typeof items[key].get === 'function' ? items[key].get() : undefined;
+        } catch (e) {
+          value = undefined;
+        }
+
         if (key === 'McpServersJson') {
-          settings[key] = JSON.stringify(redactMcpServers(values[key]));
-        } else if (values[key] !== undefined) {
-          settings[key] = values[key];
+          settings[key] = JSON.stringify(redactMcpServers(value));
+        } else if (value !== undefined) {
+          settings[key] = value;
         }
       });
 
@@ -277,43 +267,6 @@ module.exports = {
         version: 1,
         settings: settings
       };
-    }
-
-    function findItem(key) {
-      var found = null;
-      var items;
-      var i;
-      var current = clay || item.clay;
-
-      if (!current) {
-        return null;
-      }
-
-      if (itemMap === null && typeof current.getAllItems === 'function') {
-        itemMap = {};
-        try {
-          items = current.getAllItems() || [];
-        } catch (e) {
-          items = [];
-        }
-        for (i = 0; i < items.length; i += 1) {
-          if (items[i].messageKey) {
-            itemMap[items[i].messageKey] = items[i];
-          }
-        }
-      }
-      if (itemMap && itemMap[key]) {
-        return itemMap[key];
-      }
-
-      if (typeof current.getItemByMessageKey === 'function') {
-        try {
-          found = current.getItemByMessageKey(key);
-        } catch (e) {
-          found = null;
-        }
-      }
-      return found || null;
     }
 
     function parseCurrentServers(settingItem) {
@@ -502,6 +455,7 @@ module.exports = {
 
     function importSettingsText(text) {
       var settings;
+      var items;
       var applied = 0;
       var skipped = 0;
       var keptApiKey = false;
@@ -516,6 +470,8 @@ module.exports = {
         return { ok: false, applied: 0, skipped: 0, keptApiKey: false, error: message, status: message };
       }
 
+      items = itemsByMessageKey();
+
       Object.keys(settings).forEach(function(key) {
         var settingItem;
 
@@ -527,7 +483,7 @@ module.exports = {
           return;
         }
 
-        settingItem = findItem(key);
+        settingItem = items[key];
         if (!settingItem || typeof settingItem.set !== 'function') {
           skipped += 1;
           return;
@@ -683,7 +639,6 @@ module.exports = {
       return null;
     }
 
-    item.clay = clay;
     item.buildExportSettings = buildExportSettings;
     item.importSettingsText = importSettingsText;
     item.exportToTextarea = exportToTextarea;

@@ -15,7 +15,6 @@ var HEALTH_INFO_TIMEOUT_MS = 8000;
 
 var s_health_info_request_id = 1;
 var s_send_queue = [];
-var s_send_busy = false;
 var s_in_flight_send = null;
 var s_last_watch_settings = null;
 var s_pending_watch_settings = null;
@@ -291,6 +290,7 @@ function beginRequestLifecycle(requestId) {
   if (!s_active_xhrs[requestKey(requestId)]) {
     s_active_xhrs[requestKey(requestId)] = [];
   }
+  processSendQueue();
 }
 
 function finishRequestLifecycle(requestId) {
@@ -355,7 +355,7 @@ function untrackXhr(requestId, request) {
 function processSendQueue() {
   var item;
 
-  if (s_send_busy || !s_send_queue.length) {
+  if (s_in_flight_send || !s_send_queue.length) {
     return;
   }
   if (s_send_queue[0].retryTimer !== null && s_send_queue[0].retryTimer !== undefined) {
@@ -372,14 +372,12 @@ function processSendQueue() {
     item = s_send_queue.shift();
   }
 
-  s_send_busy = true;
   s_in_flight_send = item;
   Pebble.sendAppMessage(item.dict, function() {
     if (s_in_flight_send !== item) {
       return;
     }
     s_in_flight_send = null;
-    s_send_busy = false;
     if (!item.settled) {
       if (!isCurrentMessage(item.dict)) {
         failSendItem(item, { error: 'Request canceled' });
@@ -393,7 +391,6 @@ function processSendQueue() {
       return;
     }
     s_in_flight_send = null;
-    s_send_busy = false;
     if (item.settled) {
       processSendQueue();
       return;
