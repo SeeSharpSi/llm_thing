@@ -124,6 +124,7 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   assert.equal(global.Pebble.messages[0].SpeakerFeedbackEnabled, 0);
   assert.equal(global.Pebble.messages[0].ApiKey, undefined);
   assert.equal(global.Pebble.messages[0].McpServersJson, undefined);
+  assert.equal(global.Pebble.messages[0].PluginSourcesJson, undefined);
   assert.equal(global.Pebble.messages[0].DeleteAllPastChats, undefined);
   assert.equal(global.Pebble.messages[0].ConfigAction, undefined);
 });
@@ -162,7 +163,7 @@ test('Health Info setting and watch protocol are declared consistently', functio
   assert.equal(keys.indexOf('HealthIncludeHeartRate'), -1);
 });
 
-test('Pebble Memory is disabled by default and manager follows MCP Servers', function() {
+test('Pebble Memory is disabled by default and follows plugin sources', function() {
   var configured = configItems(config);
   var toggle = configured.filter(function(item) {
     return item.messageKey === 'PebbleMemoryToolEnabled';
@@ -174,9 +175,11 @@ test('Pebble Memory is disabled by default and manager follows MCP Servers', fun
   assert.equal(finalSection.type, 'section');
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
+    'PluginSourcesJson',
     'MemoriesJson'
   ]);
-  assert.equal(finalSection.items[1].type, 'memory_manager');
+  assert.equal(finalSection.items[1].type, 'plugin_sources');
+  assert.equal(finalSection.items[2].type, 'memory_manager');
   assert.equal(config[config.length - 1].type, 'submit');
 });
 
@@ -199,8 +202,18 @@ test('settings backup section sits before the final MCP and memory section witho
   assert.equal(backupSection.items[0].messageKey, undefined);
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
+    'PluginSourcesJson',
     'MemoriesJson'
   ]);
+});
+
+test('Plugin Sources is default-off metadata selection with phone-only persistence', function() {
+  var item = configItems(config).filter(function(configItem) { return configItem.messageKey === 'PluginSourcesJson'; })[0];
+  assert.ok(item);
+  assert.equal(item.type, 'plugin_sources');
+  assert.equal(item.defaultValue, '[]');
+  assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
+  assert.ok(packageJson.pebble.messageKeys.indexOf('PluginSourcesJson') !== -1);
 });
 
 test('generated message-key artifacts are internally consistent', function() {

@@ -2,6 +2,7 @@ var Clay = require('@rebble/clay');
 var clayConfig = require('./config');
 var builtinToolsComponent = require('./builtin_tools_component');
 var settingsIoComponent = require('./settings_io_component');
+var pluginSourcesComponent = require('./plugin_sources_component');
 var mcpServersComponent = require('./mcp_servers_component');
 var memoryManagerComponent = require('./memory_manager_component');
 var modelDiscovery = require('./model_discovery');
@@ -11,6 +12,7 @@ var watch = require('./watch');
 var model = require('./model');
 var memoryStore = require('./memory_store');
 var tools = require('./tools');
+var pluginSources = require('./plugin_sources');
 
 function clayCustomFn() {
   var self = this;
@@ -117,6 +119,7 @@ clay.registerComponent(modelSelectorComponent);
 clay.registerComponent(memoryManagerComponent);
 clay.registerComponent(builtinToolsComponent);
 clay.registerComponent(settingsIoComponent);
+clay.registerComponent(pluginSourcesComponent);
 
 function findConfigItem(items, messageKey) {
   var found = null;
@@ -142,6 +145,26 @@ function setDiscoveredModels(result) {
   modelItem.modelsStatus = result.status || '';
 }
 
+function setPluginSourceCatalogue() {
+  var item = findConfigItem(clay.config, 'PluginSourcesJson');
+  var result;
+
+  if (!item) {
+    return;
+  }
+  try {
+    if (!pluginSources || typeof pluginSources.getCatalogue !== 'function') {
+      throw new Error('Plugin source catalogue is not supported by this phone.');
+    }
+    result = pluginSources.getCatalogue() || {};
+    item.catalogueEncoded = encodeURIComponent(JSON.stringify(Array.isArray(result.sources) ? result.sources : []));
+    item.catalogueStatus = result.status || '';
+  } catch (error) {
+    item.catalogueEncoded = encodeURIComponent('[]');
+    item.catalogueStatus = String(error && error.message || 'Plugin source catalogue unavailable on this phone.');
+  }
+}
+
 function openConfiguration(currentSettings) {
   var configurationSettings = settings.extend(currentSettings, {});
   if (memoryStore && memoryStore.listMemories) {
@@ -153,6 +176,7 @@ function openConfiguration(currentSettings) {
   }
   clay.setSettings(configurationSettings);
   setDiscoveredModels(modelDiscovery.getCached(currentSettings));
+  setPluginSourceCatalogue();
   Pebble.openURL(clay.generateUrl());
 }
 

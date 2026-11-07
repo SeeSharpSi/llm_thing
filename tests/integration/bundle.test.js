@@ -11,7 +11,7 @@ var FakeXMLHttpRequest = require('../js/helpers/fake_xhr');
 
 var root = path.resolve(__dirname, '../..');
 
-function createBundleHarness(storageValues, manualSends) {
+function createBundleHarness(storageValues, manualSends, pluginOptions) {
   var source = fs.readFileSync(path.join(root, 'build/pebble-js-app.js'), 'utf8');
   var pebble = createFakePebble({ manualSends: !!manualSends });
   var localStorage = new FakeLocalStorage(storageValues);
@@ -31,6 +31,16 @@ function createBundleHarness(storageValues, manualSends) {
   };
 
   FakeXMLHttpRequest.reset();
+  if (pluginOptions) {
+    pebble.enumeratePlugins = function() { return pluginOptions.plugins || []; };
+    pebble.pluginSubscriptions = [];
+    pebble.subscribeToSource = function(request) {
+      var subscription = { request: request, unsubscribed: false };
+      subscription.unsubscribe = function() { subscription.unsubscribed = true; };
+      pebble.pluginSubscriptions.push(subscription);
+      return subscription;
+    };
+  }
   vm.runInNewContext(source, sandbox, { filename: 'build/pebble-js-app.js' });
 
   return {
@@ -146,6 +156,217 @@ test('built PebbleKit bundle loads and registers runtime handlers', function() {
   assert.ok(configHtml.indexOf('component-settings-io') !== -1, 'settings backup component missing');
   assert.ok(settingsIoMarker > 0, 'settings backup component source missing');
   assert.ok(settingsIoMarker < firstScriptEnd, 'settings backup component source escaped its script');
+});
+
+test('built bundle supplies encoded plugin catalogue to plugin sources Clay component', function() {
+  var plugin = {
+    uuid: '12345678-1234-4234-8234-123456789abc',
+    name: 'Weather <script>alert(1)</script>',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue', 'shortText'] } }]
+  };
+  var harness = createBundleHarness({}, false, { plugins: [plugin] });
+  var pebble = harness.pebble;
+  var html;
+
+  pebble.emit('showConfiguration');
+  html = decodeURIComponent(pebble.openedUrls[0].split(',').slice(1).join(','));
+
+  assert.match(html, /plugin_sources/);
+  assert.match(html, /catalogueEncoded/);
+  assert.ok(html.indexOf(plugin.uuid) !== -1, 'plugin catalogue reaches generated settings');
+  assert.equal(html.indexOf('<script>alert(1)</script>'), -1, 'plugin name is not injected as executable markup');
+  assert.equal(pebble.pluginSubscriptions.length, 0, 'catalogue discovery does not read source data');
+});
+
+test('selected plugin source is read on model call and returned to model and watch', function() {
+  var uuid = '12345678-1234-4234-8234-123456789abc';
+  var endpoint = 'https://offline.invalid/v1/responses';
+  var plugins = [{
+    uuid: uuid,
+    name: 'Weather',
+    sources: [
+      { category: 'weather', items: ['location'], properties: { temperature: ['numericValue', 'shortText'] } },
+      { category: 'weather', items: ['forecast'], properties: { summary: ['shortText'] } }
+    ]
+  }];
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: endpoint,
+      ApiKey: 'offline-key',
+      Model: 'offline-model',
+      MaxToolCalls: 1,
+      PluginSourcesJson: JSON.stringify([{ plugin: uuid, category: 'weather', item: 'location' }])
+    })
+  }, true, { plugins: plugins });
+  var pebble = harness.pebble;
+  var request;
+  var body;
+  var selectedTool;
+  var toolName;
+  var followUp;
+  var outputs;
+  var sourceEnvelope;
+  var sourceResult;
+  var responseText;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  assert.equal(pebble.pluginSubscriptions.length, 0, 'settings sync does not read source data');
+  pebble.emit('appmessage', { payload: { RequestId: 31, RequestText: 'What is temperature at home?' } });
+  request = FakeXMLHttpRequest.last();
+  body = JSON.parse(request.body);
+  assert.equal(pebble.pluginSubscriptions.length, 0, 'tool discovery does not read source data');
+  selectedTool = body.tools.filter(function(tool) {
+    return tool.type === 'function' && tool.name.indexOf('pebble_plugin_') === 0;
+  });
+  assert.equal(selectedTool.length, 1, 'only selected plugin source exposed');
+  toolName = selectedTool[0].name;
+  assert.equal(JSON.stringify(body.tools).indexOf('forecast'), -1, 'unselected source is absent');
+
+  request.respond(200, {
+    output: [{ type: 'function_call', call_id: 'plugin-call', name: toolName, arguments: '{}' }]
+  });
+  assert.equal(pebble.pluginSubscriptions.length, 1, 'tool call starts one short-lived source subscription');
+  assert.equal(pebble.pluginSubscriptions[0].request.plugin, uuid);
+  assert.equal(pebble.pluginSubscriptions[0].request.category, 'weather');
+  assert.equal(pebble.pluginSubscriptions[0].request.item, 'location');
+  pebble.pluginSubscriptions[0].request.onData({
+    pluginUuid: uuid,
+    validUntilMs: Date.now() + 60000,
+    instances: [{ instanceId: 'home', properties: { temperature: { numericValue: { value: 21, unit: 'C' } } } }]
+  });
+
+  followUp = FakeXMLHttpRequest.last();
+  body = JSON.parse(followUp.body);
+  outputs = body.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(outputs.length, 1, 'source result is sent as function output');
+  sourceEnvelope = JSON.parse(outputs[0].output);
+  assert.equal(sourceEnvelope.error, undefined, 'source result has no tool error');
+  assert.ok(sourceEnvelope.result && typeof sourceEnvelope.result === 'object', 'tool result uses object wrapper');
+  sourceResult = sourceEnvelope.result;
+  assert.equal(sourceResult.pluginUuid, uuid);
+  assert.equal(sourceResult.category, 'weather');
+  assert.equal(sourceResult.item, 'location');
+  assert.equal(sourceResult.instances[0].instanceId, 'home');
+  assert.equal(sourceResult.instances[0].properties.temperature.numericValue.value, 21);
+  assert.equal(sourceResult.instances[0].properties.temperature.numericValue.unit, 'C');
+  assert.equal(pebble.pluginSubscriptions[0].unsubscribed, true, 'source subscription is unsubscribed after data');
+
+  followUp.respond(200, { output_text: 'It is 21 C at home.' });
+  flushManualSends(pebble);
+  responseText = pebble.messages.filter(function(message) { return message.ResponseChunk !== undefined; })
+    .map(function(message) { return message.ResponseChunk; }).join('');
+  assert.match(responseText, /21 C at home/);
+  assert.ok(pebble.messages.some(function(message) { return message.ResponseDone === 1; }), 'final answer delivered to watch');
+});
+
+test('canceling plugin source request unsubscribes and ignores late source data', function() {
+  var uuid = '12345678-1234-4234-8234-123456789abc';
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses',
+      ApiKey: 'offline-key',
+      Model: 'offline-model',
+      MaxToolCalls: 1,
+      PluginSourcesJson: JSON.stringify([{ plugin: uuid, category: 'weather', item: 'location' }])
+    })
+  }, true, { plugins: [{
+    uuid: uuid,
+    name: 'Weather',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue', 'shortText'] } }]
+  }] });
+  var pebble = harness.pebble;
+  var request;
+  var body;
+  var toolName;
+  var subscription;
+  var messagesAfterCancel;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  pebble.emit('appmessage', { payload: { RequestId: 34, RequestText: 'weather?' } });
+  request = FakeXMLHttpRequest.last();
+  body = JSON.parse(request.body);
+  toolName = body.tools.filter(function(tool) {
+    return tool.type === 'function' && tool.name.indexOf('pebble_plugin_') === 0;
+  })[0].name;
+  request.respond(200, {
+    output: [{ type: 'function_call', call_id: 'cancel-plugin-call', name: toolName, arguments: '{}' }]
+  });
+  assert.equal(pebble.pluginSubscriptions.length, 1, 'tool call starts plugin source subscription');
+  subscription = pebble.pluginSubscriptions[0];
+
+  pebble.emit('appmessage', { payload: { RequestCancel: 1, RequestId: 34 } });
+  assert.equal(subscription.unsubscribed, true, 'watch cancellation immediately unsubscribes source');
+  messagesAfterCancel = pebble.messages.length;
+  subscription.request.onData({
+    pluginUuid: uuid,
+    validUntilMs: Date.now() + 60000,
+    instances: [{ instanceId: 'home', properties: { temperature: { numericValue: { value: 21, unit: 'C' } } } }]
+  });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'late source data does not trigger model follow-up request');
+  assert.equal(pebble.messages.length, messagesAfterCancel, 'late source data does not deliver a watch response');
+});
+
+test('unselected plugin sources are not exposed when tool budget is available', function() {
+  var uuid = '12345678-1234-4234-8234-123456789abc';
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses',
+      ApiKey: 'offline-key',
+      Model: 'offline-model',
+      MaxToolCalls: 4,
+      PluginSourcesJson: '[]'
+    })
+  }, true, { plugins: [{
+    uuid: uuid,
+    name: 'Weather',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue'] } }]
+  }] });
+  var pebble = harness.pebble;
+  var request;
+  var body;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  pebble.emit('appmessage', { payload: { RequestId: 32, RequestText: 'weather?' } });
+  request = FakeXMLHttpRequest.last();
+  body = JSON.parse(request.body);
+  assert.equal((body.tools || []).some(function(tool) {
+    return typeof tool.name === 'string' && tool.name.indexOf('pebble_plugin_') === 0;
+  }), false);
+  assert.equal(pebble.pluginSubscriptions.length, 0);
+});
+
+test('zero tool budget blocks explicitly selected plugin sources', function() {
+  var uuid = '12345678-1234-4234-8234-123456789abc';
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses',
+      ApiKey: 'offline-key',
+      Model: 'offline-model',
+      MaxToolCalls: 0,
+      PluginSourcesJson: JSON.stringify([{ plugin: uuid, category: 'weather', item: 'location' }])
+    })
+  }, true, { plugins: [{
+    uuid: uuid,
+    name: 'Weather',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue'] } }]
+  }] });
+  var pebble = harness.pebble;
+  var request;
+  var body;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  pebble.emit('appmessage', { payload: { RequestId: 33, RequestText: 'weather?' } });
+  request = FakeXMLHttpRequest.last();
+  body = JSON.parse(request.body);
+  assert.equal((body.tools || []).some(function(tool) {
+    return typeof tool.name === 'string' && tool.name.indexOf('pebble_plugin_') === 0;
+  }), false);
+  assert.equal(pebble.pluginSubscriptions.length, 0);
 });
 
 test('built PebbleKit bundle syncs stored Response Sound setting on ready', function() {

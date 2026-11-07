@@ -4,6 +4,7 @@ var timelineStore = require('./timeline_store');
 var memoryStore = require('./memory_store');
 var webFetch = require('./web_fetch');
 var toolPagination = require('./tool_pagination');
+var pluginSources = require('./plugin_sources');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
@@ -622,6 +623,8 @@ function cancelMcpRequest(requestId) {
   var kept;
   var removed;
   var waiter;
+
+  pluginSources.cancelRequest(requestId);
 
   for (i = 0; i < keys.length; i += 1) {
     pending = s_mcp_pending[keys[i]];
@@ -3711,6 +3714,9 @@ function discoverPhoneTools(settings, requestId, callback) {
     }
 
     addBuiltinTools(settings, tools, toolMap);
+    pluginSources.getTools(settings).forEach(function(definition) {
+      addBuiltinTool(tools, toolMap, definition);
+    });
     tools.sort(function(a, b) {
       if (a.name < b.name) {
         return -1;

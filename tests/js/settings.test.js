@@ -21,6 +21,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.equal(settings.DEFAULT_SETTINGS.PreserveChats, false);
   assert.equal(settings.DEFAULT_SETTINGS.PebbleMemoryToolEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.SpeakerFeedbackEnabled, false);
+  assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
 });
 
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
@@ -112,6 +113,16 @@ test('saveSettings stores normalized settings', function() {
   assert.equal(stored.TouchScrollEnabled, false);
   assert.equal(stored.MaxToolCalls, 0);
   assert.equal(stored.Endpoint, settings.DEFAULT_SETTINGS.Endpoint);
+});
+
+test('PluginSourcesJson persists as phone-side JSON setting', function() {
+  var settings;
+  var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
+  global.localStorage = new FakeLocalStorage();
+  settings = require(settingsPath);
+  settings.saveSettings({ PluginSourcesJson: selected });
+  assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).PluginSourcesJson, selected);
+  assert.equal(settings.loadSettings().PluginSourcesJson, selected);
 });
 
 test('saveSettings and loadSettings persist SpeakerFeedbackEnabled on and off', function() {

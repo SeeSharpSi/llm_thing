@@ -29,6 +29,14 @@
       "location",
       "health"
     ],
+    "usesPermissions": [
+      "Internet",
+      "LocalNetwork",
+      "Location",
+      "Timeline",
+      "Health",
+      "ShowNotifications"
+    ],
     "targetPlatforms": [
       "basalt",
       "chalk",
@@ -109,7 +117,8 @@
       "SpeakerFeedbackEnabled",
       "RequestCancel",
       "RequestRetry",
-      "RetryAvailable"
+      "RetryAvailable",
+      "PluginSourcesJson"
     ],
     "resources": {
       "media": [

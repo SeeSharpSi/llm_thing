@@ -604,6 +604,49 @@ test('web_fetch rejects malformed and private URLs before creating a request', f
   assert.match(results[1].error, /valid HTTP\(S\)/);
 });
 
+test('plugin source builtin integrates schema, progress, execution, and request cancellation', function() {
+  var harness = createHarness();
+  var sourceRequest;
+  var unsubscribed = 0;
+  var definitions;
+  var toolMap;
+  var result;
+  var invalid;
+  global.Pebble = {
+    enumeratePlugins: function() {
+      return [{ uuid: '00000000-0000-0000-0001-000000000007', name: 'Fixture', sources: [{ category: 'status', items: ['current'], properties: { value: ['shortText'] } }] }];
+    },
+    subscribeToSource: function(request) {
+      sourceRequest = request;
+      return { unsubscribe: function() { unsubscribed += 1; } };
+    }
+  };
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]', PluginSourcesJson: '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"status","item":"current"}]',
+    MaxToolCalls: 2, GeolocationToolEnabled: false, TimelineToolEnabled: false, HealthToolEnabled: false
+  }, 99, function(error, found, map) { assert.ifError(error); definitions = found; toolMap = map; });
+  var sourceTool = definitions.filter(function(definition) { return definition.name.indexOf('pebble_plugin_') === 0; })[0];
+  assert.ok(sourceTool);
+  assert.equal(sourceTool.parameters.additionalProperties, false);
+  assert.match(sourceTool.parameters.properties.offset.description, /nextOffset/);
+  assert.match(sourceTool.description, /properties filter/);
+  harness.tools.runToolCalls(99, [{ id: 'source-call', name: sourceTool.name, arguments: {} }], toolMap, function(results) { result = results; });
+  assert.equal(harness.watch.progress[0][0], 'start');
+  sourceRequest.onData({ pluginUuid: '00000000-0000-0000-0001-000000000007', instances: [{ instanceId: 'phone', properties: { value: { shortText: { text: 'ready' } } } }] });
+  assert.equal(JSON.parse(result[0].result).instances[0].properties.value.shortText.text, 'ready');
+  assert.equal(result[0]._structuredResult, true);
+  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'done'; }));
+  harness.tools.runToolCalls(99, [{ id: 'invalid-source-call', name: sourceTool.name, arguments: { unexpected: true } }], toolMap, function(results) { invalid = results; });
+  assert.match(invalid[0].error, /unexpected/);
+  assert.equal(unsubscribed, 1);
+
+  result = null;
+  harness.tools.runToolCalls(99, [{ id: 'cancel-source-call', name: sourceTool.name, arguments: {} }], toolMap, function(results) { result = results; });
+  harness.tools.cancelMcpRequest(99);
+  assert.equal(unsubscribed, 2);
+  assert.equal(result, null);
+});
+
 test('web_fetch reports network and timeout errors', function() {
   var harness = createHarness();
   var results;

@@ -86,13 +86,20 @@ function createHarness(options) {
       modelDiscovery.refreshCallbacks.push(callback);
     }
   };
+  var pluginSources = {
+    calls: 0,
+    getCatalogue: function() {
+      pluginSources.calls += 1;
+      return { sources: [{ plugin: 'plugin-id', pluginName: 'Phone', category: 'calendar', item: 'today', properties: ['title'] }], status: '1 source available.' };
+    }
+  };
   var tools = {
     warmCalls: [],
     warmMcpTools: function(value) { tools.warmCalls.push(value); }
   };
   var config = [{
     type: 'section',
-    items: [{ type: 'model_selector', messageKey: 'Model' }]
+    items: [{ type: 'model_selector', messageKey: 'Model' }, { type: 'plugin_sources', messageKey: 'PluginSourcesJson' }]
   }];
 
   load.loadWithStubs(indexPath, {
@@ -103,6 +110,8 @@ function createHarness(options) {
     './settings_io_component': { name: 'settings_io' },
     './model_discovery': modelDiscovery,
     './model_selector_component': { name: 'model_selector' },
+    './plugin_sources_component': { name: 'plugin_sources' },
+    './plugin_sources': pluginSources,
     './settings': settings,
     './tools': tools,
     './watch': watch,
@@ -114,7 +123,7 @@ function createHarness(options) {
     }
   });
 
-  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery, tools: tools };
+  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery, tools: tools, pluginSources: pluginSources };
 }
 
 test.afterEach(function() {
@@ -133,7 +142,8 @@ test('opens configuration synchronously from cache without starting model discov
   assert.equal(harness.clay.registered[2].name, 'memory_manager');
   assert.equal(harness.clay.registered[3].name, 'builtin_tools');
   assert.equal(harness.clay.registered[4].name, 'settings_io');
-  assert.equal(harness.clay.registered.length, 5);
+  assert.equal(harness.clay.registered[5].name, 'plugin_sources');
+  assert.equal(harness.clay.registered.length, 6);
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
@@ -148,6 +158,33 @@ test('opens configuration synchronously from cache without starting model discov
   assert.equal(harness.modelDiscovery.refreshCalls.length, 0);
   assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[0].modelsEncoded)), ['model-a', "$'model-b"]);
   assert.equal(harness.clay.config[0].items[0].modelsStatus, '2 cached models.');
+  assert.equal(harness.pluginSources.calls, 1);
+  assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[1].catalogueEncoded)), [
+    { plugin: 'plugin-id', pluginName: 'Phone', category: 'calendar', item: 'today', properties: ['title'] }
+  ]);
+  assert.equal(harness.clay.config[0].items[1].catalogueStatus, '1 source available.');
+  global.Pebble.emit('showConfiguration');
+  assert.equal(harness.pluginSources.calls, 2, 'catalogue refreshes each time settings open');
+});
+
+test('configuration reports unsupported plugin catalogue without losing configured choices', function() {
+  var harness = createHarness({ settings: { PluginSourcesJson: '[{"plugin":"legacy","category":"old","item":"entry"}]' } });
+  harness.pluginSources.getCatalogue = function() { throw new Error('Plugin source catalogue is not supported by this phone.'); };
+  global.Pebble.emit('showConfiguration');
+  assert.equal(harness.clay.currentSettings.PluginSourcesJson, '[{"plugin":"legacy","category":"old","item":"entry"}]');
+  assert.equal(decodeURIComponent(harness.clay.config[0].items[1].catalogueEncoded), '[]');
+  assert.match(harness.clay.config[0].items[1].catalogueStatus, /not supported by this phone/);
+});
+
+test('configuration close persists plugin choices but not catalogue injection fields', function() {
+  var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
+  var harness = createHarness();
+  global.Pebble.emit('showConfiguration');
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ PluginSourcesJson: selected }) });
+
+  assert.equal(harness.settings.saved[0].PluginSourcesJson, selected);
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.settings.saved[0], 'catalogueEncoded'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(harness.settings.saved[0], 'catalogueStatus'), false);
 });
 
 test('memory manager visibility follows its toggle after Clay builds', function() {

@@ -2,11 +2,14 @@
 
 Pebble watchapp that sends dictated prompts through the phone to an
 OpenAI-compatible API and displays responses on the watch. Phone-side tools
-support geolocation, Pebble Timeline, Pebble Health, and remote MCP servers.
+support geolocation, Pebble Timeline, Pebble Health, read-only Pebble plugin
+sources, and remote MCP servers.
 
 ## Requirements
 
 - Pebble SDK and `pebble` command-line tool
+- Plugin-source support requires Pebble SDK 4.44 or newer, `pebble` 5.1.0 or
+  newer, and the latest Pebble mobile app
 - Node.js `^20.19.0`, `^22.13.0`, or `>=24.0.0` for automated tests
 - A host C compiler such as Clang or GCC for watch-core unit tests
 
@@ -132,13 +135,35 @@ limits are explicitly shortened with `titleTruncated` or `timeTruncated`.
 
 Enabled phone tools execute automatically without confirmation prompts.
 Geolocation, Timeline, Health, and each MCP server remain disabled until enabled
-in settings. Use each MCP server's allowed-tool list and per-request call limit
-to constrain automatic execution.
+in settings. Plugin Sources are also opt-in; each source is selected by plugin
+UUID, category, and item. Use each MCP server's allowed-tool list and per-request
+call limit to constrain automatic execution.
 
 Within one model tool batch, independent built-in `web_fetch` reads run with a
 maximum concurrency of two. Results retain model call order. Every other tool,
-including MCP, memory, geolocation, Timeline, and Health, stays serial; each
-serial call forms a barrier before later reads start.
+including MCP, memory, geolocation, Timeline, Health, and plugin sources, stays
+serial; each serial call forms a barrier before later reads start.
+
+### Pebble plugin sources
+
+**Plugin Sources** in settings lists installed sources when settings open.
+Plugin metadata enumeration does not read personal data. Tick
+individual sources to opt in; all are off by default, and at most 16 sources can
+be registered. After saving, enabled read tools execute automatically within
+the existing global `MaxToolCalls` limit. Plugin actions are not exposed.
+
+To use a source, install and configure its plugin in the latest Pebble mobile
+app, reopen LLM Thing settings, select the source, save, then ask a relevant
+question. Reads use one-shot, short-lived subscriptions with a 15-second timeout.
+Results are bounded to 6,000 characters of JSON scalar or series data, with
+per-source instance/property filters and paged instance offset/limit. Bitmap
+payloads are not returned. Data read from a plugin is sent to the configured LLM
+provider as tool output. If access needs permission, approve it in the Pebble
+app and retry. A missing plugin never silently falls back to another source.
+On an older phone without the plugin API, settings show unsupported status and
+retain saved selections.
+
+Pebble's plugin guide: <https://developer.repebble.com/guides/plugins/preview/>
 
 MCP uses Streamable HTTP and protocol version `2025-06-18`. The client supports
 JSON and multi-event SSE responses, session IDs, negotiated capabilities,

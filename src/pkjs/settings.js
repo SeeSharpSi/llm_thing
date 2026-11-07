@@ -38,7 +38,8 @@ var DEFAULT_SETTINGS = {
   BackgroundColor: 0xFFFFFF,
   PromptBackgroundColor: 0xAAAAAA,
   BoldTextColor: 0x000000,
-  McpServersJson: '[]'
+  McpServersJson: '[]',
+  PluginSourcesJson: '[]'
 };
 
 function logDebug(message) {

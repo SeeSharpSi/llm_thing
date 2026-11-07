@@ -546,6 +546,21 @@ test('MCP import accepts an array and replaces servers with an empty array', fun
   assert.equal(item.items.McpServersJson.get(), '[]');
 });
 
+test('plugin source selections roundtrip in settings backup without catalogue metadata', function() {
+  var item = createHarness();
+  var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
+  var key = 'PluginSourcesJson';
+  item.items[key] = fakeItem('plugin_sources', { messageKey: key }, selected);
+  var exported = item.buildExportSettings();
+  var restored = createHarness();
+  restored.items[key] = fakeItem('plugin_sources', { messageKey: key }, '[]');
+
+  assert.equal(exported.settings[key], selected);
+  assert.equal(Object.keys(exported.settings).some(function(name) { return /catalogue/i.test(name); }), false);
+  assert.equal(restored.importSettingsText(JSON.stringify(exported)).ok, true);
+  assert.equal(restored.items[key].get(), selected);
+});
+
 test('import rejects empty, oversized, malformed, array, primitive, and wrong-version input', function() {
   var item = createHarness();
   var cases = [
