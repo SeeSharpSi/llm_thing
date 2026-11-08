@@ -3,8 +3,11 @@
 var test = require('node:test');
 var assert = require('node:assert/strict');
 var path = require('node:path');
+var JSDOM = require('jsdom').JSDOM;
 var createFakePebble = require('./helpers/fake_pebble');
 var load = require('./helpers/load_with_stubs');
+var pluginSourcesComponent = require('../../src/pkjs/plugin_sources_component');
+var pluginActionsComponent = require('../../src/pkjs/plugin_actions_component');
 
 var indexPath = path.resolve(__dirname, '../../src/pkjs/index');
 
@@ -50,6 +53,7 @@ function createHarness(options) {
     calls: [],
     syncWatchSettings: function(value, force) { watch.calls.push(['sync', value, force]); },
     handleHealthInfoResponse: function(value) { watch.calls.push(['health', value]); },
+    handleActionApprovalResponse: function(value) { watch.calls.push(['action-approval', value]); },
     sendPastChatsError: function(value) { watch.calls.push(['list-error', value]); },
     sendPastChats: function(value) { watch.calls.push(['list', value]); },
     sendPastChatTranscript: function(value) { watch.calls.push(['transcript', value]); },
@@ -243,6 +247,65 @@ test('memory manager visibility follows its toggle after Clay builds', function(
   enabled = true;
   toggleListener();
   assert.deepEqual(managerCalls, ['hide', 'show']);
+});
+
+test('after build nests action root after sources inside the single Plugins body', function() {
+  var harness = createHarness();
+  var dom = new JSDOM('<!doctype html><html><body>' + pluginSourcesComponent.template + pluginActionsComponent.template + '</body></html>');
+  var sourceRoot = dom.window.document.querySelector('.component-plugin-sources:not(.component-plugin-actions)');
+  var actionRoot = dom.window.document.querySelector('.component-plugin-actions');
+  var sourceTarget = sourceRoot.querySelector('[data-manipulator-target]');
+  var sourceItem = {
+    config: { defaultValue: '[]', catalogueEncoded: encodeURIComponent('[]'), catalogueStatus: '' },
+    $element: [sourceRoot],
+    $manipulatorTarget: { set: function(name, value) { if (name === 'value') { sourceTarget.value = value; } } },
+    trigger: function() { return sourceItem; }
+  };
+  var actionCalls = [];
+  var actionItem = {
+    $element: [actionRoot],
+    show: function() { actionCalls.push('show'); },
+    hide: function() { actionCalls.push('hide'); }
+  };
+  var afterBuild;
+  var context = {
+    EVENTS: { AFTER_BUILD: 'after-build' },
+    on: function(event, callback) { assert.equal(event, 'after-build'); afterBuild = callback; },
+    getItemById: function() { return null; },
+    getItemByMessageKey: function(key) {
+      if (key === 'PluginSourcesJson') { return sourceItem; }
+      if (key === 'PluginActionsJson') { return actionItem; }
+      return null;
+    }
+  };
+
+  pluginSourcesComponent.initialize.call(sourceItem);
+  harness.clay.customFn.call(context);
+  afterBuild();
+
+  assert.equal(sourceRoot.querySelectorAll('[data-plugin-toggle]').length, 1);
+  assert.equal(actionRoot.parentNode, sourceRoot.querySelector('[data-plugin-body]'));
+  assert.equal(actionRoot.previousElementSibling.getAttribute('data-plugin-list'), 'sources');
+  assert.deepEqual(actionCalls, ['show']);
+});
+
+test('after build hides action component if source component cannot attach it', function() {
+  var harness = createHarness();
+  var afterBuild;
+  var calls = [];
+  var context = {
+    EVENTS: { AFTER_BUILD: 'after-build' },
+    on: function(event, callback) { assert.equal(event, 'after-build'); afterBuild = callback; },
+    getItemById: function() { return null; },
+    getItemByMessageKey: function(key) {
+      if (key === 'PluginSourcesJson') { return { appendActions: function() { return false; } }; }
+      if (key === 'PluginActionsJson') { return { $element: [{}], show: function() {}, hide: function() { calls.push('hide'); } }; }
+      return null;
+    }
+  };
+  harness.clay.customFn.call(context);
+  afterBuild();
+  assert.deepEqual(calls, ['hide']);
 });
 
 test('Reset Watch Display restores Response Sound default to disabled', function() {
@@ -465,6 +528,18 @@ test('appmessage routes cancel and safe retry request ids', function() {
   global.Pebble.emit('appmessage', { payload: { RequestId: 43, RequestRetry: 42 } });
 
   assert.deepEqual(harness.model.calls, [['cancel', 42], ['retry', 43, 42]]);
+});
+
+test('approval decisions including zero and malformed values route to watch validation', function() {
+  var harness = createHarness();
+  var denied = { RequestId: 12, ApprovalId: 4, ApprovalDecision: 0 };
+  var malformed = { RequestId: 'bad', ApprovalId: null, ApprovalDecision: 'maybe' };
+  global.Pebble.emit('appmessage', { payload: denied });
+  global.Pebble.emit('appmessage', { payload: malformed });
+  assert.deepEqual(harness.watch.calls, [
+    ['action-approval', denied],
+    ['action-approval', malformed]
+  ]);
 });
 
 test('saved-chat requests reject disabled preservation and missing chats', function() {

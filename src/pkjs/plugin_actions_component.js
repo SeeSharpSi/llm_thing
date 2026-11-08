@@ -7,10 +7,6 @@ Object.keys(sourceComponent).forEach(function(key) {
 
 component.name = 'plugin_actions';
 component.style = '';
-component.template = sourceComponent.template
-  .replace('class="component component-plugin-sources"', 'class="component component-plugin-sources component-plugin-actions" data-plugin-kind="actions"')
-  .replace('Plugin Sources', 'Plugin Actions')
-  .replace('Optional read-only data sources', 'Optional actions that can change things')
-  .replace('Enabled sources are read automatically. Returned data is sent to your configured model provider. Pebble OS permissions may still need approval.', 'Enabled actions run automatically without confirmation and can change external services. Arguments and results are sent to your model provider. Pebble may ask for permission. Canceling cannot undo an action already started.');
+component.template = '<div class="component component-plugin-sources component-plugin-actions" data-plugin-kind="actions"><p class="plugin-sources-warning">Sources are read-only. Enabled actions run automatically without confirmation unless Ask first is on. Ask first requires Confirm or Deny on watch. Actions can change external services. Arguments and results go to your model provider. Pebble may ask for permission. Canceling cannot undo an action already started.</p><p class="plugin-sources-status" data-plugin-status role="status" aria-live="polite"></p><div data-plugin-list="actions"></div><input data-manipulator-target type="hidden" /></div>';
 
 module.exports = component;

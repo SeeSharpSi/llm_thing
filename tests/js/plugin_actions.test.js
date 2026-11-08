@@ -11,11 +11,17 @@ var UUID = 'abcdefab-cdef-abcd-efab-cdefabcdefab';
 
 function setup(manifest) {
   var tracked = [];
+  var approvals = [];
   var watch = {
     current: true,
     isCurrentRequest: function() { return watch.current; },
     trackXhr: function(id, handle) { tracked.push(handle); return true; },
-    untrackXhr: function(id, handle) { var index = tracked.indexOf(handle); if (index !== -1) { tracked.splice(index, 1); } }
+    untrackXhr: function(id, handle) { var index = tracked.indexOf(handle); if (index !== -1) { tracked.splice(index, 1); } },
+    requestActionApproval: function(spec, id, callback) {
+      var entry = { spec: spec, requestId: id, callback: callback, aborted: false };
+      approvals.push(entry);
+      return { abort: function() { entry.aborted = true; } };
+    }
   };
   global.Pebble = {
     enumeratePlugins: function() { return manifest; },
@@ -23,7 +29,7 @@ function setup(manifest) {
   };
   setup.invocations = [];
   setup.promise = null;
-  return { api: load.loadWithStubs(modulePath, { './watch': watch }), watch: watch, tracked: tracked };
+  return { api: load.loadWithStubs(modulePath, { './watch': watch }), watch: watch, tracked: tracked, approvals: approvals };
 }
 
 function manifest() {
@@ -135,6 +141,137 @@ test('action invocation passes exact identity and validated args; filters result
   callbacks[0]({ ok: true, text: 'changed', refreshed: ['device'], ignored: 'secret', binary: { data: 'secret' } });
   assert.deepEqual(JSON.parse(output), { ok: true, pluginUuid: UUID, action: 'setMode', text: 'changed', refreshed: ['device'] });
   assert.equal(h.tracked.length, 0);
+});
+
+test('confirmation opt-in ORs duplicate flags across bounded scan and rejects invalid flags', function() {
+  var h = setup(manifest());
+  var entries = [{ plugin: UUID, action: 'setMode', confirm: false }];
+  var i;
+  for (i = 0; i < 20; i += 1) {
+    entries.push({ plugin: ('00000000-0000-0000-0000-' + ('000000000000' + i).slice(-12)), action: 'other' + i });
+  }
+  entries.push({ plugin: UUID, action: 'setMode', confirm: true });
+  var confirmed = h.api.getTools({ PluginActionsJson: JSON.stringify(entries) });
+  assert.match(confirmed[0].description, /Requires watch approval before execution/);
+  var callbackValue;
+  confirmed[0].call({ mode: 'on' }, 30, function(error) { callbackValue = error; });
+  assert.equal(h.approvals.length, 1, 'later duplicate opts accepted action into confirmation');
+  assert.equal(setup.invocations.length, 0);
+  h.approvals[0].callback(null, false);
+  assert.match(callbackValue, /User denied/);
+
+  var invalid = h.api.getTools({ PluginActionsJson: JSON.stringify([
+    { plugin: UUID, action: 'setMode', confirm: 'true' }
+  ]) });
+  assert.equal(invalid.length, 0, 'nonboolean confirmation flag omits entry');
+});
+
+test('confirmed action waits for allow and uses same immutable argument snapshot for prompt and native call', function() {
+  var pluginManifest = manifest();
+  pluginManifest[0].actions[0].parameters.properties.nested = {
+    type: 'object', additionalProperties: false, required: ['value'],
+    properties: { value: { type: 'string' } }
+  };
+  var h = setup(pluginManifest);
+  var definition = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+  var original = { mode: 'on', count: 1, nested: { value: 'before\u202e\u0001\ud800' } };
+  var callbackValue;
+  setup.promise = { then: function(resolve) { resolve({ ok: true, text: 'done' }); return this; } };
+  definition.call(original, 31, function(error, value) { callbackValue = error || value; });
+  assert.equal(setup.invocations.length, 0, 'native action waits for watch allow');
+  assert.equal(h.approvals.length, 1);
+  assert.equal(h.approvals[0].spec.args.nested.value, 'before\u202e\u0001\ud800');
+  original.mode = 'off';
+  original.count = 2;
+  original.nested.value = 'after';
+  assert.deepEqual(h.approvals[0].spec.args, { mode: 'on', count: 1, nested: { value: 'before\u202e\u0001\ud800' } });
+  assert.equal(Object.isFrozen(h.approvals[0].spec.args), true);
+  assert.equal(Object.isFrozen(h.approvals[0].spec.args.nested), true);
+  h.approvals[0].callback(null, true);
+  assert.deepEqual(setup.invocations[0].args, { mode: 'on', count: 1, nested: { value: 'before\u202e\u0001\ud800' } });
+  assert.equal(callbackValue && JSON.parse(callbackValue).text, 'done');
+});
+
+test('duplicate synchronous approval callbacks invoke native once while promise remains pending', function() {
+  var h = setup(manifest());
+  var resolveNative;
+  setup.promise = { then: function(resolve) { resolveNative = resolve; return this; } };
+  var definition = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+  definition.call({ mode: 'on' }, 37, function() {});
+  h.approvals[0].callback(null, true);
+  h.approvals[0].callback(null, true);
+  assert.equal(setup.invocations.length, 1);
+  resolveNative({ ok: true });
+  assert.equal(setup.invocations.length, 1);
+});
+
+test('aborting tracked plugin action aborts approval and ignores late allow', function() {
+  var h = setup(manifest());
+  var definition = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+  var callbackCount = 0;
+  definition.call({ mode: 'on' }, 38, function() { callbackCount += 1; });
+  assert.equal(h.tracked.length, 1);
+  h.tracked[0].abort();
+  assert.equal(h.approvals[0].aborted, true);
+  h.approvals[0].callback(null, true);
+  assert.equal(setup.invocations.length, 0);
+  assert.equal(callbackCount, 0);
+});
+
+test('legacy actions remain automatic and denial prevents same-request reprompt', function() {
+  var h = setup(manifest());
+  var automatic = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: false }]) })[0];
+  assert.doesNotMatch(automatic.description, /Requires watch approval/);
+  setup.promise = { then: function(resolve) { resolve({ ok: true }); return this; } };
+  automatic.call({ mode: 'on' }, 32, function() {});
+  assert.equal(setup.invocations.length, 1);
+  assert.equal(h.approvals.length, 0);
+
+  var confirmed = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+  var first;
+  var second;
+  confirmed.call({ mode: 'on' }, 33, function(error) { first = error; });
+  h.approvals[0].callback(null, false);
+  confirmed.call({ mode: 'off' }, 33, function(error) { second = error; });
+  assert.match(first, /User denied.*action was not run/);
+  assert.match(first, /Do not retry or bypass confirmation/);
+  assert.equal(second, first);
+  assert.equal(h.approvals.length, 1);
+  assert.equal(setup.invocations.length, 1);
+});
+
+test('confirmation API absence, errors, and stale lifecycle fail closed', function() {
+  var h = setup(manifest());
+  var definition = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+  var error;
+  h.watch.requestActionApproval = null;
+  definition.call({ mode: 'on' }, 34, function(value) { error = value; });
+  assert.match(error, /Watch confirmation is unavailable/);
+  assert.equal(setup.invocations.length, 0);
+
+  h.watch.requestActionApproval = function(spec, id, callback) {
+    callback('Watch confirmation timed out; action was not run.', false);
+    return { abort: function() {} };
+  };
+  definition.call({ mode: 'on' }, 35, function(value) { error = value; });
+  assert.match(error, /timed out; action was not run/);
+  assert.equal(setup.invocations.length, 0);
+});
+
+test('native action deadline starts only after watch approval', function() {
+  var timers = installFakeTimers();
+  try {
+    var h = setup(manifest());
+    var definition = h.api.getTools({ PluginActionsJson: JSON.stringify([{ plugin: UUID, action: 'setMode', confirm: true }]) })[0];
+    var error;
+    setup.promise = { then: function() { return this; } };
+    definition.call({ mode: 'on' }, 36, function(value) { error = value; });
+    assert.equal(timers.timers.length, 0, 'no native timeout while user decides');
+    h.approvals[0].callback(null, true);
+    assert.equal(timers.timers[0].delay, 30000);
+    timers.run(timers.timers[0].id);
+    assert.match(error, /outcome unknown/);
+  } finally { timers.restore(); }
 });
 
 test('uncertain native outcomes block same action replay; timeout is explicit and never retried', function() {

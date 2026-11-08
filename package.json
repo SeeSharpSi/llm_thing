@@ -119,7 +119,13 @@
       "RequestRetry",
       "RetryAvailable",
       "PluginSourcesJson",
-      "PluginActionsJson"
+      "PluginActionsJson",
+      "ApprovalRequest",
+      "ApprovalId",
+      "ApprovalTitle",
+      "ApprovalDetail",
+      "ApprovalDecision",
+      "ApprovalCancel"
     ],
     "resources": {
       "media": [

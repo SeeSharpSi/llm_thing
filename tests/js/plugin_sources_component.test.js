@@ -36,6 +36,12 @@ function setValue(item, value) {
   return component.manipulator.set.call(item, value);
 }
 
+function openPlugin(item, plugin) {
+  var group = item.root.querySelector('[data-plugin-group="' + plugin + '"]');
+  group.open = true;
+  return group;
+}
+
 test('source selection defaults disabled and serializes checkbox changes', function() {
   var item = createItem();
   var checkbox = item.root.querySelector('[data-plugin-index="0"]');
@@ -43,16 +49,54 @@ test('source selection defaults disabled and serializes checkbox changes', funct
   checkbox.checked = true;
   checkbox.dispatchEvent(new item.window.Event('change', { bubbles: true }));
   assert.deepEqual(JSON.parse(component.manipulator.get.call(item)), [{ plugin: catalogue[0].plugin, category: 'event', item: 'today' }]);
+  assert.equal(item.root.querySelector('[data-plugin-group="' + catalogue[0].plugin + '"] .plugin-count-sources').textContent, '1/1 sources');
   checkbox = item.root.querySelector('[data-plugin-index="0"]');
   checkbox.checked = false;
   checkbox.dispatchEvent(new item.window.Event('change', { bubbles: true }));
   assert.deepEqual(JSON.parse(item.target.value), []);
 });
 
+test('saved enabled source remains selected while its plugin starts collapsed', function() {
+  var selected = [{ plugin: catalogue[0].plugin, category: 'event', item: 'today' }];
+  var item = createItem({ defaultValue: JSON.stringify(selected) });
+  var group = item.root.querySelector('[data-plugin-group="' + catalogue[0].plugin + '"]');
+
+  assert.equal(group.open, false);
+  assert.equal(group.querySelector('[data-plugin-index="0"]').checked, true);
+  assert.equal(group.querySelector('.plugin-count-sources').textContent, '1/1 sources');
+  setValue(item, JSON.stringify(selected));
+  assert.equal(item.root.querySelector('[data-plugin-group="' + catalogue[0].plugin + '"]').open, false, 'import while collapsed stays collapsed');
+});
+
+test('nested action events cannot select source catalogue entries', function() {
+  var item = createItem();
+  var actionRoot = item.window.document.createElement('div');
+  var actionList = item.window.document.createElement('div');
+  var actionCheckbox = item.window.document.createElement('input');
+  var sourceList = item.root.querySelector('[data-plugin-list="sources"]');
+  actionRoot.setAttribute('data-plugin-kind', 'actions');
+  actionList.setAttribute('data-plugin-list', 'actions');
+  actionCheckbox.type = 'checkbox';
+  actionCheckbox.setAttribute('data-plugin-index', '0');
+  actionList.appendChild(actionCheckbox);
+  actionRoot.appendChild(actionList);
+
+  assert.equal(typeof item.appendActions, 'function');
+  assert.equal(item.appendActions(actionRoot), true);
+  assert.equal(actionRoot.previousElementSibling, sourceList);
+  assert.equal(item.root.querySelectorAll('[data-plugin-toggle]').length, 1);
+  item.root.querySelector('[data-plugin-toggle]').click();
+  actionCheckbox.checked = true;
+  actionCheckbox.dispatchEvent(new item.window.Event('change', { bubbles: true }));
+
+  assert.deepEqual(item.collectSources(), []);
+  assert.deepEqual(JSON.parse(item.target.value), []);
+});
+
 test('uses text nodes for untrusted catalogue metadata', function() {
   var item = createItem();
   assert.equal(item.root.querySelector('img'), null);
-  assert.equal(item.root.querySelector('.plugin-source-group-title').textContent, 'Calendar <img src=x>');
+  assert.equal(item.root.querySelector('.plugin-source-group-name').textContent, 'Calendar <img src=x>');
   assert.match(item.root.querySelector('.plugin-sources-warning').textContent, /sent to your configured model provider/);
 });
 
@@ -92,6 +136,7 @@ test('unavailable selected entries remain visible and removable', function() {
   ];
   setValue(item, JSON.stringify(selected));
   assert.equal(item.root.querySelectorAll('.plugin-source-unavailable').length, 1);
+  assert.equal(item.root.querySelector('[data-plugin-group="' + selected[1].plugin + '"] .plugin-count-sources').textContent, '1/1 sources');
   assert.deepEqual(JSON.parse(component.manipulator.get.call(item)), selected);
   item.root.querySelector('[data-plugin-remove]').dispatchEvent(new item.window.Event('click', { bubbles: true }));
   assert.deepEqual(JSON.parse(item.target.value), [selected[0]]);
@@ -113,6 +158,8 @@ test('removing one unavailable source in installed plugin group preserves others
   setValue(item, JSON.stringify(selected));
   item.root.querySelector('[data-plugin-toggle]').click();
   group = item.root.querySelector('.plugin-source-group');
+  group.open = true;
+  assert.equal(group.querySelector('.plugin-count-sources').textContent, '3/3 sources');
   details = group.querySelector('.plugin-source-details');
   details.open = true;
   remove = group.querySelector('[data-plugin-remove]');
@@ -120,6 +167,7 @@ test('removing one unavailable source in installed plugin group preserves others
   remove.dispatchEvent(new item.window.Event('click', { bubbles: true }));
 
   assert.deepEqual(JSON.parse(item.target.value), [selected[0], selected[2]]);
+  assert.equal(group.querySelector('.plugin-count-sources').textContent, '2/2 sources');
   assert.equal(item.root.querySelectorAll('.plugin-source-group').length, 1);
   assert.equal(item.root.querySelectorAll('.plugin-source-unavailable').length, 1);
   assert.equal(group.querySelector('.plugin-source-details'), details);
@@ -127,6 +175,37 @@ test('removing one unavailable source in installed plugin group preserves others
   focused = item.root.ownerDocument.activeElement;
   assert.equal(focused, group.querySelector('[data-plugin-remove]'));
   assert.ok(item.root.contains(focused), 'focus remains on a live control');
+});
+
+test('removing final unavailable source focuses closed sibling summary', function() {
+  var firstPlugin = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  var secondPlugin = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  var item = createItem({ catalogueEncoded: encodeURIComponent('[]') });
+  var selected = [
+    { plugin: firstPlugin, category: 'old', item: 'gone' },
+    { plugin: secondPlugin, category: 'old', item: 'gone' }
+  ];
+  var firstGroup;
+  var secondGroup;
+  var summary;
+
+  setValue(item, JSON.stringify(selected));
+  item.root.querySelector('[data-plugin-toggle]').click();
+  firstGroup = item.root.querySelector('[data-plugin-group="' + firstPlugin + '"]');
+  secondGroup = item.root.querySelector('[data-plugin-group="' + secondPlugin + '"]');
+  firstGroup.open = true;
+  assert.equal(secondGroup.open, false);
+  assert.equal(secondGroup.querySelector('.plugin-count-sources').textContent, '1/1 sources');
+  firstGroup.querySelector('[data-plugin-remove]').focus();
+  firstGroup.querySelector('[data-plugin-remove]').click();
+
+  secondGroup = item.root.querySelector('[data-plugin-group="' + secondPlugin + '"]');
+  summary = secondGroup.querySelector(':scope > .plugin-source-group-title');
+  assert.deepEqual(JSON.parse(item.target.value), [selected[1]]);
+  assert.equal(secondGroup.open, false, 'focus transfer does not open sibling');
+  assert.equal(secondGroup.querySelector('.plugin-count-sources').textContent, '1/1 sources');
+  assert.equal(item.root.ownerDocument.activeElement, summary);
+  assert.notEqual(item.root.ownerDocument.activeElement, item.root.ownerDocument.body);
 });
 
 test('malformed catalogue reports unavailable while preserving saved selections', function() {
@@ -169,6 +248,7 @@ test('uppercase UUID selections normalize and deduplicate with lowercase catalog
   ]));
   assert.deepEqual(choices, [{ plugin: lower, category: 'event', item: 'today' }]);
   setValue(item, JSON.stringify([{ plugin: uppercase, category: 'event', item: 'today' }]));
+  openPlugin(item, lower);
   assert.equal(item.root.querySelectorAll('.plugin-source-unavailable').length, 0);
   assert.equal(item.root.querySelector('[data-plugin-index="0"]').checked, true);
 });
@@ -184,6 +264,7 @@ test('metadata-to-selection roundtrip preserves opaque category and item whitesp
   var item = createItem({ catalogueEncoded: encodeURIComponent(JSON.stringify([source])) });
   var checkbox = item.root.querySelector('[data-plugin-toggle]');
   checkbox.dispatchEvent(new item.window.Event('click', { bubbles: true }));
+  openPlugin(item, source.plugin);
   checkbox = item.root.querySelector('[data-plugin-index="0"]');
   checkbox.checked = true;
   checkbox.dispatchEvent(new item.window.Event('change', { bubbles: true }));
@@ -201,6 +282,7 @@ test('checkbox change preserves checked state, keyboard focus, and open disclosu
   var details = item.root.querySelector('.plugin-source-details');
   var group = item.root.querySelector('.plugin-source-group');
   item.root.querySelector('[data-plugin-toggle]').click();
+  group.open = true;
   details.open = true;
   checkbox = item.root.querySelector('[data-plugin-index="0"]');
   checkbox.focus();
@@ -278,6 +360,36 @@ test('scoped component rules override Clay base label layout and reset inherited
   assert.equal(computed.paddingTop, '0.25rem');
   assert.equal(computed.textAlign, 'left');
   assert.equal(computed.lineHeight, 'normal');
+});
+
+test('plugin separators distinguish plugin boundaries from source-action divider', function() {
+  var dom = new JSDOM('<!doctype html><html><head><style>' + component.style + '</style></head><body>' +
+    '<div class="component-plugin-sources">' +
+      '<section class="plugin-source-group" data-has-sources><section class="plugin-source-group component-plugin-actions plugin-action-group" data-plugin-kind="actions"></section></section>' +
+      '<section class="plugin-source-group" data-has-sources></section>' +
+      '<section class="plugin-source-group component-plugin-actions plugin-action-group" data-plugin-kind="actions"></section>' +
+    '</div></body></html>');
+  var groups = dom.window.document.querySelectorAll('.component-plugin-sources > .plugin-source-group');
+  var mixedAction = groups[0].querySelector('.plugin-action-group');
+  var sourceOnly = groups[1];
+  var actionOnly = groups[2];
+  var style = dom.window.getComputedStyle;
+  var actionRow = dom.window.document.createElement('div');
+  var unavailableAction = dom.window.document.createElement('div');
+  actionRow.className = 'plugin-source-row plugin-action-row';
+  unavailableAction.className = 'plugin-source-unavailable';
+  mixedAction.appendChild(actionRow);
+  mixedAction.appendChild(unavailableAction);
+
+  assert.equal(style(groups[0]).borderBottomWidth, '2px');
+  assert.equal(style(groups[0]).borderBottomColor, 'rgb(135, 147, 161)');
+  assert.equal(style(sourceOnly).borderBottomWidth, '2px');
+  assert.equal(style(actionOnly).borderBottomWidth, '2px');
+  assert.equal(style(mixedAction).borderTopWidth, '1px');
+  assert.equal(style(mixedAction).borderTopColor, 'rgb(116, 123, 132)');
+  assert.equal(style(mixedAction).borderBottomWidth, '0px');
+  assert.equal(style(actionRow).borderBottomWidth, '0px');
+  assert.equal(style(unavailableAction).borderBottomWidth, '0px');
 });
 
 test('narrow viewport rules allow rows and long metadata to wrap without fixed overflow', function() {

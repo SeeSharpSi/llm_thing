@@ -133,24 +133,31 @@ limits are explicitly shortened with `titleTruncated` or `timeTruncated`.
 
 ## Tools And MCP
 
-Enabled phone tools execute automatically without confirmation prompts.
+Enabled phone tools execute automatically without confirmation prompts, except
+plugin actions configured to ask first.
 Geolocation, Timeline, Health, and each MCP server remain disabled until enabled
-in settings. Plugin Sources are also opt-in; each source is selected by plugin
-UUID, category, and item. Use each MCP server's allowed-tool list and per-request
-call limit to constrain automatic execution.
+in settings. Plugin sources and actions are independently opt-in. Sources are
+selected by plugin UUID, category, and item. Actions are selected by plugin UUID
+and action name. Use each MCP server's allowed-tool list and per-request call
+limit to constrain automatic execution.
 
 Within one model tool batch, independent built-in `web_fetch` reads run with a
 maximum concurrency of two. Results retain model call order. Every other tool,
 including MCP, memory, geolocation, Timeline, Health, and plugin sources, stays
 serial; each serial call forms a barrier before later reads start.
 
-### Pebble plugin sources
+### Pebble plugins
 
-**Plugin Sources** in settings lists installed sources when settings open.
-Plugin metadata enumeration does not read personal data. Tick
-individual sources to opt in; all are off by default, and at most 16 sources can
-be registered. After saving, enabled read tools execute automatically within
-the existing global `MaxToolCalls` limit.
+The **Plugins** dropdown shows one entry per installed plugin UUID, initially
+collapsed. Expand an entry to see its read-only sources first, followed by its
+actions. A 2px gray line separates plugins; when an entry has both, a 1px gray
+divider separates sources from actions. Source-only and action-only plugins
+still appear as one entry. Each plugin heading shows gray selected/total counts
+for sources and actions, reflecting current selections. Totals include listed
+entries plus saved unavailable choices, which remain visible and removable when
+expanded. Plugin metadata enumeration does not read personal data. Sources and
+actions have separate opt-ins, are off by default, and each has a limit of 16.
+Enabled reads and actions count toward the existing global `MaxToolCalls` limit.
 
 To use a source, install and configure its plugin in the latest Pebble mobile
 app, reopen LLM Thing settings, select the source, save, then ask a relevant
@@ -163,14 +170,18 @@ app and retry. A missing plugin never silently falls back to another source.
 On an older phone without the plugin API, settings show unsupported status and
 retain saved selections.
 
-### Pebble plugin actions
+Actions execute serially. By default, an enabled action executes automatically,
+preserving existing behavior. Turn on its **Ask first** switch to require watch
+approval before each native call. The switch appears only for enabled actions.
+The watch displays plugin, action, and arguments. Press SELECT to confirm, BACK
+to deny, and UP or DOWN to scroll. Approval requests expire after 60 seconds;
+denial, cancellation, timeout, or transport failure means the action is not run.
+Denied actions cannot be requested again during the same model request.
 
-**Plugin Actions** settings groups installed plugins and lists their actions.
-Each action has a separate opt-in, all are off by default, and at most 16 actions
-can be enabled independently of the 16-source limit. Enabled actions execute
-automatically without an additional application confirmation and count toward the
-existing global `MaxToolCalls` limit. Actions execute serially. There is no
-automatic retry.
+The watch approval inbox is limited to 1,024 bytes. The full approval detail is
+limited to 600 UTF-8 bytes. Oversized arguments are not partially shown or
+approved; the tool returns an error asking for a shorter request. Only after
+approval does the native action's 30-second deadline begin.
 
 Each call pins `Pebble.invokeAction` to the selected plugin UUID and exact action
 name. It never falls back to another plugin or action. Plugin actions can change
@@ -178,12 +189,11 @@ external state or send data outside the phone. Arguments and results are sent to
 the configured model provider. Pebble may require OS permission approval or
 plugin authentication in the Pebble app or plugin setup.
 
-Actions have a 30-second deadline. A timeout or rejection leaves the outcome
-unknown because the action may have completed. The app does not claim to abort an
-action, and cancellation cannot undo side effects. After an uncertain outcome,
-that action is blocked for the rest of the current request to prevent duplicate
-execution. The existing Retry flow after tool execution requests a final answer
-only; it does not repeat actions.
+After an action starts, cancellation cannot undo its side effects. A native
+timeout or rejection may have an unknown outcome, so the action is blocked for
+the rest of the current request to prevent duplicate execution. The existing
+Retry flow after tool execution requests a final answer only; it does not repeat
+actions. There is no automatic retry.
 
 Unsupported or unsafe action JSON Schemas are omitted with a visible warning.
 Common Hue and Todoist action schemas are supported.

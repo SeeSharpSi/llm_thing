@@ -7,6 +7,8 @@
 #define LLM_FONT_SIZE_DEFAULT 18
 #define LLM_BUZZ_STRENGTH_DEFAULT 1
 #define LLM_SCROLL_LINES_DEFAULT 3
+#define LLM_APPROVAL_DETAIL_MAX_BYTES 600
+#define LLM_APPROVAL_TIMEOUT_MS 60000u
 
 typedef enum {
   LLM_RESPONSE_TRANSFER_IDLE = 0,
@@ -19,6 +21,22 @@ typedef struct {
   uint32_t next_index;
   uint32_t request_id;
 } LlmResponseTransfer;
+
+typedef enum {
+  LLM_APPROVAL_IDLE = 0,
+  LLM_APPROVAL_PENDING,
+  LLM_APPROVAL_RESOLVED
+} LlmApprovalPhase;
+
+typedef struct {
+  LlmApprovalPhase phase;
+  uint32_t request_id;
+  uint32_t approval_id;
+  uint32_t last_resolved_request_id;
+  uint32_t last_resolved_id;
+  bool has_resolved_id;
+  bool decision;
+} LlmApprovalState;
 
 typedef enum {
   LLM_RESPONSE_CHUNK_ACCEPTED,
@@ -46,6 +64,17 @@ bool llm_response_transfer_is_active_for_request(const LlmResponseTransfer *tran
 LlmResponseChunkResult llm_response_transfer_accept_chunk(LlmResponseTransfer *transfer,
                                                            uint32_t chunk_index);
 bool llm_response_transfer_finish(LlmResponseTransfer *transfer);
+void llm_approval_reset(LlmApprovalState *approval);
+bool llm_approval_begin(LlmApprovalState *approval, uint32_t active_request_id,
+                        uint32_t request_id, uint32_t approval_id);
+bool llm_approval_is_current(const LlmApprovalState *approval, uint32_t request_id,
+                             uint32_t approval_id);
+bool llm_approval_choose(LlmApprovalState *approval, uint32_t request_id,
+                         uint32_t approval_id, bool approve);
+bool llm_approval_cancel(LlmApprovalState *approval, uint32_t request_id,
+                         uint32_t approval_id);
+bool llm_approval_decode_integer(uint32_t raw_value, size_t width, bool is_signed,
+                                 uint32_t *value);
 size_t llm_safe_utf8_prefix_length(const char *text, size_t length, size_t max_length);
 bool llm_response_trim_oldest_turn(char *buffer, bool *truncated, char prompt_marker);
 LlmResponseAppendResult llm_response_append(char *buffer, size_t capacity, bool *truncated,

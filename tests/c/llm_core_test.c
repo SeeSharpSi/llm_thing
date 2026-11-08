@@ -225,6 +225,58 @@ static void test_request_response_lifecycle_guards(void) {
   EXPECT_TRUE(llm_response_transfer_finish(&transfer));
 }
 
+static void test_approval_lifecycle_guards(void) {
+  LlmApprovalState approval = {0};
+  uint32_t decoded = 0;
+
+  EXPECT_TRUE(llm_approval_begin(&approval, 10, 10, 1));
+  EXPECT_TRUE(llm_approval_is_current(&approval, 10, 1));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 1));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 2));
+  EXPECT_TRUE(llm_approval_is_current(&approval, 10, 1));
+  EXPECT_TRUE(!llm_approval_choose(&approval, 9, 1, true));
+  EXPECT_TRUE(!llm_approval_choose(&approval, 10, 2, true));
+  EXPECT_TRUE(llm_approval_choose(&approval, 10, 1, true));
+  EXPECT_TRUE(approval.decision);
+  EXPECT_TRUE(!llm_approval_is_current(&approval, 10, 1));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 1));
+  EXPECT_TRUE(llm_approval_begin(&approval, 10, 10, 2));
+  EXPECT_TRUE(llm_approval_choose(&approval, 10, 2, true));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 1));
+
+  EXPECT_TRUE(llm_approval_begin(&approval, 10, 10, 3));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 1));
+  EXPECT_TRUE(!llm_approval_cancel(&approval, 9, 3));
+  EXPECT_TRUE(llm_approval_cancel(&approval, 10, 3));
+  EXPECT_TRUE(!approval.decision);
+  EXPECT_TRUE(!llm_approval_choose(&approval, 10, 3, true));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 10, 10, 3));
+
+  EXPECT_TRUE(!llm_approval_begin(&approval, 11, 10, 3));
+  EXPECT_TRUE(llm_approval_begin(&approval, 11, 11, 3));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 12, 12, 3));
+  EXPECT_TRUE(llm_approval_choose(&approval, 11, 3, false));
+  EXPECT_TRUE(llm_approval_begin(&approval, 12, 12, 3));
+  EXPECT_TRUE(!llm_approval_begin(&approval, 12, 12, 0));
+
+  EXPECT_TRUE(llm_approval_decode_integer(0x7f, 1, true, &decoded));
+  EXPECT_EQ_INT(decoded, 127);
+  EXPECT_TRUE(!llm_approval_decode_integer(0x80, 1, true, &decoded));
+  EXPECT_TRUE(llm_approval_decode_integer(0xff, 1, false, &decoded));
+  EXPECT_EQ_INT(decoded, 255);
+  EXPECT_TRUE(llm_approval_decode_integer(0x7fff, 2, true, &decoded));
+  EXPECT_EQ_INT(decoded, 32767);
+  EXPECT_TRUE(!llm_approval_decode_integer(0x8000, 2, true, &decoded));
+  EXPECT_TRUE(llm_approval_decode_integer(0xffff, 2, false, &decoded));
+  EXPECT_EQ_INT(decoded, 65535);
+  EXPECT_TRUE(llm_approval_decode_integer(0x7fffffff, 4, true, &decoded));
+  EXPECT_EQ_INT(decoded, 0x7fffffff);
+  EXPECT_TRUE(!llm_approval_decode_integer(0x80000000, 4, true, &decoded));
+  EXPECT_TRUE(llm_approval_decode_integer(0xffffffff, 4, false, &decoded));
+  EXPECT_EQ_INT(decoded, 0xffffffffu);
+  EXPECT_TRUE(!llm_approval_decode_integer(1, 3, false, &decoded));
+}
+
 static void test_scroll_bounds(void) {
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 100, 32000), 0);
   EXPECT_EQ_INT(llm_min_scroll_offset_y(168, 500, 32000), -332);
@@ -265,6 +317,7 @@ int main(void) {
   test_response_transfer_chunks();
   test_response_transfer_reset_and_finish();
   test_request_response_lifecycle_guards();
+  test_approval_lifecycle_guards();
   test_scroll_bounds();
   test_progress_scroll_does_not_read_layout_metrics();
 

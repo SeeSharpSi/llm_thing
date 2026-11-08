@@ -37,6 +37,8 @@ function clayCustomFn() {
     var configAction = self.getItemByMessageKey('ConfigAction');
     var memoryToggle = self.getItemByMessageKey('PebbleMemoryToolEnabled');
     var memoryManager = self.getItemByMessageKey('MemoriesJson');
+    var pluginSourcesItem = self.getItemByMessageKey('PluginSourcesJson');
+    var pluginActionsItem = self.getItemByMessageKey('PluginActionsJson');
     var builtinTools = self.getItemById('BuiltinTools');
     var builtinToolKeys = [
       'WebSearchEnabled',
@@ -98,6 +100,17 @@ function clayCustomFn() {
         }
       });
       builtinTools.appendItems(toolRoots);
+    }
+
+    if (pluginActionsItem && pluginActionsItem.$element && pluginActionsItem.$element[0]) {
+      if (pluginSourcesItem && typeof pluginSourcesItem.appendActions === 'function') {
+        if (pluginActionsItem.show) { pluginActionsItem.show(); }
+        if (!pluginSourcesItem.appendActions(pluginActionsItem.$element[0]) && pluginActionsItem.hide) {
+          pluginActionsItem.hide();
+        }
+      } else if (pluginActionsItem.hide) {
+        pluginActionsItem.hide();
+      }
     }
 
     if (!resetButton) {
@@ -283,6 +296,11 @@ Pebble.addEventListener('webviewclosed', function(e) {
 Pebble.addEventListener('appmessage', function(e) {
   var dict = e.payload || {};
   var requestId = dict.RequestId || 0;
+
+  if (dict.ApprovalDecision !== undefined && dict.ApprovalDecision !== null) {
+    watch.handleActionApprovalResponse(dict);
+    return;
+  }
 
   if (dict.HealthSummaryRequest) {
     watch.handleHealthInfoResponse(dict);

@@ -8,6 +8,15 @@ test('plugin consumer declares required permissions and persisted message key', 
   var messageKeys = packageJson.pebble.messageKeys;
   var pluginSourcesIndex = messageKeys.indexOf('PluginSourcesJson');
   var pluginActionsIndex = messageKeys.indexOf('PluginActionsJson');
+  var approvalKeys = [
+    'PluginActionsJson',
+    'ApprovalRequest',
+    'ApprovalId',
+    'ApprovalTitle',
+    'ApprovalDetail',
+    'ApprovalDecision',
+    'ApprovalCancel'
+  ];
 
   assert.deepEqual(packageJson.pebble.usesPermissions, [
     'Internet',
@@ -18,6 +27,6 @@ test('plugin consumer declares required permissions and persisted message key', 
     'ShowNotifications'
   ]);
   assert.notEqual(pluginSourcesIndex, -1, 'PluginSourcesJson must remain declared');
-  assert.equal(pluginActionsIndex, messageKeys.length - 1, 'PluginActionsJson must be appended');
   assert.ok(pluginSourcesIndex < pluginActionsIndex, 'PluginActionsJson must follow PluginSourcesJson');
+  assert.deepEqual(messageKeys.slice(-approvalKeys.length), approvalKeys);
 });

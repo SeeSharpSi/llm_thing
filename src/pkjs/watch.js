@@ -12,6 +12,11 @@ var WATCH_PROMPT_OFF = '\u0004';
 var WATCH_SMALL_ON = '\u0005';
 var WATCH_SMALL_OFF = '\u0006';
 var HEALTH_INFO_TIMEOUT_MS = 8000;
+var ACTION_APPROVAL_TIMEOUT_MS = 60000;
+var ACTION_APPROVAL_DETAIL_MAX_BYTES = 600;
+var ACTION_APPROVAL_MESSAGE_MAX_BYTES = 1024;
+// Conservative allowance for five AppMessage tuple headers, keys, scalar values, and title.
+var ACTION_APPROVAL_WIRE_FIXED_OVERHEAD_BYTES = 128;
 
 var s_health_info_request_id = 1;
 var s_send_queue = [];
@@ -23,6 +28,8 @@ var s_sending_watch_settings = null;
 var s_latest_request_id = null;
 var s_active_xhrs = {};
 var s_pending_health_info = {};
+var s_pending_action_approvals = Object.create(null);
+var s_action_approval_id = (Date.now() % 2147483647) + 1;
 var s_progress = {
   requestId: 0,
   active: false,
@@ -67,6 +74,25 @@ function failSendItem(item, error) {
   if (item.onFailure) {
     item.onFailure(error || { error: 'AppMessage failed' });
   }
+}
+
+function pendingActionApproval(requestId, approvalId) {
+  var pending = s_pending_action_approvals[String(requestId)];
+  return pending && !pending.settled && pending.approvalId === approvalId ? pending : null;
+}
+
+function isApprovalCancel(item) {
+  return !!item && item.approvalCancel === true && item.dict && item.dict.ApprovalCancel === 1;
+}
+
+function isApprovalRequestActive(item) {
+  return !!item && item.approvalRequest && !!pendingActionApproval(item.approvalRequest.requestId, item.approvalRequest.approvalId);
+}
+
+function canSendItem(item) {
+  if (isApprovalCancel(item)) { return true; }
+  if (item && item.approvalRequest && !isApprovalRequestActive(item)) { return false; }
+  return !!item && isCurrentMessage(item.dict);
 }
 
 function succeedSendItem(item) {
@@ -237,7 +263,7 @@ function dropQueuedMessagesForRequest(requestId) {
 
   for (i = 0; i < s_send_queue.length; i += 1) {
     item = s_send_queue[i];
-    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) === Number(requestId)) {
+    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) === Number(requestId) && !isApprovalCancel(item)) {
       dropped.push(item);
     } else {
       kept.push(item);
@@ -258,7 +284,7 @@ function dropStaleQueuedMessages(requestId) {
 
   for (i = 0; i < s_send_queue.length; i += 1) {
     item = s_send_queue[i];
-    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) !== Number(requestId)) {
+    if (dictHasRequestId(item.dict) && Number(item.dict.RequestId) !== Number(requestId) && !isApprovalCancel(item)) {
       dropped.push(item);
     } else {
       kept.push(item);
@@ -278,6 +304,7 @@ function dropStaleQueuedMessages(requestId) {
 function beginRequestLifecycle(requestId) {
   var key;
 
+  clearActionApprovalsForRequest(requestId, true);
   s_latest_request_id = requestId;
   for (key in s_active_xhrs) {
     if (s_active_xhrs.hasOwnProperty(key) && key !== requestKey(requestId)) {
@@ -294,6 +321,8 @@ function beginRequestLifecycle(requestId) {
 }
 
 function finishRequestLifecycle(requestId) {
+  clearActionApprovalsForRequest(requestId, false);
+  abortPluginActionHandlesForRequest(requestId);
   delete s_active_xhrs[requestKey(requestId)];
 }
 
@@ -305,6 +334,7 @@ function cancelRequestLifecycle(requestId) {
   }
 
   key = requestKey(requestId);
+  clearActionApprovalsForRequest(requestId, false);
   s_latest_request_id = null;
   abortXhrsForKey(key);
   cancelHealthInfoForRequest(requestId);
@@ -352,6 +382,36 @@ function untrackXhr(requestId, request) {
   }
 }
 
+function handleSendFailure(item, error) {
+  if (s_in_flight_send !== item) { return; }
+  s_in_flight_send = null;
+  if (item.settled) {
+    processSendQueue();
+    return;
+  }
+  if (item.attempts < MAX_SEND_ATTEMPTS && canSendItem(item)) {
+    item.attempts += 1;
+    if (item.approvalRequest || item.approvalCancel) {
+      common.logDebug('action approval AppMessage retry=' + item.attempts + ' stage=transport');
+    } else {
+      common.logDebug('sendAppMessage retry=' + item.attempts + ' error=' + JSON.stringify(error));
+    }
+    s_send_queue.unshift(item);
+    item.retryTimer = setTimeout(function() {
+      item.retryTimer = null;
+      processSendQueue();
+    }, SEND_RETRY_DELAY_MS);
+    return;
+  }
+  if (item.approvalRequest || item.approvalCancel) {
+    common.logDebug('action approval AppMessage failed attempts=' + item.attempts + ' stage=transport');
+  } else {
+    common.logDebug('sendAppMessage failed attempts=' + item.attempts + ': ' + JSON.stringify(error));
+  }
+  failSendItem(item, error || { error: 'AppMessage failed' });
+  processSendQueue();
+}
+
 function processSendQueue() {
   var item;
 
@@ -363,8 +423,8 @@ function processSendQueue() {
   }
 
   item = s_send_queue.shift();
-  while (item && !isCurrentMessage(item.dict)) {
-    common.logDebug('skipping stale message request=' + item.dict.RequestId);
+  while (item && !canSendItem(item)) {
+    if (!item.approvalRequest && !item.approvalCancel) { common.logDebug('skipping stale message request=' + item.dict.RequestId); }
     failSendItem(item, { error: 'Stale request' });
     if (!s_send_queue.length) {
       return;
@@ -373,46 +433,32 @@ function processSendQueue() {
   }
 
   s_in_flight_send = item;
-  Pebble.sendAppMessage(item.dict, function() {
+  try { Pebble.sendAppMessage(item.dict, function() {
     if (s_in_flight_send !== item) {
       return;
     }
     s_in_flight_send = null;
     if (!item.settled) {
-      if (!isCurrentMessage(item.dict)) {
+      if (!canSendItem(item)) {
         failSendItem(item, { error: 'Request canceled' });
       } else {
         succeedSendItem(item);
       }
     }
     processSendQueue();
-  }, function(e) {
-    if (s_in_flight_send !== item) {
-      return;
+  }, function(e) { handleSendFailure(item, e); });
+  } catch (sendError) {
+    if (item.approvalRequest || item.approvalCancel) { handleSendFailure(item, { error: 'send threw' }); }
+    else {
+      if (s_in_flight_send === item) { s_in_flight_send = null; }
+      throw sendError;
     }
-    s_in_flight_send = null;
-    if (item.settled) {
-      processSendQueue();
-      return;
-    }
-    if (!item.settled && item.attempts < MAX_SEND_ATTEMPTS && isCurrentMessage(item.dict)) {
-      item.attempts += 1;
-      common.logDebug('sendAppMessage retry=' + item.attempts + ' error=' + JSON.stringify(e));
-      s_send_queue.unshift(item);
-      item.retryTimer = setTimeout(function() {
-        item.retryTimer = null;
-        processSendQueue();
-      }, SEND_RETRY_DELAY_MS);
-      return;
-    }
-    common.logDebug('sendAppMessage failed attempts=' + item.attempts + ': ' + JSON.stringify(e));
-    failSendItem(item, e || { error: 'AppMessage failed' });
-    processSendQueue();
-  });
+  }
 }
 
-function sendMessage(dict, onSuccess, onFailure) {
-  if (!isCurrentMessage(dict)) {
+function sendMessage(dict, onSuccess, onFailure, sendOptions) {
+  sendOptions = sendOptions || {};
+  if (!isCurrentMessage(dict) && sendOptions.approvalCancel !== true) {
     common.logDebug('dropping stale message request=' + dict.RequestId);
     if (onFailure) {
       onFailure({ error: 'Stale request' });
@@ -426,10 +472,204 @@ function sendMessage(dict, onSuccess, onFailure) {
     onFailure: onFailure,
     attempts: 1,
     retryTimer: null,
-    settled: false
+    settled: false,
+    approvalRequest: sendOptions.approvalRequest || null,
+    approvalCancel: sendOptions.approvalCancel === true
   });
   processSendQueue();
   return true;
+}
+
+function isStrictApprovalRequestId(requestId) {
+  return typeof requestId === 'number' && isFinite(requestId) && Math.floor(requestId) === requestId &&
+    requestId >= 0 && requestId <= 4294967295;
+}
+
+function nextActionApprovalId() {
+  var result = s_action_approval_id;
+  s_action_approval_id = s_action_approval_id >= 2147483647 ? 1 : s_action_approval_id + 1;
+  return result;
+}
+
+function escapeApprovalJson(value) {
+  return value.replace(/[\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g, function(character) {
+    var hex = character.charCodeAt(0).toString(16);
+    while (hex.length < 4) { hex = '0' + hex; }
+    return '\\u' + hex;
+  });
+}
+
+function dropQueuedApprovalRequest(pending) {
+  var kept = [];
+  var dropped = [];
+  var i;
+  var item;
+  for (i = 0; i < s_send_queue.length; i += 1) {
+    item = s_send_queue[i];
+    if (item.approvalRequest && Number(item.approvalRequest.requestId) === Number(pending.requestId) &&
+        item.approvalRequest.approvalId === pending.approvalId) { dropped.push(item); }
+    else { kept.push(item); }
+  }
+  s_send_queue = kept;
+  if (s_in_flight_send && s_in_flight_send.approvalRequest &&
+      Number(s_in_flight_send.approvalRequest.requestId) === Number(pending.requestId) &&
+      s_in_flight_send.approvalRequest.approvalId === pending.approvalId) { dropped.push(s_in_flight_send); }
+  for (i = 0; i < dropped.length; i += 1) { failSendItem(dropped[i], { error: 'Approval no longer pending' }); }
+}
+
+function sendActionApprovalCancel(pending) {
+  var dict = { RequestId: pending.requestId, ApprovalId: pending.approvalId, ApprovalCancel: 1 };
+  try { sendMessage(dict, null, null, { approvalCancel: true }); } catch (e) {}
+}
+
+function settleActionApproval(pending, error, approved, suppressCallback, sendCancel) {
+  if (!pending || pending.settled) { return false; }
+  pending.settled = true;
+  if (pending.timeout !== null) { clearTimeout(pending.timeout); pending.timeout = null; }
+  if (s_pending_action_approvals[String(pending.requestId)] === pending) {
+    delete s_pending_action_approvals[String(pending.requestId)];
+  }
+  dropQueuedApprovalRequest(pending);
+  if (pending.tracked) {
+    pending.tracked = false;
+    try { untrackXhr(pending.requestId, pending.handle); } catch (e) {}
+  }
+  if (sendCancel) { sendActionApprovalCancel(pending); }
+  if (!suppressCallback && isCurrentRequest(pending.requestId)) {
+    pending.callback(error || null, approved === true);
+  }
+  return true;
+}
+
+function requestActionApproval(spec, requestId, callback) {
+  var handle;
+  var pending;
+  var approvalId;
+  var argsJson;
+  var detail;
+  var dict;
+  var bytes;
+  var key;
+  var validationError = null;
+
+  spec = spec || {};
+  if (!isStrictApprovalRequestId(requestId) || typeof callback !== 'function' || !isCurrentRequest(requestId)) {
+    if (typeof callback === 'function') { callback('Action approval request is stale; action was not run.', false); }
+    return { abort: function() {} };
+  }
+  if (typeof Pebble === 'undefined' || !Pebble || typeof Pebble.sendAppMessage !== 'function') {
+    callback('Watch confirmation is unavailable; action was not run.', false);
+    return { abort: function() {} };
+  }
+  key = String(requestId);
+  if (s_pending_action_approvals[key]) {
+    callback('Another action confirmation is pending; action was not run.', false);
+    return { abort: function() {} };
+  }
+  try {
+    if (typeof spec.plugin !== 'string' || typeof spec.pluginName !== 'string' || typeof spec.action !== 'string' ||
+        !spec.plugin || !spec.pluginName || !spec.action) { throw new Error('invalid approval identity'); }
+    argsJson = JSON.stringify(spec.args);
+    if (typeof argsJson !== 'string') { throw new Error('arguments are not JSON'); }
+    detail = 'Plugin: ' + escapeApprovalJson(JSON.stringify(spec.pluginName)) +
+      '\nAction: ' + escapeApprovalJson(JSON.stringify(spec.action)) +
+      '\nArguments: ' + escapeApprovalJson(argsJson) +
+      '\nPlugin UUID: ' + escapeApprovalJson(JSON.stringify(spec.plugin));
+    if (detail.indexOf('\u0000') !== -1) { throw new Error('NUL in approval detail'); }
+    bytes = nextUtf8Chunk(detail, 0, ACTION_APPROVAL_DETAIL_MAX_BYTES);
+    if (bytes.end !== detail.length || bytes.bytes > ACTION_APPROVAL_DETAIL_MAX_BYTES) {
+      validationError = 'Confirmation details exceed the watch limit; shorten arguments. Action was not run.';
+    } else {
+      approvalId = nextActionApprovalId();
+      dict = {
+        RequestId: requestId,
+        ApprovalRequest: 1,
+        ApprovalId: approvalId,
+        ApprovalTitle: 'Confirm action',
+        ApprovalDetail: detail
+      };
+      if (bytes.bytes + ACTION_APPROVAL_WIRE_FIXED_OVERHEAD_BYTES > ACTION_APPROVAL_MESSAGE_MAX_BYTES) {
+        validationError = 'Confirmation details exceed the watch message limit; shorten arguments. Action was not run.';
+      }
+    }
+  } catch (e) {
+    validationError = 'Confirmation details are invalid; shorten arguments. Action was not run.';
+  }
+  if (validationError) {
+    callback(validationError, false);
+    return { abort: function() {} };
+  }
+
+  pending = {
+    requestId: requestId,
+    approvalId: approvalId,
+    callback: callback,
+    timeout: null,
+    handle: null,
+    tracked: false,
+    settled: false
+  };
+  handle = { abort: function() { settleActionApproval(pending, null, false, true, true); } };
+  pending.handle = handle;
+  s_pending_action_approvals[key] = pending;
+  pending.timeout = setTimeout(function() {
+    settleActionApproval(pending, 'Watch confirmation timed out; action was not run.', false, false, true);
+  }, ACTION_APPROVAL_TIMEOUT_MS);
+  pending.tracked = true;
+  if (!trackXhr(requestId, handle)) {
+    pending.tracked = false;
+    settleActionApproval(pending, 'Watch confirmation request became stale; action was not run.', false, false, true);
+    return handle;
+  }
+  sendMessage(dict, null, function() {
+    if (pendingActionApproval(requestId, approvalId) === pending) {
+      settleActionApproval(pending, 'Could not send watch confirmation; action was not run.', false, false, true);
+    }
+  }, { approvalRequest: { requestId: requestId, approvalId: approvalId } });
+  return handle;
+}
+
+function handleActionApprovalResponse(dict) {
+  var pending;
+  var requestId;
+  var approvalId;
+  var decision;
+  if (!dict || typeof dict !== 'object' || !Object.prototype.hasOwnProperty.call(dict, 'RequestId') ||
+      !Object.prototype.hasOwnProperty.call(dict, 'ApprovalId') || !Object.prototype.hasOwnProperty.call(dict, 'ApprovalDecision')) { return false; }
+  requestId = dict.RequestId;
+  approvalId = dict.ApprovalId;
+  decision = dict.ApprovalDecision;
+  if (!isStrictApprovalRequestId(requestId) || typeof approvalId !== 'number' || !isFinite(approvalId) ||
+      Math.floor(approvalId) !== approvalId || approvalId < 1 || approvalId > 4294967295 ||
+      (decision !== 0 && decision !== 1)) { return false; }
+  pending = pendingActionApproval(requestId, approvalId);
+  if (!pending || !isCurrentRequest(requestId)) { return false; }
+  settleActionApproval(pending, null, decision === 1, false, true);
+  return true;
+}
+
+function clearActionApprovalsForRequest(requestId, staleOnly) {
+  var keys = Object.keys(s_pending_action_approvals);
+  var i;
+  var pending;
+  for (i = 0; i < keys.length; i += 1) {
+    pending = s_pending_action_approvals[keys[i]];
+    if (pending && (staleOnly ? Number(pending.requestId) !== Number(requestId) : Number(pending.requestId) === Number(requestId))) {
+      settleActionApproval(pending, null, false, true, true);
+    }
+  }
+}
+
+function abortPluginActionHandlesForRequest(requestId) {
+  var key = requestKey(requestId);
+  var handles = (s_active_xhrs[key] || []).slice();
+  var i;
+  for (i = 0; i < handles.length; i += 1) {
+    if (handles[i] && handles[i].pluginAction === true && typeof handles[i].abort === 'function') {
+      try { handles[i].abort(); } catch (e) {}
+      untrackXhr(requestId, handles[i]);
+    }
+  }
 }
 
 function buildWatchSettings(settings) {
@@ -1304,5 +1544,7 @@ module.exports = {
   sendPastChatDeleted: sendPastChatDeleted,
   sendPastChatTranscript: sendPastChatTranscript,
   requestHealthInfo: requestHealthInfo,
-  handleHealthInfoResponse: handleHealthInfoResponse
+  handleHealthInfoResponse: handleHealthInfoResponse,
+  requestActionApproval: requestActionApproval,
+  handleActionApprovalResponse: handleActionApprovalResponse
 };

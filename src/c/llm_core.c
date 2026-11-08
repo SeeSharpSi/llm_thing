@@ -92,6 +92,81 @@ bool llm_response_transfer_finish(LlmResponseTransfer *transfer) {
   return true;
 }
 
+void llm_approval_reset(LlmApprovalState *approval) {
+  if (approval) {
+    memset(approval, 0, sizeof(*approval));
+  }
+}
+
+bool llm_approval_begin(LlmApprovalState *approval, uint32_t active_request_id,
+                        uint32_t request_id, uint32_t approval_id) {
+  uint32_t delta;
+  if (!approval || !approval_id || !active_request_id || request_id != active_request_id) {
+    return false;
+  }
+  if (approval_id > 0x7fffffffu) {
+    return false;
+  }
+  if (approval->request_id != request_id) {
+    approval->has_resolved_id = false;
+  }
+  if (approval->phase == LLM_APPROVAL_PENDING) {
+    return false;
+  }
+  if (approval->has_resolved_id && approval->last_resolved_request_id == request_id) {
+    delta = (approval_id - approval->last_resolved_id) & 0x7fffffffu;
+    if (delta == 0 || delta >= 0x40000000u) return false;
+  }
+
+  approval->request_id = request_id;
+  approval->approval_id = approval_id;
+  approval->phase = LLM_APPROVAL_PENDING;
+  approval->decision = false;
+  return true;
+}
+
+bool llm_approval_is_current(const LlmApprovalState *approval, uint32_t request_id,
+                             uint32_t approval_id) {
+  return approval && approval->phase == LLM_APPROVAL_PENDING &&
+      approval->request_id == request_id && approval->approval_id == approval_id;
+}
+
+bool llm_approval_choose(LlmApprovalState *approval, uint32_t request_id,
+                         uint32_t approval_id, bool approve) {
+  if (!llm_approval_is_current(approval, request_id, approval_id)) {
+    return false;
+  }
+  approval->phase = LLM_APPROVAL_RESOLVED;
+  approval->decision = approve;
+  approval->last_resolved_id = approval_id;
+  approval->last_resolved_request_id = request_id;
+  approval->has_resolved_id = true;
+  return true;
+}
+
+bool llm_approval_cancel(LlmApprovalState *approval, uint32_t request_id,
+                         uint32_t approval_id) {
+  return llm_approval_choose(approval, request_id, approval_id, false);
+}
+
+bool llm_approval_decode_integer(uint32_t raw_value, size_t width, bool is_signed,
+                                 uint32_t *value) {
+  uint32_t sign_bit;
+  uint32_t mask;
+  if (!value || (width != 1 && width != 2 && width != 4)) return false;
+  if (width == 4) {
+    mask = UINT32_MAX;
+    sign_bit = 0x80000000u;
+  } else {
+    mask = (1u << (width * 8)) - 1u;
+    sign_bit = 1u << ((width * 8) - 1);
+  }
+  raw_value &= mask;
+  if (is_signed && (raw_value & sign_bit)) return false;
+  *value = raw_value;
+  return true;
+}
+
 size_t llm_safe_utf8_prefix_length(const char *text, size_t length, size_t max_length) {
   size_t prefix_length = length < max_length ? length : max_length;
 

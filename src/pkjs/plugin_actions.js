@@ -150,13 +150,21 @@ function parseEnabled(settings) {
   var i;
   var entry;
   var key;
+  var enabledIndex;
   try { parsed = JSON.parse(settings && settings.PluginActionsJson || '[]'); } catch (e) { return enabled; }
   if (Object.prototype.toString.call(parsed) !== '[object Array]') { return enabled; }
-  for (i = 0; i < parsed.length && i < MAX_ENABLED_SCAN && enabled.length < MAX_ENABLED; i += 1) {
+  for (i = 0; i < parsed.length && i < MAX_ENABLED_SCAN; i += 1) {
     entry = parsed[i];
     if (!isObject(entry) || !validUuid(entry.plugin) || typeof entry.action !== 'string' || !entry.action || entry.action.length > MAX_ACTION_NAME) { continue; }
+    if (own(entry, 'confirm') && typeof entry.confirm !== 'boolean') { continue; }
     key = JSON.stringify([entry.plugin.toLowerCase(), entry.action]);
-    if (!own(seen, key)) { seen[key] = true; enabled.push({ plugin: entry.plugin.toLowerCase(), action: entry.action }); }
+    if (own(seen, key)) {
+      enabledIndex = seen[key];
+      if (entry.confirm === true) { enabled[enabledIndex].confirm = true; }
+    } else if (enabled.length < MAX_ENABLED) {
+      seen[key] = enabled.length;
+      enabled.push({ plugin: entry.plugin.toLowerCase(), action: entry.action, confirm: entry.confirm === true });
+    }
   }
   return enabled;
 }
@@ -178,7 +186,7 @@ function stateFor(requestId) {
   var i;
   if (state && !watch.isCurrentRequest(requestId)) { delete s_requests[key]; state = null; }
   if (!state) {
-    state = { requestId: requestId, blocked: Object.create(null), live: Object.create(null) };
+    state = { requestId: requestId, blocked: Object.create(null), denied: Object.create(null), live: Object.create(null) };
     s_requests[key] = state;
     s_request_order.push(key);
   }
@@ -252,14 +260,31 @@ function capResult(result) {
   return output;
 }
 
-function callAction(action, schema, args, requestId, callback) {
+function cloneAndFreezeArguments(args) {
+  var clone;
+  function freeze(value) {
+    var key;
+    if (!value || typeof value !== 'object') { return; }
+    for (key in value) { if (own(value, key)) { freeze(value[key]); } }
+    if (Object.freeze) { try { Object.freeze(value); } catch (e) {} }
+  }
+  try { clone = JSON.parse(JSON.stringify(args)); } catch (e2) { return null; }
+  if (!clone || typeof clone !== 'object' || Object.prototype.toString.call(clone) === '[object Array]') { return null; }
+  freeze(clone);
+  return clone;
+}
+
+function callAction(action, schema, args, requestId, callback, requiresConfirmation) {
   var state = stateFor(requestId);
   var actionKey = JSON.stringify([action.plugin, action.action]);
   var token = 'action-' + s_live_id;
   var done = false;
   var timer = null;
   var tracked = false;
-  var handle = { abort: cancel };
+  var approvalHandle = null;
+  var approvalCallbackCalled = false;
+  var snapshot;
+  var handle = { pluginAction: true, abort: cancel };
   var validationError;
   s_live_id += 1;
 
@@ -275,61 +300,121 @@ function callAction(action, schema, args, requestId, callback) {
     if (uncertain) { state.blocked[actionKey] = true; }
     if (watch.isCurrentRequest(requestId)) { callback(error, result); }
   }
-  function cancel() { if (done) { return; } done = true; cleanup(); }
+  function cancel() {
+    if (done) { return; }
+    done = true;
+    if (approvalHandle && typeof approvalHandle.abort === 'function') {
+      try { approvalHandle.abort(); } catch (e) {}
+      approvalHandle = null;
+    }
+    cleanup();
+  }
+  function invokeNative() {
+    var promise;
+    if (done || !watch.isCurrentRequest(requestId)) { cancel(); return; }
+    timer = setTimeout(function() { finish(uncertainMessage('native action timed out'), null, true); }, ACTION_TIMEOUT_MS);
+    try {
+      promise = Pebble.invokeAction({ plugin: action.plugin, action: action.action, args: snapshot });
+      if (!promise || typeof promise.then !== 'function') { finish(uncertainMessage('native response was not a promise'), null, true); return; }
+      promise.then(function(response) {
+        var output;
+        if (done) { return; }
+        if (!watch.isCurrentRequest(requestId)) { cancel(); return; }
+        try {
+          if (!isObject(response) || typeof response.ok !== 'boolean') { finish(uncertainMessage('native response was malformed'), null, true); return; }
+          if (response.ok !== true) {
+            if (typeof response.code !== 'string' || (response.message !== undefined && typeof response.message !== 'string')) {
+              finish(uncertainMessage('native error response was malformed'), null, true);
+              return;
+            }
+            if (response.code === 'PERMISSION_DENIED') { finish('Plugin action permission denied. Approve Pebble access, then retry.', null, false); return; }
+            if (response.code === 'AUTH_REQUIRED') { finish('Plugin action requires authentication. Configure or sign in to the plugin, then retry.', null, false); return; }
+            if (response.code === 'TIMEOUT' || response.code === 'UNKNOWN') {
+              finish(uncertainMessage('native reported ' + response.code), null, true);
+              return;
+            }
+            if (response.code === 'INVALID_ARGS' || response.code === 'INVALID_REQUEST' ||
+                response.code === 'PLUGIN_UNAVAILABLE' || response.code === 'RATE_LIMITED') {
+              finish('Plugin action failed with code ' + response.code, null, false);
+              return;
+            }
+            finish(uncertainMessage('native error code was not recognized'), null, true);
+            return;
+          }
+          if ((response.text !== undefined && typeof response.text !== 'string') ||
+              (response.refreshed !== undefined && Object.prototype.toString.call(response.refreshed) !== '[object Array]')) {
+            finish(uncertainMessage('native response fields were malformed'), null, true);
+            return;
+          }
+          output = capResult({ pluginUuid: action.plugin, action: action.action, text: response.text, refreshed: response.refreshed });
+          finish(null, output, false);
+        } catch (e) {
+          finish(uncertainMessage('native response could not be processed safely'), null, true);
+        }
+      }, function() {
+        if (!done) { finish(uncertainMessage('native invocation rejected'), null, true); }
+      });
+    } catch (e2) { finish(uncertainMessage('native invocation failed'), null, true); }
+  }
+  function approvalCompleted(error, approved) {
+    var denial;
+    if (approvalCallbackCalled) { return; }
+    approvalCallbackCalled = true;
+    approvalHandle = null;
+    if (done || !watch.isCurrentRequest(requestId)) { cancel(); return; }
+    if (error) {
+      denial = String(error);
+      state.denied[actionKey] = denial;
+      finish(denial, null, false);
+      return;
+    }
+    if (approved !== true) {
+      denial = 'User denied plugin action; action was not run. Do not retry or bypass confirmation.';
+      state.denied[actionKey] = denial;
+      finish(denial, null, false);
+      return;
+    }
+    invokeNative();
+  }
   if (!watch.isCurrentRequest(requestId)) { return; }
   validationError = actionSchema.validate(args, schema);
   if (validationError) { callback('Invalid plugin action arguments: ' + validationError); return; }
   if (state.blocked[actionKey]) { callback('Plugin action blocked after an earlier unknown outcome in this request; do not retry automatically'); return; }
+  if (state.denied[actionKey]) { callback(state.denied[actionKey]); return; }
+  if (requiresConfirmation && typeof watch.requestActionApproval !== 'function') {
+    state.denied[actionKey] = 'Watch confirmation is unavailable; action was not run.';
+    callback(state.denied[actionKey]);
+    return;
+  }
   if (typeof Pebble === 'undefined' || !Pebble || typeof Pebble.invokeAction !== 'function') { callback('Pebble plugin action API unavailable; update Pebble app'); return; }
+  snapshot = cloneAndFreezeArguments(args);
+  if (!snapshot) { callback('Plugin action arguments could not be snapshotted safely; action was not run.'); return; }
+  validationError = actionSchema.validate(snapshot, schema);
+  if (validationError) { callback('Invalid plugin action arguments: ' + validationError); return; }
   state.live[token] = cancel;
   if (typeof watch.trackXhr === 'function') {
     tracked = true;
     if (!watch.trackXhr(requestId, handle)) { tracked = false; cancel(); return; }
   }
-  timer = setTimeout(function() { finish(uncertainMessage('native action timed out'), null, true); }, ACTION_TIMEOUT_MS);
-  var promise;
-  try {
-    promise = Pebble.invokeAction({ plugin: action.plugin, action: action.action, args: args });
-    if (!promise || typeof promise.then !== 'function') { finish(uncertainMessage('native response was not a promise'), null, true); return; }
-    promise.then(function(response) {
-      var output;
-      if (done) { return; }
-      if (!watch.isCurrentRequest(requestId)) { cancel(); return; }
-      try {
-        if (!isObject(response) || typeof response.ok !== 'boolean') { finish(uncertainMessage('native response was malformed'), null, true); return; }
-        if (response.ok !== true) {
-          if (typeof response.code !== 'string' || (response.message !== undefined && typeof response.message !== 'string')) {
-            finish(uncertainMessage('native error response was malformed'), null, true);
-            return;
-          }
-          if (response.code === 'PERMISSION_DENIED') { finish('Plugin action permission denied. Approve Pebble access, then retry.', null, false); return; }
-          if (response.code === 'AUTH_REQUIRED') { finish('Plugin action requires authentication. Configure or sign in to the plugin, then retry.', null, false); return; }
-          if (response.code === 'TIMEOUT' || response.code === 'UNKNOWN') {
-            finish(uncertainMessage('native reported ' + response.code), null, true);
-            return;
-          }
-          if (response.code === 'INVALID_ARGS' || response.code === 'INVALID_REQUEST' ||
-              response.code === 'PLUGIN_UNAVAILABLE' || response.code === 'RATE_LIMITED') {
-            finish('Plugin action failed with code ' + response.code, null, false);
-            return;
-          }
-          finish(uncertainMessage('native error code was not recognized'), null, true);
-          return;
-        }
-        if ((response.text !== undefined && typeof response.text !== 'string') ||
-            (response.refreshed !== undefined && Object.prototype.toString.call(response.refreshed) !== '[object Array]')) {
-          finish(uncertainMessage('native response fields were malformed'), null, true);
-          return;
-        }
-        output = capResult({ pluginUuid: action.plugin, action: action.action, text: response.text, refreshed: response.refreshed });
-        finish(null, output, false);
-      } catch (e) {
-        finish(uncertainMessage('native response could not be processed safely'), null, true);
+  if (requiresConfirmation) {
+    var returnedHandle;
+    try {
+      returnedHandle = watch.requestActionApproval({
+        plugin: action.plugin,
+        pluginName: action.pluginName,
+        action: action.action,
+        args: snapshot
+      }, requestId, approvalCompleted);
+      if (!approvalCallbackCalled && !done) { approvalHandle = returnedHandle; }
+      else if (returnedHandle && typeof returnedHandle.abort === 'function') { returnedHandle.abort(); }
+    } catch (approvalError) {
+      if (!approvalCallbackCalled && !done) {
+        approvalCallbackCalled = true;
+        state.denied[actionKey] = 'Watch confirmation is unavailable; action was not run.';
+        finish(state.denied[actionKey], null, false);
       }
-    }, function() {
-      if (!done) { finish(uncertainMessage('native invocation rejected'), null, true); }
-    });
-  } catch (e) { finish(uncertainMessage('native invocation failed'), null, true); }
+    }
+  } else { invokeNative(); }
 }
 
 function getTools(settings) {
@@ -345,15 +430,18 @@ function getTools(settings) {
     for (j = 0; j < catalogue.length; j += 1) {
       if (catalogue[j].plugin !== enabled[i].plugin || catalogue[j].action !== enabled[i].action) { continue; }
       (function(selected) {
+        var requiresConfirmation = enabled[i].confirm === true;
         var validate = function(args) { return actionSchema.validate(args, selected.parameters); };
+        var description = 'Invoke exact action ' + selected.action + ' on installed Pebble plugin ' + selected.pluginName + '. This may change plugin or external state. ' +
+          (requiresConfirmation ? 'Requires watch approval before execution. ' : '') + selected.modelDescription;
         tools.push({
           name: definitionName(selected, used),
           label: 'Plugin action: ' + selected.pluginName + ' / ' + selected.action,
-          description: boundedText('Invoke exact action ' + selected.action + ' on installed Pebble plugin ' + selected.pluginName + '. This may change plugin or external state. ' + selected.modelDescription, MAX_MODEL_DESCRIPTION),
+          description: boundedText(description, MAX_MODEL_DESCRIPTION),
           parameters: selected.parameters,
           validate: validate,
           logArguments: false,
-          call: function(args, requestId, callback) { callAction(selected, selected.parameters, args, requestId, callback); }
+          call: function(args, requestId, callback) { callAction(selected, selected.parameters, args, requestId, callback, requiresConfirmation); }
         });
       }(catalogue[j]));
       break;

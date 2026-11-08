@@ -85,6 +85,10 @@
 #define PAST_CHAT_ID_SIZE 49
 #define PAST_CHAT_TITLE_SIZE 81
 #define PAST_CHATS_STATUS_SIZE 96
+#define APPROVAL_DETAIL_BUFFER_SIZE (LLM_APPROVAL_DETAIL_MAX_BYTES + 1)
+#define APPROVAL_DETAIL_MEASURE_HEIGHT 16000
+#define APPROVAL_SEND_RETRY_MS 100
+#define APPROVAL_SEND_MAX_ATTEMPTS 3
 
 #if defined(PBL_MICROPHONE)
 typedef struct {
@@ -124,6 +128,20 @@ static char s_text_run[TEXT_RUN_BUFFER_SIZE];
 #endif
 
 static Window *s_window;
+static Window *s_approval_window;
+static TextLayer *s_approval_header_layer;
+static ScrollLayer *s_approval_scroll_layer;
+static TextLayer *s_approval_detail_layer;
+static TextLayer *s_approval_footer_layer;
+static AppTimer *s_approval_timeout_timer;
+static AppTimer *s_approval_send_timer;
+static char s_approval_detail[APPROVAL_DETAIL_BUFFER_SIZE];
+static LlmApprovalState s_approval_state;
+static uint8_t s_approval_send_attempts;
+static bool s_approval_decision_pending;
+static uint32_t s_approval_send_request_id;
+static uint32_t s_approval_send_id;
+static bool s_approval_send_decision;
 #if defined(PBL_MICROPHONE)
 static Window *s_past_chats_window;
 #endif
@@ -259,6 +277,12 @@ static void prv_request_past_chats(void);
 
 static void prv_progress_loading_timer_callback(void *context);
 static void prv_text_layout_timer_callback(void *context);
+static void prv_approval_send(void);
+static void prv_approval_close_window(void);
+static void prv_approval_end_request(void);
+static void prv_approval_cancel_request(void);
+static bool prv_show_approval(uint32_t request_id, uint32_t approval_id,
+                              const char *detail);
 #if defined(PBL_MICROPHONE)
 static void prv_update_request_elapsed(void);
 #endif
@@ -581,6 +605,9 @@ static void prv_apply_settings_visuals(const WatchSettingsDirty *dirty) {
       window_set_background_color(s_past_chats_window, s_background_color);
     }
 #endif
+    if (s_approval_window) {
+      window_set_background_color(s_approval_window, s_background_color);
+    }
   }
 #if defined(PBL_MICROPHONE)
   if (menu_colors_changed && s_past_chats_menu_layer) {
@@ -598,6 +625,11 @@ static void prv_apply_settings_visuals(const WatchSettingsDirty *dirty) {
   }
   if (dirty->bold_text_color && s_progress_loading_layer) {
     layer_mark_dirty(s_progress_loading_layer);
+  }
+  if (dirty->text_color) {
+    if (s_approval_header_layer) text_layer_set_text_color(s_approval_header_layer, s_text_color);
+    if (s_approval_detail_layer) text_layer_set_text_color(s_approval_detail_layer, s_text_color);
+    if (s_approval_footer_layer) text_layer_set_text_color(s_approval_footer_layer, s_text_color);
   }
 }
 
@@ -1829,6 +1861,7 @@ static void prv_progress_append(const char *text) {
 }
 
 static void prv_set_response(const char *text) {
+  prv_approval_end_request();
 #if defined(PBL_MICROPHONE)
   llm_response_transfer_finish(&s_response_transfer);
   s_request_active = false;
@@ -1849,6 +1882,7 @@ static void prv_set_response(const char *text) {
 }
 
 static void prv_show_home_screen(void) {
+  prv_approval_end_request();
 #if defined(PBL_MICROPHONE)
   llm_response_transfer_finish(&s_response_transfer);
   s_request_active = false;
@@ -1959,6 +1993,7 @@ static void prv_send_retry_request(void) {
     return;
   }
 
+  prv_approval_cancel_request();
   s_request_id = next_request_id;
   s_request_active = true;
   s_retry_available = false;
@@ -1977,6 +2012,7 @@ static bool prv_abort_active_request(void) {
   if (!s_request_active) {
     return false;
   }
+  prv_approval_cancel_request();
   old_request_id = s_request_id;
   prv_send_cancel_message(old_request_id);
   llm_response_transfer_finish(&s_response_transfer);
@@ -2038,6 +2074,7 @@ static void prv_send_request(const char *text) {
     return;
   }
 
+  prv_approval_cancel_request();
   s_request_id = next_request_id;
   s_request_active = true;
   s_retry_available = false;
@@ -2406,6 +2443,459 @@ static void prv_show_past_chats_menu(void) {
 }
 #endif
 
+static void prv_approval_clear_timers(void) {
+  if (s_approval_timeout_timer) {
+    app_timer_cancel(s_approval_timeout_timer);
+    s_approval_timeout_timer = NULL;
+  }
+  if (s_approval_send_timer) {
+    app_timer_cancel(s_approval_send_timer);
+    s_approval_send_timer = NULL;
+  }
+}
+
+static void prv_approval_close_window(void) {
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+  if (s_approval_window && window_stack_contains_window(s_approval_window)) {
+    window_stack_remove(s_approval_window, false);
+  }
+  memset(s_approval_detail, 0, sizeof(s_approval_detail));
+}
+
+static void prv_approval_finish_delivery(void) {
+  s_approval_decision_pending = false;
+  s_approval_send_attempts = 0;
+  s_approval_send_request_id = 0;
+  s_approval_send_id = 0;
+  s_approval_send_decision = false;
+  if (s_approval_send_timer) {
+    app_timer_cancel(s_approval_send_timer);
+    s_approval_send_timer = NULL;
+  }
+  prv_approval_close_window();
+}
+
+static void prv_approval_send_retry_timer(void *context) {
+  (void)context;
+  s_approval_send_timer = NULL;
+  prv_approval_send();
+}
+
+static void prv_approval_send(void) {
+  DictionaryIterator *iter;
+  AppMessageResult result;
+  DictionaryResult write_result;
+
+  if (!s_approval_decision_pending || s_approval_send_attempts >= APPROVAL_SEND_MAX_ATTEMPTS) {
+    prv_approval_finish_delivery();
+    return;
+  }
+  s_approval_send_attempts += 1;
+  result = app_message_outbox_begin(&iter);
+  if (result == APP_MSG_OK && iter) {
+    write_result = dict_write_uint32(iter, MESSAGE_KEY_RequestId, s_approval_send_request_id);
+    if (write_result == DICT_OK) {
+      write_result = dict_write_uint32(iter, MESSAGE_KEY_ApprovalId, s_approval_send_id);
+    }
+    if (write_result == DICT_OK) {
+      write_result = dict_write_uint8(iter, MESSAGE_KEY_ApprovalDecision,
+          s_approval_send_decision ? 1 : 0);
+    }
+    if (write_result == DICT_OK) {
+      dict_write_end(iter);
+      result = app_message_outbox_send();
+      if (result == APP_MSG_OK) {
+        return;
+      }
+    }
+  }
+
+  if (s_approval_send_attempts < APPROVAL_SEND_MAX_ATTEMPTS) {
+    s_approval_send_timer = app_timer_register(APPROVAL_SEND_RETRY_MS,
+        prv_approval_send_retry_timer, NULL);
+    if (!s_approval_send_timer) prv_approval_finish_delivery();
+  } else {
+    prv_approval_finish_delivery();
+  }
+}
+
+static void prv_approval_choose(bool approve) {
+  if (!llm_approval_choose(&s_approval_state, s_request_id,
+          s_approval_state.approval_id, approve)) {
+    return;
+  }
+  if (s_approval_timeout_timer) {
+    app_timer_cancel(s_approval_timeout_timer);
+    s_approval_timeout_timer = NULL;
+  }
+  s_approval_decision_pending = true;
+  s_approval_send_request_id = s_approval_state.request_id;
+  s_approval_send_id = s_approval_state.approval_id;
+  s_approval_send_decision = s_approval_state.decision;
+  s_approval_send_attempts = 0;
+  prv_approval_send();
+}
+
+static void prv_approval_timeout(void *context) {
+  (void)context;
+  s_approval_timeout_timer = NULL;
+  prv_approval_choose(false);
+}
+
+static void prv_approval_select_click(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  prv_approval_choose(true);
+}
+
+static void prv_approval_back_click(ClickRecognizerRef recognizer, void *context) {
+  (void)recognizer;
+  (void)context;
+  prv_approval_choose(false);
+}
+
+static void prv_approval_scroll_up(ClickRecognizerRef recognizer, void *context) {
+  GPoint offset;
+  (void)recognizer;
+  (void)context;
+  if (!s_approval_scroll_layer) return;
+  offset = scroll_layer_get_content_offset(s_approval_scroll_layer);
+  scroll_layer_set_content_offset(s_approval_scroll_layer, GPoint(0, offset.y + 30), true);
+}
+
+static void prv_approval_scroll_down(ClickRecognizerRef recognizer, void *context) {
+  GPoint offset;
+  (void)recognizer;
+  (void)context;
+  if (!s_approval_scroll_layer) return;
+  offset = scroll_layer_get_content_offset(s_approval_scroll_layer);
+  scroll_layer_set_content_offset(s_approval_scroll_layer, GPoint(0, offset.y - 30), true);
+}
+
+static void prv_approval_click_config(void *context) {
+  (void)context;
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, SCROLL_REPEAT_INTERVAL_MS,
+      prv_approval_scroll_up);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, SCROLL_REPEAT_INTERVAL_MS,
+      prv_approval_scroll_down);
+  window_single_click_subscribe(BUTTON_ID_SELECT, prv_approval_select_click);
+  window_single_click_subscribe(BUTTON_ID_BACK, prv_approval_back_click);
+}
+
+static void prv_approval_window_load(Window *window) {
+  Layer *root = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(root);
+  int16_t margin = HOME_CARD_MARGIN;
+  int16_t vertical_inset = 0;
+  int16_t header_height = 30;
+  int16_t footer_height = 30;
+  GRect scroll_frame;
+  GSize detail_size;
+
+#if defined(PBL_ROUND)
+  margin = 14;
+  vertical_inset = 16;
+#endif
+  if (bounds.size.w < margin * 2 + 20) margin = 2;
+  if (bounds.size.h < header_height + footer_height + 20 + vertical_inset * 2) {
+    header_height = 24;
+    footer_height = 24;
+    if (bounds.size.h < header_height + footer_height + 20 + vertical_inset * 2) {
+      vertical_inset = 0;
+    }
+  }
+  s_approval_header_layer = text_layer_create(GRect(margin, vertical_inset,
+      bounds.size.w - margin * 2,
+      header_height));
+  if (!s_approval_header_layer) return;
+  text_layer_set_background_color(s_approval_header_layer, GColorClear);
+  text_layer_set_text_color(s_approval_header_layer, s_text_color);
+  text_layer_set_font(s_approval_header_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  text_layer_set_text_alignment(s_approval_header_layer, GTextAlignmentCenter);
+  text_layer_set_text(s_approval_header_layer, "Confirm action");
+  layer_add_child(root, text_layer_get_layer(s_approval_header_layer));
+
+  scroll_frame = GRect(margin, vertical_inset + header_height, bounds.size.w - margin * 2,
+      bounds.size.h - vertical_inset * 2 - header_height - footer_height);
+  s_approval_scroll_layer = scroll_layer_create(scroll_frame);
+  if (!s_approval_scroll_layer) return;
+  scroll_layer_set_shadow_hidden(s_approval_scroll_layer, true);
+  s_approval_detail_layer = text_layer_create(GRect(0, 0, scroll_frame.size.w,
+      APPROVAL_DETAIL_MEASURE_HEIGHT));
+  if (!s_approval_detail_layer) return;
+  text_layer_set_background_color(s_approval_detail_layer, GColorClear);
+  text_layer_set_text_color(s_approval_detail_layer, s_text_color);
+  text_layer_set_font(s_approval_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_overflow_mode(s_approval_detail_layer, GTextOverflowModeWordWrap);
+  text_layer_set_text_alignment(s_approval_detail_layer, GTextAlignmentLeft);
+  text_layer_set_text(s_approval_detail_layer, s_approval_detail);
+  detail_size = text_layer_get_content_size(s_approval_detail_layer);
+  if (detail_size.h <= 0 || detail_size.h >= APPROVAL_DETAIL_MEASURE_HEIGHT) return;
+  if (detail_size.h < scroll_frame.size.h) detail_size.h = scroll_frame.size.h;
+  layer_set_frame(text_layer_get_layer(s_approval_detail_layer),
+      GRect(0, 0, scroll_frame.size.w, detail_size.h));
+  scroll_layer_add_child(s_approval_scroll_layer, text_layer_get_layer(s_approval_detail_layer));
+  scroll_layer_set_content_size(s_approval_scroll_layer,
+      GSize(scroll_frame.size.w, detail_size.h));
+  layer_add_child(root, scroll_layer_get_layer(s_approval_scroll_layer));
+
+  s_approval_footer_layer = text_layer_create(GRect(margin,
+      bounds.size.h - vertical_inset - footer_height,
+      bounds.size.w - margin * 2, footer_height));
+  if (!s_approval_footer_layer) return;
+  text_layer_set_background_color(s_approval_footer_layer, GColorClear);
+  text_layer_set_text_color(s_approval_footer_layer, s_text_color);
+  text_layer_set_font(s_approval_footer_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
+  text_layer_set_text_alignment(s_approval_footer_layer, GTextAlignmentCenter);
+  text_layer_set_text(s_approval_footer_layer, "SELECT: Confirm\nBACK: Deny");
+  layer_add_child(root, text_layer_get_layer(s_approval_footer_layer));
+  window_set_click_config_provider(window, prv_approval_click_config);
+}
+
+static void prv_approval_window_unload(Window *window) {
+  (void)window;
+  if (!s_approval_decision_pending &&
+      llm_approval_is_current(&s_approval_state, s_request_id, s_approval_state.approval_id)) {
+    prv_approval_choose(false);
+  }
+  if (s_approval_timeout_timer) {
+    app_timer_cancel(s_approval_timeout_timer);
+    s_approval_timeout_timer = NULL;
+  }
+  if (s_approval_detail_layer) {
+    text_layer_destroy(s_approval_detail_layer);
+    s_approval_detail_layer = NULL;
+  }
+  if (s_approval_header_layer) {
+    text_layer_destroy(s_approval_header_layer);
+    s_approval_header_layer = NULL;
+  }
+  if (s_approval_footer_layer) {
+    text_layer_destroy(s_approval_footer_layer);
+    s_approval_footer_layer = NULL;
+  }
+  if (s_approval_scroll_layer) {
+    scroll_layer_destroy(s_approval_scroll_layer);
+    s_approval_scroll_layer = NULL;
+  }
+  memset(s_approval_detail, 0, sizeof(s_approval_detail));
+}
+
+static bool prv_approval_cstring_valid(const Tuple *tuple, size_t max_bytes) {
+  const char *text;
+  if (!tuple || tuple->type != TUPLE_CSTRING || tuple->length == 0 ||
+      tuple->length > max_bytes + 1) {
+    return false;
+  }
+  text = (const char *)tuple->value;
+  return memchr(text, '\0', tuple->length) == text + tuple->length - 1;
+}
+
+static bool prv_approval_uint_tuple(const Tuple *tuple, uint32_t *value) {
+  uint32_t raw_value;
+  bool is_signed;
+  if (!tuple || !value) return false;
+  if (tuple->type == TUPLE_UINT) {
+    is_signed = false;
+    switch (tuple->length) {
+      case 1: raw_value = tuple->value->uint8; break;
+      case 2: raw_value = tuple->value->uint16; break;
+      case 4: raw_value = tuple->value->uint32; break;
+      default: return false;
+    }
+  } else if (tuple->type == TUPLE_INT) {
+    is_signed = true;
+    switch (tuple->length) {
+      case 1: raw_value = (uint32_t)(int32_t)tuple->value->int8; break;
+      case 2: raw_value = (uint32_t)(int32_t)tuple->value->int16; break;
+      case 4: raw_value = (uint32_t)tuple->value->int32; break;
+      default: return false;
+    }
+  } else {
+    return false;
+  }
+  return llm_approval_decode_integer(raw_value, tuple->length, is_signed, value);
+}
+
+static bool prv_approval_utf8_valid(const char *text, size_t length) {
+  size_t i = 0;
+  while (i < length) {
+    uint8_t first = (uint8_t)text[i++];
+    uint32_t codepoint;
+    size_t continuation;
+    if (first < 0x80) continue;
+    if (first >= 0xc2 && first <= 0xdf) {
+      codepoint = first & 0x1f;
+      continuation = 1;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      codepoint = first & 0x0f;
+      continuation = 2;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      codepoint = first & 0x07;
+      continuation = 3;
+    } else {
+      return false;
+    }
+    if (i + continuation > length) return false;
+    while (continuation > 0) {
+      uint8_t next = (uint8_t)text[i++];
+      if ((next & 0xc0) != 0x80) return false;
+      codepoint = (codepoint << 6) | (next & 0x3f);
+      continuation -= 1;
+    }
+    if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff) ||
+        (codepoint < 0x800 && first >= 0xe0) ||
+        (codepoint < 0x10000 && first >= 0xf0)) return false;
+  }
+  return true;
+}
+
+static void prv_handle_approval_message(Tuple *request_id_t, Tuple *approval_request_t,
+                                        Tuple *approval_id_t, Tuple *approval_title_t,
+                                        Tuple *approval_detail_t) {
+  uint32_t request_id;
+  uint32_t approval_id;
+  uint32_t approval_request;
+  bool payload_valid;
+
+  if (!prv_approval_uint_tuple(request_id_t, &request_id) ||
+      !prv_approval_uint_tuple(approval_id_t, &approval_id) ||
+      !prv_approval_uint_tuple(approval_request_t, &approval_request) || approval_request != 1 ||
+      !llm_response_transfer_is_active_for_request(&s_response_transfer, s_request_id)) {
+    return;
+  }
+  if (!approval_id || request_id != s_request_id) return;
+
+  payload_valid = prv_approval_cstring_valid(approval_title_t, 80) &&
+      prv_approval_cstring_valid(approval_detail_t, LLM_APPROVAL_DETAIL_MAX_BYTES) &&
+      prv_approval_utf8_valid(approval_detail_t->value->cstring,
+          approval_detail_t->length - 1);
+  if (!payload_valid) {
+    if (s_approval_state.phase == LLM_APPROVAL_PENDING &&
+        (s_approval_state.request_id != request_id ||
+         s_approval_state.approval_id != approval_id)) {
+      prv_approval_choose(false);
+      prv_approval_close_window();
+    } else if (s_approval_state.phase != LLM_APPROVAL_PENDING &&
+        llm_approval_begin(&s_approval_state, s_request_id, request_id, approval_id)) {
+      prv_approval_choose(false);
+    }
+    return;
+  }
+  prv_show_approval(request_id, approval_id, approval_detail_t->value->cstring);
+}
+
+static void prv_handle_approval_cancel(Tuple *request_id_t, Tuple *approval_id_t,
+                                       Tuple *cancel_t) {
+  uint32_t request_id;
+  uint32_t approval_id;
+  uint32_t cancel;
+  if (!prv_approval_uint_tuple(request_id_t, &request_id) ||
+      !prv_approval_uint_tuple(approval_id_t, &approval_id) ||
+      !prv_approval_uint_tuple(cancel_t, &cancel) || cancel != 1 || approval_id == 0) return;
+  if (request_id != s_approval_state.request_id ||
+      approval_id != s_approval_state.approval_id) return;
+  if (s_approval_state.phase == LLM_APPROVAL_PENDING) {
+    llm_approval_cancel(&s_approval_state, request_id, approval_id);
+  }
+  if (s_approval_timeout_timer) {
+    app_timer_cancel(s_approval_timeout_timer);
+    s_approval_timeout_timer = NULL;
+  }
+  if (s_approval_send_timer) {
+    app_timer_cancel(s_approval_send_timer);
+    s_approval_send_timer = NULL;
+  }
+  s_approval_decision_pending = false;
+  s_approval_send_attempts = 0;
+  s_approval_send_request_id = 0;
+  s_approval_send_id = 0;
+  s_approval_send_decision = false;
+  prv_approval_close_window();
+}
+
+static void prv_approval_end_request(void) {
+  if (llm_approval_is_current(&s_approval_state, s_request_id,
+          s_approval_state.approval_id)) {
+    prv_approval_choose(false);
+  }
+  prv_approval_clear_timers();
+  s_approval_decision_pending = false;
+  s_approval_send_attempts = 0;
+  s_approval_send_request_id = 0;
+  s_approval_send_id = 0;
+  s_approval_send_decision = false;
+  prv_approval_close_window();
+}
+
+static void prv_approval_cancel_request(void) {
+  if (llm_approval_is_current(&s_approval_state, s_request_id,
+          s_approval_state.approval_id)) {
+    llm_approval_cancel(&s_approval_state, s_request_id, s_approval_state.approval_id);
+  }
+  prv_approval_clear_timers();
+  s_approval_decision_pending = false;
+  s_approval_send_attempts = 0;
+  s_approval_send_request_id = 0;
+  s_approval_send_id = 0;
+  s_approval_send_decision = false;
+  prv_approval_close_window();
+}
+
+static bool prv_show_approval(uint32_t request_id, uint32_t approval_id,
+                              const char *detail) {
+  if (s_approval_decision_pending) return false;
+  if (s_approval_state.phase == LLM_APPROVAL_PENDING) {
+    if (s_approval_state.request_id == request_id &&
+        s_approval_state.approval_id == approval_id) return false;
+    prv_approval_choose(false);
+    prv_approval_close_window();
+    return false;
+  }
+  if (!llm_approval_begin(&s_approval_state, s_request_id, request_id, approval_id)) {
+    return false;
+  }
+  if (s_approval_timeout_timer) {
+    app_timer_cancel(s_approval_timeout_timer);
+    s_approval_timeout_timer = NULL;
+  }
+  snprintf(s_approval_detail, sizeof(s_approval_detail), "%s", detail);
+  s_approval_decision_pending = false;
+  s_approval_send_attempts = 0;
+  if (!s_approval_window) {
+    s_approval_window = window_create();
+    if (!s_approval_window) {
+      prv_approval_choose(false);
+      memset(s_approval_detail, 0, sizeof(s_approval_detail));
+      return false;
+    }
+    window_set_window_handlers(s_approval_window, (WindowHandlers) {
+      .load = prv_approval_window_load,
+      .unload = prv_approval_window_unload,
+    });
+  }
+  window_set_background_color(s_approval_window, s_background_color);
+#if defined(PBL_TOUCH)
+  prv_stop_touch_momentum();
+#endif
+  window_stack_push(s_approval_window, true);
+  if (!window_stack_contains_window(s_approval_window) || !s_approval_scroll_layer ||
+      !s_approval_detail_layer || !s_approval_footer_layer) {
+    prv_approval_choose(false);
+    prv_approval_close_window();
+    return false;
+  }
+  s_approval_timeout_timer = app_timer_register(LLM_APPROVAL_TIMEOUT_MS,
+      prv_approval_timeout, NULL);
+  if (!s_approval_timeout_timer) {
+    prv_approval_choose(false);
+    return false;
+  }
+  return true;
+}
+
 static void prv_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
@@ -2571,6 +3061,17 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
     prv_maybe_schedule_quick_launch_dictation();
   }
   prv_apply_settings_visuals(&dirty);
+
+  Tuple *approval_request_t = dict_find(iter, MESSAGE_KEY_ApprovalRequest);
+  Tuple *approval_cancel_t = dict_find(iter, MESSAGE_KEY_ApprovalCancel);
+  if (approval_cancel_t) {
+    prv_handle_approval_cancel(request_id_t, dict_find(iter, MESSAGE_KEY_ApprovalId),
+        approval_cancel_t);
+  } else if (approval_request_t && response_lifecycle_active) {
+    prv_handle_approval_message(request_id_t, approval_request_t,
+        dict_find(iter, MESSAGE_KEY_ApprovalId), dict_find(iter, MESSAGE_KEY_ApprovalTitle),
+        dict_find(iter, MESSAGE_KEY_ApprovalDetail));
+  }
 
   Tuple *health_info_request_t = dict_find(iter, MESSAGE_KEY_HealthSummaryRequest);
   if (health_info_request_t && (!request_id_t || message_request_id == s_request_id)) {
@@ -2770,6 +3271,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
     Tuple *error_t = dict_find(iter, MESSAGE_KEY_ResponseError);
     if (error_t && llm_response_transfer_finish(&s_response_transfer)) {
+      prv_approval_end_request();
   #if defined(PBL_MICROPHONE)
       Tuple *retry_available_t = dict_find(iter, MESSAGE_KEY_RetryAvailable);
       bool retry_available = retry_available_t &&
@@ -2794,6 +3296,7 @@ static void prv_inbox_received_handler(DictionaryIterator *iter, void *context) 
 
     Tuple *done_t = dict_find(iter, MESSAGE_KEY_ResponseDone);
     if (done_t && llm_response_transfer_finish(&s_response_transfer)) {
+      prv_approval_end_request();
       APP_LOG(APP_LOG_LEVEL_DEBUG, "response done chars=%u", (unsigned int)strlen(s_response));
   #if defined(PBL_MICROPHONE)
       s_request_active = false;
@@ -2831,8 +3334,39 @@ static void prv_inbox_dropped_handler(AppMessageResult reason, void *context) {
 #endif
 }
 
+static void prv_outbox_sent_handler(DictionaryIterator *iter, void *context) {
+  Tuple *decision_t = iter ? dict_find(iter, MESSAGE_KEY_ApprovalDecision) : NULL;
+  Tuple *request_id_t = iter ? dict_find(iter, MESSAGE_KEY_RequestId) : NULL;
+  Tuple *approval_id_t = iter ? dict_find(iter, MESSAGE_KEY_ApprovalId) : NULL;
+  (void)context;
+
+  if (!decision_t || !request_id_t || !approval_id_t ||
+      request_id_t->value->uint32 != s_approval_send_request_id ||
+      approval_id_t->value->uint32 != s_approval_send_id ||
+      !s_approval_decision_pending) {
+    return;
+  }
+  prv_approval_finish_delivery();
+}
+
 static void prv_outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "outbox failed reason=%d", reason);
+  if (iter && dict_find(iter, MESSAGE_KEY_ApprovalDecision)) {
+    Tuple *request_id_t = dict_find(iter, MESSAGE_KEY_RequestId);
+    Tuple *approval_id_t = dict_find(iter, MESSAGE_KEY_ApprovalId);
+    if (request_id_t && approval_id_t && s_approval_decision_pending &&
+        request_id_t->value->uint32 == s_approval_send_request_id &&
+        approval_id_t->value->uint32 == s_approval_send_id) {
+      if (s_approval_send_attempts < APPROVAL_SEND_MAX_ATTEMPTS && !s_approval_send_timer) {
+        s_approval_send_timer = app_timer_register(APPROVAL_SEND_RETRY_MS,
+            prv_approval_send_retry_timer, NULL);
+        if (!s_approval_send_timer) prv_approval_finish_delivery();
+      } else {
+        prv_approval_finish_delivery();
+      }
+    }
+    return;
+  }
   if (iter && dict_find(iter, MESSAGE_KEY_RequestCancel)) {
     return;
   }
@@ -2968,6 +3502,7 @@ static void prv_window_load(Window *window) {
 }
 
 static void prv_window_unload(Window *window) {
+  prv_approval_end_request();
   speaker_feedback_stop();
 #if defined(PBL_MICROPHONE)
   if (s_request_active) {
@@ -3063,6 +3598,7 @@ static void prv_init(void) {
 
   app_message_register_inbox_received(prv_inbox_received_handler);
   app_message_register_inbox_dropped(prv_inbox_dropped_handler);
+  app_message_register_outbox_sent(prv_outbox_sent_handler);
   app_message_register_outbox_failed(prv_outbox_failed_handler);
   app_message_result = app_message_open(APP_MESSAGE_INBOX_SIZE, APP_MESSAGE_OUTBOX_SIZE);
   if (app_message_result == APP_MSG_OK) {
@@ -3078,6 +3614,12 @@ static void prv_init(void) {
 }
 
 static void prv_deinit(void) {
+  prv_approval_end_request();
+  prv_approval_clear_timers();
+  if (s_approval_window) {
+    window_destroy(s_approval_window);
+    s_approval_window = NULL;
+  }
   speaker_feedback_stop();
   if (s_quick_launch_dictation_timer) {
     app_timer_cancel(s_quick_launch_dictation_timer);

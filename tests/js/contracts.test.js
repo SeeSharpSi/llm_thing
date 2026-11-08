@@ -229,6 +229,26 @@ test('Plugin Actions is independent and default-off with phone-only persistence'
   assert.ok(packageJson.pebble.messageKeys.indexOf('PluginActionsJson') !== -1);
 });
 
+test('plugin approval protocol keys append without adding approval settings', function() {
+  var keys = packageJson.pebble.messageKeys;
+  var approvalKeys = [
+    'PluginActionsJson',
+    'ApprovalRequest',
+    'ApprovalId',
+    'ApprovalTitle',
+    'ApprovalDetail',
+    'ApprovalDecision',
+    'ApprovalCancel'
+  ];
+
+  assert.deepEqual(keys.slice(-approvalKeys.length), approvalKeys);
+  assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
+  assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
+  approvalKeys.slice(1).forEach(function(key) {
+    assert.equal(Object.prototype.hasOwnProperty.call(settings.DEFAULT_SETTINGS, key), false, key + ' must not be a setting');
+  });
+});
+
 test('generated message-key artifacts are internally consistent', function() {
   var expected = packageJson.pebble.messageKeys.slice().sort();
   var appInfo = JSON.parse(fs.readFileSync(path.join(root, 'build/appinfo.json'), 'utf8'));

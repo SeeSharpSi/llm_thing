@@ -20,6 +20,220 @@ test.afterEach(function() {
   load.clearModule(watchPath);
 });
 
+function approvalSpec(args) {
+  return { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', pluginName: 'Fixture', action: 'setMode', args: args || { mode: 'on' } };
+}
+
+test('action approval sends scoped prompt and accepts only matching numeric decision once', function() {
+  var watch = freshWatch();
+  var callbackValues = [];
+  watch.beginRequestLifecycle(501);
+  watch.requestActionApproval(approvalSpec(), 501, function(error, approved) { callbackValues.push([error, approved]); });
+  var prompt = global.Pebble.messages[0];
+  assert.equal(prompt.RequestId, 501);
+  assert.equal(prompt.ApprovalRequest, 1);
+  assert.ok(prompt.ApprovalId > 0);
+  assert.equal(prompt.ApprovalTitle, 'Confirm action');
+  assert.ok(prompt.ApprovalDetail.indexOf('Plugin:') < prompt.ApprovalDetail.indexOf('Action:'));
+  assert.ok(prompt.ApprovalDetail.indexOf('Action:') < prompt.ApprovalDetail.indexOf('Arguments:'));
+  assert.ok(prompt.ApprovalDetail.indexOf('Arguments:') < prompt.ApprovalDetail.indexOf('Plugin UUID:'));
+  assert.match(prompt.ApprovalDetail, /Plugin UUID:/);
+  assert.equal(watch.handleActionApprovalResponse({ ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false, 'missing RequestId rejected');
+  assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId, ApprovalDecision: '1' }), false, 'string allow rejected');
+  assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId + 1, ApprovalDecision: 1 }), false, 'mismatched ID rejected');
+  assert.equal(watch.handleActionApprovalResponse({ RequestId: 500, ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false, 'stale request rejected');
+  [-1, 1.5, '501', 4294967296].forEach(function(requestId) {
+    assert.equal(watch.handleActionApprovalResponse({ RequestId: requestId, ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false,
+      'invalid RequestId rejected: ' + requestId);
+  });
+  assert.equal(callbackValues.length, 0);
+  assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), true);
+  assert.deepEqual(callbackValues, [[null, true]]);
+  assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId, ApprovalDecision: 0 }), false, 'duplicate response ignored');
+  assert.equal(callbackValues.length, 1);
+  assert.ok(global.Pebble.messages.some(function(message) { return message.ApprovalCancel === 1 && message.ApprovalId === prompt.ApprovalId; }));
+  [-1, 1.5, '501', 4294967296].forEach(function(requestId) {
+    var count = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length;
+    var error;
+    watch.requestActionApproval(approvalSpec(), requestId, function(value) { error = value; });
+    assert.match(error, /stale; action was not run/);
+    assert.equal(global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, count);
+  });
+});
+
+test('approval denial, timeout, send exhaustion, and lifecycle cancellation settle fail closed', function() {
+  var timers = installFakeTimers();
+  var originalLog = console.log;
+  try {
+    var watch = freshWatch();
+    var prompt;
+    var result;
+    watch.beginRequestLifecycle(502);
+    watch.requestActionApproval(approvalSpec(), 502, function(error, approved) { result = [error, approved]; });
+    prompt = global.Pebble.messages[0];
+    watch.handleActionApprovalResponse({ RequestId: 502, ApprovalId: prompt.ApprovalId, ApprovalDecision: 0 });
+    assert.deepEqual(result, [null, false]);
+
+    watch.requestActionApproval(approvalSpec(), 502, function(error, approved) { result = [error, approved]; });
+    prompt = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; })[1];
+    var approvalTimer = timers.timers.filter(function(timer) { return timer.delay === 60000 && !timer.cleared; })[0];
+    timers.run(approvalTimer.id);
+    assert.match(result[0], /timed out; action was not run/);
+    assert.equal(result[1], false);
+    assert.equal(watch.handleActionApprovalResponse({ RequestId: 502, ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false);
+
+    var pebble = global.Pebble;
+    pebble.queueSendFailure({ error: 'secret ApprovalDetail sensitive-argument' });
+    pebble.queueSendFailure({ error: 'secret ApprovalDetail sensitive-argument' });
+    pebble.queueSendFailure({ error: 'secret ApprovalDetail sensitive-argument' });
+    var logs = [];
+    console.log = function(message) { logs.push(String(message)); };
+    watch.requestActionApproval(approvalSpec({ value: 'sensitive-argument' }), 502, function(error, approved) { result = [error, approved]; });
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 100 && !timer.cleared; })[0].id);
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 100 && !timer.cleared; })[0].id);
+    console.log = originalLog;
+    assert.match(result[0], /Could not send watch confirmation; action was not run/);
+    assert.equal(result[1], false);
+    assert.doesNotMatch(logs.join('\n'), /ApprovalDetail|sensitive-argument/);
+
+    var callbackCount = 0;
+    watch.requestActionApproval(approvalSpec(), 502, function() { callbackCount += 1; });
+    prompt = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0];
+    watch.cancelRequestLifecycle(502);
+    assert.equal(callbackCount, 0, 'lifecycle cancel suppresses callback');
+    assert.equal(watch.handleActionApprovalResponse({ RequestId: 502, ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false, 'late allow ignored');
+  } finally { console.log = originalLog; timers.restore(); }
+});
+
+test('approval detail enforces exact UTF-8 byte limit and escapes display controls without changing input', function() {
+  var watch = freshWatch();
+  watch.beginRequestLifecycle(503);
+  var prefix = 'Plugin: "Fixture"\nAction: "setMode"\nArguments: ';
+  var suffix = '\nPlugin UUID: "abcdefab-cdef-abcd-efab-cdefabcdefab"';
+  var valueLength = 600 - prefix.length - '{"x":""}'.length - suffix.length;
+  var result;
+  watch.requestActionApproval(approvalSpec({ x: new Array(valueLength + 1).join('x') }), 503, function(error, approved) { result = [error, approved]; });
+  assert.equal(global.Pebble.messages[0].ApprovalDetail.length, 600, '600-byte ASCII detail accepted');
+  var firstPrompt = global.Pebble.messages[0];
+  assert.match(firstPrompt.ApprovalDetail, /Arguments: \{"x":"x+/);
+  assert.ok(firstPrompt.ApprovalDetail.indexOf('Arguments:') < firstPrompt.ApprovalDetail.indexOf('Plugin UUID:'));
+  watch.handleActionApprovalResponse({ RequestId: 503, ApprovalId: firstPrompt.ApprovalId, ApprovalDecision: 0 });
+  var tooLong = { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', pluginName: 'Fixture', action: 'setMode', args: { x: new Array(valueLength + 2).join('x') } };
+  watch.requestActionApproval(tooLong, 503, function(error, approved) { result = [error, approved]; });
+  assert.match(result[0], /shorten arguments/);
+  assert.equal(global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, 1);
+  watch.requestActionApproval(approvalSpec({ x: new Array(141).join('\ud83d\ude00') }), 503, function(error) { result = [error, false]; });
+  assert.match(result[0], /shorten arguments/, 'multibyte arguments counted by UTF-8 bytes');
+  assert.equal(global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, 1);
+
+  var quotedValue = new Array(20).join('"') + new Array(181).join('\\');
+  var quoteDetail = function(value) {
+    return prefix + JSON.stringify({ x: value }) + suffix;
+  };
+  while (quoteDetail(quotedValue).length < 600) { quotedValue += 'x'; }
+  assert.equal(quoteDetail(quotedValue).length, 600);
+  watch.requestActionApproval(approvalSpec({ x: quotedValue }), 503, function(error) { result = [error, false]; });
+  var quotedPrompt = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0];
+  assert.ok(quotedPrompt, '600-byte detail with quotes and backslashes accepted');
+  assert.ok(JSON.stringify(quotedPrompt).length > 1024, 'JSON envelope expansion exceeds old false limit');
+  assert.ok(quotedPrompt.ApprovalDetail.indexOf(JSON.stringify({ x: quotedValue })) !== -1, 'full quoted argument represented');
+  watch.handleActionApprovalResponse({ RequestId: 503, ApprovalId: quotedPrompt.ApprovalId, ApprovalDecision: 0 });
+
+  var hostileName = 'name\u202e\u0001\ud800';
+  var hostileArgs = { value: '\u2066hidden\u2069\udc00\u0085\u2028' };
+  watch.requestActionApproval({ plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', pluginName: hostileName, action: 'setMode', args: hostileArgs }, 503, function() {});
+  var escaped = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0].ApprovalDetail;
+  assert.match(escaped, /\\u202e/);
+  assert.match(escaped, /\\u0001/);
+  assert.match(escaped, /\\ud800/);
+  assert.match(escaped, /\\u2066/);
+  assert.match(escaped, /\\udc00/);
+  assert.match(escaped, /\\u0085/);
+  assert.match(escaped, /\\u2028/);
+  assert.equal(hostileArgs.value, '\u2066hidden\u2069\udc00\u0085\u2028', 'display escaping does not mutate original arguments');
+  watch.finishRequestLifecycle(503);
+});
+
+test('expired queued approval is removed before it can reach watch', function() {
+  var timers = installFakeTimers();
+  try {
+    var watch = freshWatch({ manualSends: true });
+    var callbackError;
+    watch.beginRequestLifecycle(504);
+    watch.sendMessage({ RequestId: 504, Hold: 1 });
+    watch.requestActionApproval(approvalSpec(), 504, function(error) { callbackError = error; });
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 60000; })[0].id);
+    assert.match(callbackError, /timed out/);
+    global.Pebble.flushNextSend();
+    assert.equal(global.Pebble.messages.some(function(message) { return message.ApprovalRequest === 1; }), false);
+  } finally { timers.restore(); }
+});
+
+test('synchronous approval transport throws retry three times and clear timeout', function() {
+  var timers = installFakeTimers();
+  try {
+    var watch = freshWatch();
+    var pebble = global.Pebble;
+    var attempts = 0;
+    var result;
+    watch.beginRequestLifecycle(505);
+    pebble.sendAppMessage = function(dict, success) {
+      if (dict.ApprovalRequest === 1) {
+        attempts += 1;
+        throw new Error('sensitive transport error');
+      }
+      success();
+    };
+    watch.requestActionApproval(approvalSpec(), 505, function(error, approved) { result = [error, approved]; });
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 100 && !timer.cleared; })[0].id);
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 100 && !timer.cleared; })[0].id);
+    assert.equal(attempts, 3);
+    assert.match(result[0], /Could not send watch confirmation/);
+    assert.equal(result[1], false);
+    assert.equal(timers.timers.some(function(timer) { return timer.delay === 60000 && !timer.cleared; }), false);
+  } finally { timers.restore(); }
+});
+
+test('new-request and finish lifecycle clear approvals, timers, and late responses', function() {
+  var timers = installFakeTimers();
+  try {
+    var watch = freshWatch();
+    var resultCount = 0;
+    watch.beginRequestLifecycle(506);
+    watch.requestActionApproval(approvalSpec(), 506, function() { resultCount += 1; });
+    var first = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; })[0];
+    var firstTimer = timers.timers.filter(function(timer) { return timer.delay === 60000 && !timer.cleared; })[0];
+    watch.beginRequestLifecycle(507);
+    assert.equal(firstTimer.cleared, true);
+    assert.equal(resultCount, 0);
+    assert.equal(watch.handleActionApprovalResponse({ RequestId: 506, ApprovalId: first.ApprovalId, ApprovalDecision: 1 }), false);
+
+    watch.requestActionApproval(approvalSpec(), 507, function() { resultCount += 1; });
+    var second = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; })[1];
+    var secondTimer = timers.timers.filter(function(timer) { return timer.delay === 60000 && !timer.cleared; })[0];
+    watch.finishRequestLifecycle(507);
+    assert.equal(secondTimer.cleared, true);
+    assert.equal(resultCount, 0);
+    assert.equal(watch.handleActionApprovalResponse({ RequestId: 507, ApprovalId: second.ApprovalId, ApprovalDecision: 1 }), false);
+  } finally { timers.restore(); }
+});
+
+test('generated approval IDs wrap within positive 31-bit range', function() {
+  var originalNow = Date.now;
+  Date.now = function() { return 2147483646; };
+  var watch;
+  try { watch = freshWatch(); } finally { Date.now = originalNow; }
+  watch.beginRequestLifecycle(508);
+  watch.requestActionApproval(approvalSpec(), 508, function() {});
+  var first = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; })[0];
+  assert.equal(first.ApprovalId, 2147483647);
+  watch.handleActionApprovalResponse({ RequestId: 508, ApprovalId: first.ApprovalId, ApprovalDecision: 0 });
+  watch.requestActionApproval(approvalSpec(), 508, function() {});
+  var second = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; })[1];
+  assert.equal(second.ApprovalId, 1);
+  watch.finishRequestLifecycle(508);
+});
+
 test('syncWatchSettings sends normalized watch-facing dictionary', function() {
   var watch = freshWatch();
 

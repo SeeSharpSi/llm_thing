@@ -15,14 +15,15 @@ function createBundleHarness(storageValues, manualSends, pluginOptions) {
   var source = fs.readFileSync(path.join(root, 'build/pebble-js-app.js'), 'utf8');
   var pebble = createFakePebble({ manualSends: !!manualSends });
   var localStorage = new FakeLocalStorage(storageValues);
+  var timers = pluginOptions && pluginOptions.timers;
   var sandbox = {
     Pebble: pebble,
     localStorage: localStorage,
     XMLHttpRequest: FakeXMLHttpRequest,
     navigator: {},
     console: { log: function() {}, error: function() {}, warn: function() {} },
-    setTimeout: setTimeout,
-    clearTimeout: clearTimeout,
+    setTimeout: timers ? timers.setTimeout : setTimeout,
+    clearTimeout: timers ? timers.clearTimeout : clearTimeout,
     Date: Date,
     Math: Math,
     JSON: JSON,
@@ -68,7 +69,39 @@ function createBundleHarness(storageValues, manualSends, pluginOptions) {
 
   return {
     pebble: pebble,
-    localStorage: localStorage
+    localStorage: localStorage,
+    timers: timers
+  };
+}
+
+function createManualTimers() {
+  var scheduled = [];
+  var nextId = 1;
+
+  return {
+    setTimeout: function(callback, delay) {
+      var timer = { id: nextId, callback: callback, delay: delay, cleared: false };
+      nextId += 1;
+      scheduled.push(timer);
+      return timer.id;
+    },
+    clearTimeout: function(id) {
+      scheduled.forEach(function(timer) { if (timer.id === id) { timer.cleared = true; } });
+    },
+    activeDelays: function() {
+      return scheduled.filter(function(timer) { return !timer.cleared; }).map(function(timer) { return timer.delay; });
+    },
+    runDelay: function(delay) {
+      var timer = scheduled.filter(function(candidate) {
+        return !candidate.cleared && candidate.delay === delay;
+      })[0];
+      if (timer) {
+        timer.cleared = true;
+        timer.callback();
+        return true;
+      }
+      return false;
+    }
   };
 }
 
@@ -182,6 +215,20 @@ function respondWithActionCall(request, tool, args, callId) {
   });
 }
 
+function actionApprovalMessage(pebble, requestId) {
+  return pebble.messages.filter(function(message) {
+    return message.ApprovalRequest === 1 && Number(message.RequestId) === requestId;
+  }).slice(-1)[0];
+}
+
+function emitActionApproval(pebble, requestId, approvalId, decision) {
+  pebble.emit('appmessage', { payload: {
+    RequestId: requestId,
+    ApprovalId: approvalId,
+    ApprovalDecision: decision
+  } });
+}
+
 test('built PebbleKit bundle loads and registers runtime handlers', function() {
   var harness = createBundleHarness();
   var pebble = harness.pebble;
@@ -282,6 +329,8 @@ test('selected plugin source is read on model call and returned to model and wat
   request.respond(200, {
     output: [{ type: 'function_call', call_id: 'plugin-call', name: toolName, arguments: '{}' }]
   });
+  assert.equal(pebble.messages.some(function(message) { return message.ApprovalRequest === 1; }), false,
+    'read-only plugin source never asks for action approval');
   assert.equal(pebble.pluginSubscriptions.length, 1, 'tool call starts one short-lived source subscription');
   assert.equal(pebble.pluginSubscriptions[0].request.plugin, uuid);
   assert.equal(pebble.pluginSubscriptions[0].request.category, 'weather');
@@ -520,6 +569,271 @@ test('selected plugin action alone is exposed and false/zero arguments reach nat
   assert.ok(pebble.messages.some(function(message) { return message.ResponseDone === 1; }));
 });
 
+test('confirmed action waits for exact watch approval, ignores malformed decisions, and delivers result', function() {
+  var uuid = '34345678-1234-4234-8234-123456789abc';
+  var plugin = {
+    uuid: uuid,
+    name: 'Living Lights',
+    actions: [{ name: 'set_light', description: 'Set a light', parameters: {
+      type: 'object', properties: {
+        item: { type: 'string', enum: ['light'] },
+        instanceId: { type: 'string' },
+        on: { type: 'boolean' },
+        fadeMs: { type: 'integer', minimum: 0 }
+      }, required: ['item', 'instanceId', 'on', 'fadeMs'], additionalProperties: false
+    } }]
+  };
+  var args = { item: 'light', instanceId: 'living-room', on: false, fadeMs: 0 };
+  var timers = createManualTimers();
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 2,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_light', confirm: true }])
+    })
+  }, true, { plugins: [plugin], timers: timers });
+  var pebble = harness.pebble;
+  var call;
+  var approval;
+  var invocation;
+  var followUp;
+  var followUpBody;
+  var outputs;
+  var envelope;
+  var answer;
+  var promptOccurrences;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 101, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'confirmed-light');
+  flushManualSends(pebble);
+  approval = actionApprovalMessage(pebble, 101);
+  assert.ok(approval, 'watch receives actual approval AppMessage');
+  assert.equal(approval.ApprovalTitle, 'Confirm action');
+  assert.ok(Number.isInteger(approval.ApprovalId) && approval.ApprovalId > 0 && approval.ApprovalId <= 0xffffffff,
+    'watch approval carries positive uint32 ID');
+  assert.ok(Buffer.byteLength(approval.ApprovalDetail, 'utf8') <= 600, 'approval detail stays within UTF-8 byte bound');
+  assert.ok(approval.ApprovalDetail.indexOf(uuid) !== -1, 'approval shows complete plugin UUID');
+  assert.ok(approval.ApprovalDetail.indexOf('Living Lights') !== -1, 'approval shows plugin name');
+  assert.ok(approval.ApprovalDetail.indexOf('set_light') !== -1, 'approval shows exact action name');
+  assert.ok(approval.ApprovalDetail.indexOf(JSON.stringify(args)) !== -1, 'approval shows complete JSON arguments');
+  assert.equal(pebble.actionInvocations.length, 0, 'confirmation blocks native invocation');
+  assert.ok(timers.activeDelays().indexOf(60000) !== -1, 'approval waits with bounded 60-second timeout');
+
+  pebble.emit('appmessage', { payload: { ApprovalId: approval.ApprovalId, ApprovalDecision: 1 } });
+  pebble.emit('appmessage', { payload: { RequestId: 100, ApprovalId: approval.ApprovalId, ApprovalDecision: 1 } });
+  pebble.emit('appmessage', { payload: { RequestId: 101, ApprovalId: approval.ApprovalId + 1, ApprovalDecision: 1 } });
+  pebble.emit('appmessage', { payload: { RequestId: 101, ApprovalId: approval.ApprovalId, ApprovalDecision: '1' } });
+  assert.equal(pebble.actionInvocations.length, 0, 'missing/stale/wrong-ID/string decisions are ignored');
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'malformed decisions do not replay prompt to model');
+
+  emitActionApproval(pebble, 101, approval.ApprovalId, 1);
+  assert.equal(pebble.actionInvocations.length, 1, 'valid numeric allow invokes exactly once');
+  invocation = pebble.actionInvocations[0];
+  assert.equal(invocation.request.plugin, uuid);
+  assert.equal(invocation.request.action, 'set_light');
+  assert.equal(JSON.stringify(invocation.request.args), JSON.stringify(args), 'invocation uses approved argument snapshot');
+  assert.ok(timers.activeDelays().indexOf(30000) !== -1, 'native timeout starts only after approval');
+  assert.ok(pebble.messages.some(function(message) {
+    return message.ApprovalCancel === 1 && Number(message.RequestId) === 101 && message.ApprovalId === approval.ApprovalId;
+  }), 'allow closes the watch approval prompt by ID');
+  emitActionApproval(pebble, 101, approval.ApprovalId, 1);
+  assert.equal(pebble.actionInvocations.length, 1, 'duplicate allow cannot invoke twice');
+  invocation.resolve({ ok: true, text: 'Living room light is off', refreshed: ['lights'] });
+
+  followUp = FakeXMLHttpRequest.last();
+  followUpBody = JSON.parse(followUp.body);
+  promptOccurrences = collectStringValues(followUpBody.input).split('Run plugin action').length - 1;
+  assert.equal(promptOccurrences, 1, 'approval decisions do not replay original request text');
+  outputs = followUpBody.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(outputs.length, 1);
+  envelope = JSON.parse(outputs[0].output);
+  assert.equal(envelope.result.pluginUuid, uuid);
+  assert.equal(envelope.result.action, 'set_light');
+  assert.equal(envelope.result.text, 'Living room light is off');
+  assert.equal(JSON.stringify(envelope.result.refreshed), JSON.stringify(['lights']));
+  followUp.respond(200, { output_text: 'Living room light is off.' });
+  flushManualSends(pebble);
+  answer = pebble.messages.filter(function(message) { return message.ResponseChunk !== undefined; })
+    .map(function(message) { return message.ResponseChunk; }).join('');
+  assert.match(answer, /Living room light is off/);
+  assert.ok(pebble.messages.some(function(message) { return message.ResponseDone === 1; }));
+});
+
+test('approval denial returns not-run result without native invocation or repeat prompt', function() {
+  var uuid = '35345678-1234-4234-8234-123456789abc';
+  var args = { on: true };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 2,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'turn_on', confirm: true }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'turn_on', {
+    type: 'object', properties: { on: { type: 'boolean' } }, required: ['on']
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var approval;
+  var deniedFollowUp;
+  var secondFollowUp;
+  var body;
+  var outputs;
+  var approvalCount;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 111, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'deny-once');
+  flushManualSends(pebble);
+  approval = actionApprovalMessage(pebble, 111);
+  assert.ok(approval);
+  emitActionApproval(pebble, 111, approval.ApprovalId, 0);
+  deniedFollowUp = FakeXMLHttpRequest.last();
+  assert.equal(pebble.actionInvocations.length, 0, 'numeric deny never invokes action');
+  body = JSON.parse(deniedFollowUp.body);
+  outputs = body.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+  assert.equal(outputs.length, 1);
+  assert.match(outputs[0].output, /denied|declined|not run/i, 'model receives denied/not-run result');
+
+  approvalCount = pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length;
+  respondWithActionCall(deniedFollowUp, call.tools[0], args, 'deny-repeat');
+  secondFollowUp = FakeXMLHttpRequest.last();
+  assert.equal(pebble.actionInvocations.length, 0, 'denied action stays blocked for current request');
+  assert.equal(pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, approvalCount,
+    'denied action is not prompted again');
+  body = JSON.parse(secondFollowUp.body);
+  outputs = body.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+  assert.ok(outputs.some(function(entry) { return /not run|denied|declined/i.test(entry.output); }));
+
+  secondFollowUp.respond(200, { output_text: 'No changes were made.' });
+  flushManualSends(pebble);
+  assert.ok(pebble.messages.some(function(message) {
+    return message.ResponseChunk !== undefined && /No changes were made/.test(message.ResponseChunk);
+  }), 'final answer reaches watch');
+});
+
+test('expired confirmation clears approval and late allow cannot invoke action', function() {
+  var uuid = '36345678-1234-4234-8234-123456789abc';
+  var args = { on: false };
+  var timers = createManualTimers();
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 1,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'turn_off', confirm: true }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'turn_off', {
+    type: 'object', properties: { on: { type: 'boolean' } }, required: ['on']
+  })], timers: timers });
+  var pebble = harness.pebble;
+  var call;
+  var approval;
+  var requestCount;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 121, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'expired-confirmation');
+  flushManualSends(pebble);
+  approval = actionApprovalMessage(pebble, 121);
+  assert.ok(approval);
+  assert.equal(timers.runDelay(60000), true, 'approval deadline fires deterministically');
+  assert.equal(pebble.actionInvocations.length, 0, 'approval timeout never invokes action');
+  assert.ok(pebble.messages.some(function(message) {
+    return message.ApprovalCancel === 1 && Number(message.RequestId) === 121 && message.ApprovalId === approval.ApprovalId;
+  }), 'timeout closes the stale watch prompt by ID');
+  assert.equal(FakeXMLHttpRequest.instances.length, 2, 'timeout returns not-run result to model');
+  assert.ok(JSON.parse(FakeXMLHttpRequest.last().body).input.some(function(entry) {
+    return entry.type === 'function_call_output' && /timed out|not run/i.test(entry.output);
+  }), 'model receives timeout/not-run result');
+  requestCount = FakeXMLHttpRequest.instances.length;
+  emitActionApproval(pebble, 121, approval.ApprovalId, 1);
+  assert.equal(pebble.actionInvocations.length, 0, 'late allow is stale after timeout');
+  assert.equal(FakeXMLHttpRequest.instances.length, requestCount, 'late allow starts no provider request');
+  assert.equal(timers.activeDelays().indexOf(60000), -1, 'expired approval timer is cleared');
+  flushManualSends(pebble);
+  assert.equal(pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, 1,
+    'expired approval cannot be requeued as a ghost prompt');
+});
+
+test('canceling approval then starting new request ignores late old allow', function() {
+  var uuid = '37345678-1234-4234-8234-123456789abc';
+  var args = { on: true };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 1,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'turn_on', confirm: true }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'turn_on', {
+    type: 'object', properties: { on: { type: 'boolean' } }, required: ['on']
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var approval;
+  var nextRequest;
+  var answer;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 131, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'cancel-pending-approval');
+  flushManualSends(pebble);
+  approval = actionApprovalMessage(pebble, 131);
+  assert.ok(approval);
+  pebble.emit('appmessage', { payload: { RequestCancel: 1, RequestId: 131 } });
+  assert.ok(pebble.messages.some(function(message) {
+    return message.ApprovalCancel === 1 && Number(message.RequestId) === 131 && message.ApprovalId === approval.ApprovalId;
+  }), 'request cancellation closes its watch prompt by ID');
+  pebble.emit('appmessage', { payload: { RequestId: 132, RequestText: 'new safe prompt' } });
+  nextRequest = FakeXMLHttpRequest.last();
+  assert.equal(FakeXMLHttpRequest.instances.length, 2, 'new request proceeds independently');
+  emitActionApproval(pebble, 131, approval.ApprovalId, 1);
+  assert.equal(pebble.actionInvocations.length, 0, 'late approval cannot invoke canceled request action');
+  assert.equal(FakeXMLHttpRequest.instances.length, 2, 'old approval does not disrupt current request');
+  nextRequest.respond(200, { output_text: 'New request completed.' });
+  flushManualSends(pebble);
+  answer = pebble.messages.filter(function(message) { return message.ResponseChunk !== undefined; })
+    .map(function(message) { return message.ResponseChunk; }).join('');
+  assert.match(answer, /New request completed/);
+});
+
+test('oversized action confirmation detail fails closed without showing prompt or invoking', function() {
+  var uuid = '38345678-1234-4234-8234-123456789abc';
+  var args = { payload: new Array(701).join('x') };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 1,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'send_payload', confirm: true }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'send_payload', {
+    type: 'object', properties: { payload: { type: 'string', maxLength: 1000 } },
+    required: ['payload'], additionalProperties: false
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var followUp;
+  var body;
+  var outputs;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 141, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'oversized-confirm');
+  assert.equal(pebble.messages.some(function(message) { return message.ApprovalRequest === 1; }), false,
+    'oversized detail is never shown on watch');
+  assert.equal(pebble.actionInvocations.length, 0, 'oversized detail fails closed');
+  followUp = FakeXMLHttpRequest.last();
+  assert.notEqual(followUp, call.request, 'model receives confirmation-detail error');
+  body = JSON.parse(followUp.body);
+  outputs = body.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+  assert.equal(outputs.length, 1);
+  assert.match(outputs[0].output, /approval|confirm|detail|600|large|limit/i);
+});
+
 test('plugin source opt-in does not enable any plugin actions', function() {
   var uuid = '33345678-1234-4234-8234-123456789abc';
   var plugin = {
@@ -704,13 +1018,14 @@ test('action mutation recovery retry uses final-answer-only request and never re
   var harness = createBundleHarness({
     llm_thing_settings: JSON.stringify({
       Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
-      MaxToolCalls: 2, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_device' }])
+      MaxToolCalls: 2, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_device', confirm: true }])
     })
   }, true, { plugins: [pluginAction(uuid, 'set_device', {
     type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled']
   })] });
   var pebble = harness.pebble;
   var call;
+  var approval;
   var actionFollowUp;
   var failedResponseMessages;
   var retryRequest;
@@ -721,6 +1036,10 @@ test('action mutation recovery retry uses final-answer-only request and never re
   flushManualSends(pebble);
   call = beginPluginActionCall(pebble, 91, args);
   respondWithActionCall(call.request, call.tools[0], args, 'retry-action');
+  flushManualSends(pebble);
+  approval = actionApprovalMessage(pebble, 91);
+  assert.ok(approval, 'mutation waits for explicit watch approval');
+  emitActionApproval(pebble, 91, approval.ApprovalId, 1);
   assert.equal(pebble.actionInvocations.length, 1);
   pebble.actionInvocations[0].resolve({ ok: true, text: 'Device updated', refreshed: ['devices'] });
   actionFollowUp = FakeXMLHttpRequest.last();

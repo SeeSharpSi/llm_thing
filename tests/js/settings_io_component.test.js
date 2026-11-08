@@ -549,7 +549,7 @@ test('MCP import accepts an array and replaces servers with an empty array', fun
 test('plugin source and action selections roundtrip without catalogue metadata', function() {
   var item = createHarness();
   var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
-  var selectedActions = '[{"plugin":"00000000-0000-0000-0001-000000000007","action":"set_on"}]';
+  var selectedActions = '[{"plugin":"00000000-0000-0000-0001-000000000007","action":"set_on"},{"plugin":"00000000-0000-0000-0001-000000000008","action":"legacy_action"},{"plugin":"00000000-0000-0000-0001-000000000009","action":"ask_action","confirm":true}]';
   var key = 'PluginSourcesJson';
   var actionKey = 'PluginActionsJson';
   item.items[key] = fakeItem('plugin_sources', { messageKey: key }, selected);
