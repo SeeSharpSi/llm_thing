@@ -3,6 +3,7 @@ var clayConfig = require('./config');
 var builtinToolsComponent = require('./builtin_tools_component');
 var settingsIoComponent = require('./settings_io_component');
 var pluginSourcesComponent = require('./plugin_sources_component');
+var pluginActionsComponent = require('./plugin_actions_component');
 var mcpServersComponent = require('./mcp_servers_component');
 var memoryManagerComponent = require('./memory_manager_component');
 var modelDiscovery = require('./model_discovery');
@@ -13,6 +14,7 @@ var model = require('./model');
 var memoryStore = require('./memory_store');
 var tools = require('./tools');
 var pluginSources = require('./plugin_sources');
+var pluginActions = require('./plugin_actions');
 
 function clayCustomFn() {
   var self = this;
@@ -120,6 +122,7 @@ clay.registerComponent(memoryManagerComponent);
 clay.registerComponent(builtinToolsComponent);
 clay.registerComponent(settingsIoComponent);
 clay.registerComponent(pluginSourcesComponent);
+clay.registerComponent(pluginActionsComponent);
 
 function findConfigItem(items, messageKey) {
   var found = null;
@@ -165,6 +168,23 @@ function setPluginSourceCatalogue() {
   }
 }
 
+function setPluginActionCatalogue() {
+  var item = findConfigItem(clay.config, 'PluginActionsJson');
+  var result;
+
+  if (!item) {
+    return;
+  }
+  try {
+    result = pluginActions.getCatalogue() || {};
+    item.catalogueEncoded = encodeURIComponent(JSON.stringify(Array.isArray(result.actions) ? result.actions : []));
+    item.catalogueStatus = result.status || '';
+  } catch (error) {
+    item.catalogueEncoded = encodeURIComponent('[]');
+    item.catalogueStatus = String(error && error.message || 'Plugin action catalogue unavailable on this phone.');
+  }
+}
+
 function openConfiguration(currentSettings) {
   var configurationSettings = settings.extend(currentSettings, {});
   if (memoryStore && memoryStore.listMemories) {
@@ -177,6 +197,7 @@ function openConfiguration(currentSettings) {
   clay.setSettings(configurationSettings);
   setDiscoveredModels(modelDiscovery.getCached(currentSettings));
   setPluginSourceCatalogue();
+  setPluginActionCatalogue();
   Pebble.openURL(clay.generateUrl());
 }
 

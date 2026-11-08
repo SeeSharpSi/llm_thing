@@ -5,6 +5,7 @@ var memoryStore = require('./memory_store');
 var webFetch = require('./web_fetch');
 var toolPagination = require('./tool_pagination');
 var pluginSources = require('./plugin_sources');
+var pluginActions = require('./plugin_actions');
 
 var MCP_PROTOCOL_VERSION = '2025-06-18';
 var MCP_CLIENT_NAME = 'llm_thing';
@@ -625,6 +626,7 @@ function cancelMcpRequest(requestId) {
   var waiter;
 
   pluginSources.cancelRequest(requestId);
+  pluginActions.cancelRequest(requestId);
 
   for (i = 0; i < keys.length; i += 1) {
     pending = s_mcp_pending[keys[i]];
@@ -3485,6 +3487,8 @@ while (hasOwn(toolMap, exposedName)) {
     structuredResult: definition.structuredResult !== false,
     label: definition.label,
     parameters: definition.parameters,
+    validate: typeof definition.validate === 'function' ? definition.validate : null,
+    logArguments: definition.logArguments !== false,
     call: definition.call
   };
   common.logDebug('builtin tool exposed=' + exposedName);
@@ -3717,6 +3721,9 @@ function discoverPhoneTools(settings, requestId, callback) {
     pluginSources.getTools(settings).forEach(function(definition) {
       addBuiltinTool(tools, toolMap, definition);
     });
+    pluginActions.getTools(settings).forEach(function(definition) {
+      addBuiltinTool(tools, toolMap, definition);
+    });
     tools.sort(function(a, b) {
       if (a.name < b.name) {
         return -1;
@@ -3848,7 +3855,11 @@ function callMcpTool(toolInfo, args, requestId, callback) {
 }
 
 function callBuiltinTool(toolInfo, args, requestId, callback) {
-  common.logDebug('builtin tool call name=' + toolInfo.name + ' args=' + common.safeJson(args).substring(0, 240));
+  if (toolInfo.logArguments !== false) {
+    common.logDebug('builtin tool call name=' + toolInfo.name + ' args=' + common.safeJson(args).substring(0, 240));
+  } else {
+    common.logDebug('builtin tool call name=' + toolInfo.name + ' args=suppressed');
+  }
   toolInfo.call(args, requestId, function(error, resultText) {
     if (!watch.isCurrentRequest(requestId)) {
       return;
@@ -4342,7 +4353,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
         };
       }
     }
-    validationError = validateToolArgs(args, toolInfo.parameters);
+    validationError = typeof toolInfo.validate === 'function' ? toolInfo.validate(args) : validateToolArgs(args, toolInfo.parameters);
     if (validationError) {
       return {
         index: index,
@@ -4419,7 +4430,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     if (!watch.isCurrentRequest(requestId)) {
       return;
     }
-    watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), formatToolCallDetail(job.name, job.args, job.toolInfo), job.progressId);
+    watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), job.toolInfo.logArguments === false ? 'checking action request' : formatToolCallDetail(job.name, job.args, job.toolInfo), job.progressId);
     try {
       if (job.toolInfo.kind === 'builtin') {
         callBuiltinTool(job.toolInfo, job.args, requestId, finishToolCall);

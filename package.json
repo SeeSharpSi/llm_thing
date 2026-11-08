@@ -118,7 +118,8 @@
       "RequestCancel",
       "RequestRetry",
       "RetryAvailable",
-      "PluginSourcesJson"
+      "PluginSourcesJson",
+      "PluginActionsJson"
     ],
     "resources": {
       "media": [

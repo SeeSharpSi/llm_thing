@@ -40,6 +40,29 @@ function createBundleHarness(storageValues, manualSends, pluginOptions) {
       pebble.pluginSubscriptions.push(subscription);
       return subscription;
     };
+    pebble.actionInvocations = [];
+    pebble.invokeAction = function(request) {
+      var invocation = { plugin: request.plugin, action: request.action, args: request.args };
+      var resolveResult;
+      var rejectResult;
+      var pending = {
+        request: invocation,
+        resolve: function(value) { if (resolveResult) { resolveResult(value); } },
+        reject: function(error) { if (rejectResult) { rejectResult(error); } }
+      };
+      pebble.actionInvocations.push(pending);
+      return {
+        then: function(resolve, reject) {
+          resolveResult = resolve;
+          rejectResult = reject;
+          return this;
+        },
+        catch: function(reject) {
+          rejectResult = reject;
+          return this;
+        }
+      };
+    };
   }
   vm.runInNewContext(source, sandbox, { filename: 'build/pebble-js-app.js' });
 
@@ -123,6 +146,39 @@ function savedChatsFixture() {
         ]
       }
     ]
+  });
+}
+
+function pluginAction(uuid, name, parameters, description) {
+  return {
+    uuid: uuid,
+    name: 'Action test plugin',
+    actions: [{ name: name, description: description || name, parameters: parameters }]
+  };
+}
+
+function beginPluginActionCall(pebble, requestId, args) {
+  var request;
+  var body;
+  var tools;
+
+  pebble.emit('appmessage', { payload: { RequestId: requestId, RequestText: 'Run plugin action' } });
+  request = FakeXMLHttpRequest.last();
+  body = JSON.parse(request.body);
+  tools = (body.tools || []).filter(function(tool) {
+    return tool.type === 'function' && tool.name.indexOf('pebble_plugin_action_') === 0;
+  });
+  return { request: request, body: body, tools: tools, args: args };
+}
+
+function respondWithActionCall(request, tool, args, callId) {
+  request.respond(200, {
+    output: [{
+      type: 'function_call',
+      call_id: callId,
+      name: tool.name,
+      arguments: JSON.stringify(args)
+    }]
   });
 }
 
@@ -367,6 +423,328 @@ test('zero tool budget blocks explicitly selected plugin sources', function() {
     return typeof tool.name === 'string' && tool.name.indexOf('pebble_plugin_') === 0;
   }), false);
   assert.equal(pebble.pluginSubscriptions.length, 0);
+});
+
+test('plugin action catalogue reaches settings for action-only plugins without invocation', function() {
+  var uuid = '22345678-1234-4234-8234-123456789abc';
+  var plugin = pluginAction(uuid, 'set_switch', {
+    type: 'object',
+    properties: { on: { type: 'boolean' } },
+    required: ['on']
+  });
+  var harness = createBundleHarness({}, false, { plugins: [plugin] });
+  var pebble = harness.pebble;
+  var html;
+
+  pebble.emit('showConfiguration');
+  html = decodeURIComponent(pebble.openedUrls[0].split(',').slice(1).join(','));
+
+  assert.match(html, /plugin_actions/);
+  assert.match(html, /catalogueEncoded/);
+  assert.ok(html.indexOf(uuid) !== -1, 'action-only plugin appears in encoded catalogue');
+  assert.equal(pebble.actionInvocations.length, 0, 'settings discovery never invokes native action');
+});
+
+test('selected plugin action alone is exposed and false/zero arguments reach native action', function() {
+  var uuid = '32345678-1234-4234-8234-123456789abc';
+  var plugin = {
+    uuid: uuid,
+    name: 'Actions and source',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue'] } }],
+    actions: [
+      { name: 'set_switch', description: 'Set switch', parameters: {
+        type: 'object', properties: { on: { type: 'boolean' }, offset: { type: 'integer' } },
+        required: ['on', 'offset'], additionalProperties: false
+      } },
+      { name: 'delete_switch', description: 'Delete switch', parameters: {
+        type: 'object', properties: { instanceId: { type: 'string' } },
+        required: ['instanceId'], additionalProperties: false
+      } }
+    ]
+  };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 2,
+      PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_switch' }]),
+      PluginSourcesJson: JSON.stringify([{ plugin: uuid, category: 'weather', item: 'location' }])
+    })
+  }, true, { plugins: [plugin] });
+  var pebble = harness.pebble;
+  var actionTools;
+  var actionCall;
+  var invocation;
+  var followUp;
+  var followUpBody;
+  var outputs;
+  var envelope;
+  var answer;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  actionCall = beginPluginActionCall(pebble, 41, { on: false, offset: 0 });
+  actionTools = actionCall.tools;
+  assert.equal(actionTools.length, 1, 'only selected plugin action is exposed');
+  assert.equal(JSON.stringify(actionCall.body.tools).indexOf('delete_switch'), -1, 'unselected action is absent');
+  assert.ok(actionCall.body.tools.some(function(tool) {
+    return tool.type === 'function' && tool.name.indexOf('pebble_plugin_') === 0 &&
+      tool.name.indexOf('pebble_plugin_action_') !== 0;
+  }), 'source selection remains independently enabled');
+
+  respondWithActionCall(actionCall.request, actionTools[0], { on: false, offset: 0 }, 'action-call');
+  assert.equal(pebble.actionInvocations.length, 1, 'one native action invocation');
+  invocation = pebble.actionInvocations[0];
+  assert.equal(invocation.request.plugin, uuid);
+  assert.equal(invocation.request.action, 'set_switch');
+  assert.equal(JSON.stringify(invocation.request.args), JSON.stringify({ on: false, offset: 0 }),
+    'boolean false and integer zero are preserved');
+  invocation.resolve({ ok: true, text: 'Switch set', refreshed: ['switches'] });
+
+  followUp = FakeXMLHttpRequest.last();
+  followUpBody = JSON.parse(followUp.body);
+  outputs = followUpBody.input.filter(function(item) { return item.type === 'function_call_output'; });
+  assert.equal(outputs.length, 1);
+  envelope = JSON.parse(outputs[0].output);
+  assert.ok(envelope.result && typeof envelope.result === 'object', 'native result retains model wrapper');
+  assert.equal(envelope.result.ok, true);
+  assert.equal(envelope.result.pluginUuid, uuid);
+  assert.equal(envelope.result.action, 'set_switch');
+  assert.equal(envelope.result.text, 'Switch set');
+  assert.equal(JSON.stringify(envelope.result.refreshed), JSON.stringify(['switches']));
+
+  followUp.respond(200, { output_text: 'Switch is off.' });
+  flushManualSends(pebble);
+  answer = pebble.messages.filter(function(message) { return message.ResponseChunk !== undefined; })
+    .map(function(message) { return message.ResponseChunk; }).join('');
+  assert.match(answer, /Switch is off/);
+  assert.ok(pebble.messages.some(function(message) { return message.ResponseDone === 1; }));
+});
+
+test('plugin source opt-in does not enable any plugin actions', function() {
+  var uuid = '33345678-1234-4234-8234-123456789abc';
+  var plugin = {
+    uuid: uuid,
+    name: 'Actions and source',
+    sources: [{ category: 'weather', items: ['location'], properties: { temperature: ['numericValue'] } }],
+    actions: [{ name: 'set_switch', description: 'Set switch', parameters: {
+      type: 'object', properties: { on: { type: 'boolean' } }, required: ['on']
+    } }]
+  };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 4,
+      PluginActionsJson: '[]',
+      PluginSourcesJson: JSON.stringify([{ plugin: uuid, category: 'weather', item: 'location' }])
+    })
+  }, true, { plugins: [plugin] });
+  var pebble = harness.pebble;
+  var call;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 42, {});
+  assert.equal(call.tools.length, 0, 'source selection cannot implicitly select plugin action');
+  assert.equal(pebble.actionInvocations.length, 0);
+});
+
+test('action schema rejects Hue enum, missing required, and Todoist conditional arguments before invocation', function() {
+  var hueUuid = '42345678-1234-4234-8234-123456789abc';
+  var todoUuid = '52345678-1234-4234-8234-123456789abc';
+  var hueSchema = {
+    type: 'object', properties: {
+      item: { type: 'string', enum: ['home_lights', 'room_lights', 'light'] },
+      instanceId: { type: 'string' }, on: { type: 'boolean' }
+    }, required: ['item', 'instanceId', 'on']
+  };
+  var todoistSchema = {
+    type: 'object', properties: {
+      title: { type: 'string', minLength: 1 }, due_iso: { type: 'string', format: 'date-time' },
+      timezone: { type: 'string', minLength: 1 }, notify_before_ms: { type: 'integer', minimum: 0 }
+    }, required: ['title'],
+    allOf: [{ if: { required: ['due_iso'] }, then: { required: ['timezone'] } }],
+    additionalProperties: false
+  };
+  var cases = [
+    { plugin: hueUuid, action: 'set_hue', schema: hueSchema,
+      args: { item: 'invalid_lights', instanceId: 'living-room', on: false }, pattern: /one of/ },
+    { plugin: hueUuid, action: 'set_hue', schema: hueSchema,
+      args: { item: 'light', instanceId: 'living-room' }, pattern: /Missing required argument/ },
+    { plugin: todoUuid, action: 'create_task', schema: todoistSchema,
+      args: { title: 'Water plants', due_iso: '2026-11-08T09:30:00Z' }, pattern: /Missing required argument.*timezone/ }
+  ];
+  var i;
+  var item;
+  var plugin;
+  var harness;
+  var actionCall;
+  var tool;
+  var followUp;
+  var body;
+  var outputs;
+
+  for (i = 0; i < cases.length; i += 1) {
+    item = cases[i];
+    plugin = pluginAction(item.plugin, item.action, item.schema);
+    harness = createBundleHarness({
+      llm_thing_settings: JSON.stringify({
+        Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+        MaxToolCalls: 1,
+        PluginActionsJson: JSON.stringify([{ plugin: item.plugin, action: item.action }])
+      })
+    }, true, { plugins: [plugin] });
+    harness.pebble.emit('ready');
+    flushManualSends(harness.pebble);
+    actionCall = beginPluginActionCall(harness.pebble, 50 + i, item.args);
+    assert.equal(actionCall.tools.length, 1, 'selected action is offered');
+    tool = actionCall.tools[0];
+    respondWithActionCall(actionCall.request, tool, item.args, 'invalid-action-' + i);
+    assert.equal(harness.pebble.actionInvocations.length, 0, 'invalid arguments never reach native API');
+
+    followUp = FakeXMLHttpRequest.last();
+    assert.notEqual(followUp, actionCall.request, 'validation error is sent to model');
+    body = JSON.parse(followUp.body);
+    outputs = body.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+    assert.equal(outputs.length, 1);
+    assert.match(outputs[0].output, item.pattern, 'model receives schema validation error');
+  }
+});
+
+test('zero tool budget blocks selected plugin actions before native invocation', function() {
+  var uuid = '62345678-1234-4234-8234-123456789abc';
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 0, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_switch' }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'set_switch', { type: 'object', properties: {} })] });
+  var call;
+
+  harness.pebble.emit('ready');
+  flushManualSends(harness.pebble);
+  call = beginPluginActionCall(harness.pebble, 61, {});
+  assert.equal(call.tools.length, 0);
+  assert.equal(harness.pebble.actionInvocations.length, 0);
+});
+
+test('unknown plugin action failure is not retried and blocks repeated action in same request', function() {
+  var uuid = '72345678-1234-4234-8234-123456789abc';
+  var args = { enabled: true };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 2, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'enable_device' }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'enable_device', {
+    type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled']
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var tool;
+  var firstFollowUp;
+  var secondFollowUp;
+  var outputs;
+  var body;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 71, args);
+  tool = call.tools[0];
+  respondWithActionCall(call.request, tool, args, 'unknown-result-1');
+  assert.equal(pebble.actionInvocations.length, 1);
+  pebble.actionInvocations[0].reject({ code: 'TIMEOUT', message: 'outcome unknown' });
+  firstFollowUp = FakeXMLHttpRequest.last();
+  assert.equal(FakeXMLHttpRequest.instances.length, 2, 'native failure does not cause automatic provider retry');
+
+  respondWithActionCall(firstFollowUp, tool, args, 'unknown-result-2');
+  secondFollowUp = FakeXMLHttpRequest.last();
+  assert.equal(FakeXMLHttpRequest.instances.length, 3, 'blocked repeated call returns to model without native retry');
+  assert.equal(pebble.actionInvocations.length, 1, 'uncertain action is not invoked twice in same request');
+  body = JSON.parse(secondFollowUp.body);
+  outputs = body.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+  assert.ok(outputs.some(function(entry) { return /unknown|uncertain|already|failed/i.test(entry.output); }),
+    'model gets blocked/unknown-outcome explanation');
+
+  secondFollowUp.respond(200, { output_text: 'The action result is unknown.' });
+  flushManualSends(pebble);
+});
+
+test('canceling in-flight plugin action suppresses callbacks but does not claim action was undone', function() {
+  var uuid = '82345678-1234-4234-8234-123456789abc';
+  var args = { enabled: true };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 1, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'enable_device' }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'enable_device', {
+    type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled']
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var afterCancel;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 81, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'cancel-action');
+  assert.equal(pebble.actionInvocations.length, 1, 'action already entered native API');
+  pebble.emit('appmessage', { payload: { RequestCancel: 1, RequestId: 81 } });
+  afterCancel = pebble.messages.length;
+  pebble.actionInvocations[0].resolve({ ok: true, text: 'Completed', refreshed: [] });
+
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'late resolution does not start provider follow-up');
+  assert.equal(pebble.messages.length, afterCancel, 'late resolution does not produce watch answer');
+  assert.equal(pebble.actionInvocations.length, 1, 'cancellation suppresses callbacks; it does not undo invocation');
+});
+
+test('action mutation recovery retry uses final-answer-only request and never reexecutes action', function() {
+  var uuid = '92345678-1234-4234-8234-123456789abc';
+  var args = { enabled: false };
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: 'https://offline.invalid/v1/responses', ApiKey: 'offline-key', Model: 'offline-model',
+      MaxToolCalls: 2, PluginActionsJson: JSON.stringify([{ plugin: uuid, action: 'set_device' }])
+    })
+  }, true, { plugins: [pluginAction(uuid, 'set_device', {
+    type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled']
+  })] });
+  var pebble = harness.pebble;
+  var call;
+  var actionFollowUp;
+  var failedResponseMessages;
+  var retryRequest;
+  var retryBody;
+  var responseOutputs;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  call = beginPluginActionCall(pebble, 91, args);
+  respondWithActionCall(call.request, call.tools[0], args, 'retry-action');
+  assert.equal(pebble.actionInvocations.length, 1);
+  pebble.actionInvocations[0].resolve({ ok: true, text: 'Device updated', refreshed: ['devices'] });
+  actionFollowUp = FakeXMLHttpRequest.last();
+  actionFollowUp.respond(401, 'offline unauthorized');
+  flushManualSends(pebble);
+  assert.ok(pebble.messages.some(function(message) { return message.RetryAvailable === 1; }),
+    'watch receives retry affordance for bounded action result');
+  failedResponseMessages = pebble.messages.length;
+
+  pebble.emit('appmessage', { payload: { RequestRetry: 91, RequestId: 92 } });
+  retryRequest = FakeXMLHttpRequest.last();
+  assert.equal(FakeXMLHttpRequest.instances.length, 3, 'watch retry starts one recovery model request');
+  retryBody = JSON.parse(retryRequest.body);
+  assert.equal(retryBody.tools, undefined, 'recovery request cannot execute tools');
+  responseOutputs = retryBody.input.filter(function(entry) { return entry.type === 'function_call_output'; });
+  assert.ok(responseOutputs.length > 0, 'completed action result remains in recovery context');
+  assert.match(responseOutputs[0].output, /Device updated/);
+  assert.equal(pebble.actionInvocations.length, 1, 'retry does not invoke completed action again');
+
+  retryRequest.respond(200, { output_text: 'The device was updated.' });
+  flushManualSends(pebble);
+  assert.ok(pebble.messages.slice(failedResponseMessages).some(function(message) {
+    return message.ResponseChunk !== undefined && /device was updated/i.test(message.ResponseChunk);
+  }), 'recovery answer is delivered to watch');
 });
 
 test('built PebbleKit bundle syncs stored Response Sound setting on ready', function() {

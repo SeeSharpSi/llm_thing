@@ -150,7 +150,7 @@ serial; each serial call forms a barrier before later reads start.
 Plugin metadata enumeration does not read personal data. Tick
 individual sources to opt in; all are off by default, and at most 16 sources can
 be registered. After saving, enabled read tools execute automatically within
-the existing global `MaxToolCalls` limit. Plugin actions are not exposed.
+the existing global `MaxToolCalls` limit.
 
 To use a source, install and configure its plugin in the latest Pebble mobile
 app, reopen LLM Thing settings, select the source, save, then ask a relevant
@@ -162,6 +162,31 @@ provider as tool output. If access needs permission, approve it in the Pebble
 app and retry. A missing plugin never silently falls back to another source.
 On an older phone without the plugin API, settings show unsupported status and
 retain saved selections.
+
+### Pebble plugin actions
+
+**Plugin Actions** settings groups installed plugins and lists their actions.
+Each action has a separate opt-in, all are off by default, and at most 16 actions
+can be enabled independently of the 16-source limit. Enabled actions execute
+automatically without an additional application confirmation and count toward the
+existing global `MaxToolCalls` limit. Actions execute serially. There is no
+automatic retry.
+
+Each call pins `Pebble.invokeAction` to the selected plugin UUID and exact action
+name. It never falls back to another plugin or action. Plugin actions can change
+external state or send data outside the phone. Arguments and results are sent to
+the configured model provider. Pebble may require OS permission approval or
+plugin authentication in the Pebble app or plugin setup.
+
+Actions have a 30-second deadline. A timeout or rejection leaves the outcome
+unknown because the action may have completed. The app does not claim to abort an
+action, and cancellation cannot undo side effects. After an uncertain outcome,
+that action is blocked for the rest of the current request to prevent duplicate
+execution. The existing Retry flow after tool execution requests a final answer
+only; it does not repeat actions.
+
+Unsupported or unsafe action JSON Schemas are omitted with a visible warning.
+Common Hue and Todoist action schemas are supported.
 
 Pebble's plugin guide: <https://developer.repebble.com/guides/plugins/preview/>
 

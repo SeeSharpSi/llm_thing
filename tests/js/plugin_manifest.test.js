@@ -5,6 +5,10 @@ var assert = require('node:assert/strict');
 var packageJson = require('../../package.json');
 
 test('plugin consumer declares required permissions and persisted message key', function() {
+  var messageKeys = packageJson.pebble.messageKeys;
+  var pluginSourcesIndex = messageKeys.indexOf('PluginSourcesJson');
+  var pluginActionsIndex = messageKeys.indexOf('PluginActionsJson');
+
   assert.deepEqual(packageJson.pebble.usesPermissions, [
     'Internet',
     'LocalNetwork',
@@ -13,5 +17,7 @@ test('plugin consumer declares required permissions and persisted message key', 
     'Health',
     'ShowNotifications'
   ]);
-  assert.equal(packageJson.pebble.messageKeys[packageJson.pebble.messageKeys.length - 1], 'PluginSourcesJson');
+  assert.notEqual(pluginSourcesIndex, -1, 'PluginSourcesJson must remain declared');
+  assert.equal(pluginActionsIndex, messageKeys.length - 1, 'PluginActionsJson must be appended');
+  assert.ok(pluginSourcesIndex < pluginActionsIndex, 'PluginActionsJson must follow PluginSourcesJson');
 });

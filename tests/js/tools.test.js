@@ -15,6 +15,7 @@ var watchPath = path.resolve(__dirname, '../../src/pkjs/watch');
 var timelineStorePath = path.resolve(__dirname, '../../src/pkjs/timeline_store');
 var webFetchPath = path.resolve(__dirname, '../../src/pkjs/web_fetch');
 var memoryStorePath = path.resolve(__dirname, '../../src/pkjs/memory_store');
+var pluginActionsPath = path.resolve(__dirname, '../../src/pkjs/plugin_actions');
 
 function createHarness() {
   FakeXMLHttpRequest.reset();
@@ -42,9 +43,11 @@ function createHarness() {
   Object.keys(common).forEach(function(key) { commonStub[key] = common[key]; });
   commonStub.logDebug = function() {};
 
+  var pluginActions = load.loadWithStubs(pluginActionsPath, { './watch': watch });
   var tools = load.loadWithStubs(toolsPath, {
     './settings': commonStub,
-    './watch': watch
+    './watch': watch,
+    './plugin_actions': pluginActions
   });
   return { tools: tools, watch: watch, commonStub: commonStub };
 }
@@ -96,6 +99,7 @@ test.afterEach(function() {
   load.clearModule(timelineStorePath);
   load.clearModule(webFetchPath);
   load.clearModule(memoryStorePath);
+  load.clearModule(pluginActionsPath);
 });
 
 test('discoverPhoneTools returns enabled built-ins in stable name order', function() {
@@ -645,6 +649,49 @@ test('plugin source builtin integrates schema, progress, execution, and request 
   harness.tools.cancelMcpRequest(99);
   assert.equal(unsubscribed, 2);
   assert.equal(result, null);
+});
+
+test('plugin action builtin uses plugin schema validator, serial progress, and suppresses argument logging', function() {
+  var harness = createHarness();
+  var resolveAction;
+  var invocations = [];
+  var definitions;
+  var toolMap;
+  var results;
+  var schema = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      mode: { type: 'string', enum: ['manual', 'scheduled'] },
+      count: { type: 'integer' },
+      target: { type: 'string' }
+    },
+    allOf: [{ properties: { count: { minimum: 0 } } }],
+    if: { properties: { mode: { const: 'scheduled' } } },
+    then: { required: ['target'] }
+  };
+  global.Pebble = {
+    enumeratePlugins: function() { return [{ uuid: 'abcdefab-cdef-abcd-efab-cdefabcdefab', name: 'Action only', actions: [{ name: 'configure', parameters: schema }] }]; },
+    invokeAction: function(request) { invocations.push(request); return { then: function(resolve) { resolveAction = resolve; return this; } }; }
+  };
+  harness.tools.discoverPhoneTools({
+    McpServersJson: '[]',
+    PluginSourcesJson: '[{"plugin":"abcdefab-cdef-abcd-efab-cdefabcdefab","category":"ignored","item":"ignored"}]',
+    PluginActionsJson: '[{"plugin":"abcdefab-cdef-abcd-efab-cdefabcdefab","action":"configure"}]',
+    MaxToolCalls: 4
+  }, 120, function(error, tools, map) { assert.ifError(error); definitions = tools; toolMap = map; });
+  var actionDefinition = definitions.filter(function(definition) { return definition.name.indexOf('pebble_plugin_action_') === 0; })[0];
+  assert.ok(actionDefinition);
+  assert.deepEqual(actionDefinition.parameters, schema);
+  harness.tools.runToolCalls(120, [{ id: 'invalid', name: actionDefinition.name, arguments: { mode: 'scheduled', count: 0 } }], toolMap, function(value) { results = value; });
+  assert.equal(invocations.length, 0, 'conditional required validation prevents native invocation');
+  assert.match(results[0].error, /Missing required argument: arguments\.target/);
+  harness.tools.runToolCalls(120, [{ id: 'valid', name: actionDefinition.name, arguments: { mode: 'scheduled', count: 0, target: 'private-target' } }], toolMap, function(value) { results = value; });
+  assert.equal(invocations.length, 1);
+  assert.deepEqual(invocations[0], { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', args: { mode: 'scheduled', count: 0, target: 'private-target' } });
+  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'start' && event[1] === 'Plugin action: Action only / configure' && event[2] === 'checking action request'; }));
+  resolveAction({ ok: true, text: 'done' });
+  assert.deepEqual(JSON.parse(results[0].result), { ok: true, pluginUuid: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', text: 'done' });
+  assert.equal(results[0]._structuredResult, true);
 });
 
 test('web_fetch reports network and timeout errors', function() {

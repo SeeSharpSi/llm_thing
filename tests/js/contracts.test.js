@@ -125,6 +125,7 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   assert.equal(global.Pebble.messages[0].ApiKey, undefined);
   assert.equal(global.Pebble.messages[0].McpServersJson, undefined);
   assert.equal(global.Pebble.messages[0].PluginSourcesJson, undefined);
+  assert.equal(global.Pebble.messages[0].PluginActionsJson, undefined);
   assert.equal(global.Pebble.messages[0].DeleteAllPastChats, undefined);
   assert.equal(global.Pebble.messages[0].ConfigAction, undefined);
 });
@@ -163,7 +164,7 @@ test('Health Info setting and watch protocol are declared consistently', functio
   assert.equal(keys.indexOf('HealthIncludeHeartRate'), -1);
 });
 
-test('Pebble Memory is disabled by default and follows plugin sources', function() {
+test('Pebble Memory is disabled by default and follows plugin sources and actions', function() {
   var configured = configItems(config);
   var toggle = configured.filter(function(item) {
     return item.messageKey === 'PebbleMemoryToolEnabled';
@@ -176,10 +177,12 @@ test('Pebble Memory is disabled by default and follows plugin sources', function
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
     'PluginSourcesJson',
+    'PluginActionsJson',
     'MemoriesJson'
   ]);
   assert.equal(finalSection.items[1].type, 'plugin_sources');
-  assert.equal(finalSection.items[2].type, 'memory_manager');
+  assert.equal(finalSection.items[2].type, 'plugin_actions');
+  assert.equal(finalSection.items[3].type, 'memory_manager');
   assert.equal(config[config.length - 1].type, 'submit');
 });
 
@@ -203,6 +206,7 @@ test('settings backup section sits before the final MCP and memory section witho
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
     'PluginSourcesJson',
+    'PluginActionsJson',
     'MemoriesJson'
   ]);
 });
@@ -214,6 +218,15 @@ test('Plugin Sources is default-off metadata selection with phone-only persisten
   assert.equal(item.defaultValue, '[]');
   assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
   assert.ok(packageJson.pebble.messageKeys.indexOf('PluginSourcesJson') !== -1);
+});
+
+test('Plugin Actions is independent and default-off with phone-only persistence', function() {
+  var item = configItems(config).filter(function(configItem) { return configItem.messageKey === 'PluginActionsJson'; })[0];
+  assert.ok(item);
+  assert.equal(item.type, 'plugin_actions');
+  assert.equal(item.defaultValue, '[]');
+  assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
+  assert.ok(packageJson.pebble.messageKeys.indexOf('PluginActionsJson') !== -1);
 });
 
 test('generated message-key artifacts are internally consistent', function() {

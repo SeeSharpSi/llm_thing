@@ -93,13 +93,26 @@ function createHarness(options) {
       return { sources: [{ plugin: 'plugin-id', pluginName: 'Phone', category: 'calendar', item: 'today', properties: ['title'] }], status: '1 source available.' };
     }
   };
+  var pluginActions = {
+    calls: 0,
+    invokeCalls: 0,
+    getCatalogue: function() {
+      pluginActions.calls += 1;
+      return { actions: [{ plugin: '00000000-0000-0000-0001-000000000007', pluginName: 'Home', action: 'set_on', description: 'Turn switch on.', arguments: ['device_id'] }], status: '1 action available.' };
+    },
+    invokeAction: function() { pluginActions.invokeCalls += 1; }
+  };
   var tools = {
     warmCalls: [],
     warmMcpTools: function(value) { tools.warmCalls.push(value); }
   };
   var config = [{
     type: 'section',
-    items: [{ type: 'model_selector', messageKey: 'Model' }, { type: 'plugin_sources', messageKey: 'PluginSourcesJson' }]
+    items: [
+      { type: 'model_selector', messageKey: 'Model' },
+      { type: 'plugin_sources', messageKey: 'PluginSourcesJson' },
+      { type: 'plugin_actions', messageKey: 'PluginActionsJson' }
+    ]
   }];
 
   load.loadWithStubs(indexPath, {
@@ -111,7 +124,9 @@ function createHarness(options) {
     './model_discovery': modelDiscovery,
     './model_selector_component': { name: 'model_selector' },
     './plugin_sources_component': { name: 'plugin_sources' },
+    './plugin_actions_component': { name: 'plugin_actions' },
     './plugin_sources': pluginSources,
+    './plugin_actions': pluginActions,
     './settings': settings,
     './tools': tools,
     './watch': watch,
@@ -123,7 +138,7 @@ function createHarness(options) {
     }
   });
 
-  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery, tools: tools, pluginSources: pluginSources };
+  return { clay: FakeClay.instance, settings: settings, watch: watch, model: model, modelDiscovery: modelDiscovery, tools: tools, pluginSources: pluginSources, pluginActions: pluginActions };
 }
 
 test.afterEach(function() {
@@ -143,7 +158,8 @@ test('opens configuration synchronously from cache without starting model discov
   assert.equal(harness.clay.registered[3].name, 'builtin_tools');
   assert.equal(harness.clay.registered[4].name, 'settings_io');
   assert.equal(harness.clay.registered[5].name, 'plugin_sources');
-  assert.equal(harness.clay.registered.length, 6);
+  assert.equal(harness.clay.registered[6].name, 'plugin_actions');
+  assert.equal(harness.clay.registered.length, 7);
   global.Pebble.emit('ready');
   assert.deepEqual(harness.model.calls, [['reset']]);
   assert.equal(harness.watch.calls[0][0], 'sync');
@@ -163,8 +179,15 @@ test('opens configuration synchronously from cache without starting model discov
     { plugin: 'plugin-id', pluginName: 'Phone', category: 'calendar', item: 'today', properties: ['title'] }
   ]);
   assert.equal(harness.clay.config[0].items[1].catalogueStatus, '1 source available.');
+  assert.equal(harness.pluginActions.calls, 1);
+  assert.equal(harness.pluginActions.invokeCalls, 0, 'configuration discovery never invokes an action');
+  assert.deepEqual(JSON.parse(decodeURIComponent(harness.clay.config[0].items[2].catalogueEncoded)), [
+    { plugin: '00000000-0000-0000-0001-000000000007', pluginName: 'Home', action: 'set_on', description: 'Turn switch on.', arguments: ['device_id'] }
+  ]);
+  assert.equal(harness.clay.config[0].items[2].catalogueStatus, '1 action available.');
   global.Pebble.emit('showConfiguration');
   assert.equal(harness.pluginSources.calls, 2, 'catalogue refreshes each time settings open');
+  assert.equal(harness.pluginActions.calls, 2, 'action catalogue refreshes each time settings open');
 });
 
 test('configuration reports unsupported plugin catalogue without losing configured choices', function() {
@@ -178,11 +201,13 @@ test('configuration reports unsupported plugin catalogue without losing configur
 
 test('configuration close persists plugin choices but not catalogue injection fields', function() {
   var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
+  var selectedActions = '[{"plugin":"00000000-0000-0000-0001-000000000007","action":"set_on"}]';
   var harness = createHarness();
   global.Pebble.emit('showConfiguration');
-  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ PluginSourcesJson: selected }) });
+  global.Pebble.emit('webviewclosed', { response: JSON.stringify({ PluginSourcesJson: selected, PluginActionsJson: selectedActions }) });
 
   assert.equal(harness.settings.saved[0].PluginSourcesJson, selected);
+  assert.equal(harness.settings.saved[0].PluginActionsJson, selectedActions);
   assert.equal(Object.prototype.hasOwnProperty.call(harness.settings.saved[0], 'catalogueEncoded'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(harness.settings.saved[0], 'catalogueStatus'), false);
 });

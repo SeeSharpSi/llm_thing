@@ -546,19 +546,25 @@ test('MCP import accepts an array and replaces servers with an empty array', fun
   assert.equal(item.items.McpServersJson.get(), '[]');
 });
 
-test('plugin source selections roundtrip in settings backup without catalogue metadata', function() {
+test('plugin source and action selections roundtrip without catalogue metadata', function() {
   var item = createHarness();
   var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"calendar","item":"today"}]';
+  var selectedActions = '[{"plugin":"00000000-0000-0000-0001-000000000007","action":"set_on"}]';
   var key = 'PluginSourcesJson';
+  var actionKey = 'PluginActionsJson';
   item.items[key] = fakeItem('plugin_sources', { messageKey: key }, selected);
+  item.items[actionKey] = fakeItem('plugin_actions', { messageKey: actionKey }, selectedActions);
   var exported = item.buildExportSettings();
   var restored = createHarness();
   restored.items[key] = fakeItem('plugin_sources', { messageKey: key }, '[]');
+  restored.items[actionKey] = fakeItem('plugin_actions', { messageKey: actionKey }, '[]');
 
   assert.equal(exported.settings[key], selected);
+  assert.equal(exported.settings[actionKey], selectedActions);
   assert.equal(Object.keys(exported.settings).some(function(name) { return /catalogue/i.test(name); }), false);
   assert.equal(restored.importSettingsText(JSON.stringify(exported)).ok, true);
   assert.equal(restored.items[key].get(), selected);
+  assert.equal(restored.items[actionKey].get(), selectedActions);
 });
 
 test('import rejects empty, oversized, malformed, array, primitive, and wrong-version input', function() {

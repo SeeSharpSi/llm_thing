@@ -151,6 +151,8 @@ test('malformed settings become empty and selected sources are deduplicated and 
   assert.equal(JSON.parse(component.manipulator.get.call(item)).length, 16);
   assert.equal(item.parseSources(JSON.stringify([values[0], values[0]])).length, 1);
   assert.equal(item.parseSources(JSON.stringify([{ plugin: 'plugin-id', category: 'category', item: 'item' }])).length, 0);
+  assert.equal(item.parseSources(JSON.stringify([{ plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', category: '', item: 'item' }])).length, 0);
+  assert.equal(item.parseSources(JSON.stringify([{ plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'set_on' }])).length, 0);
 });
 
 test('uppercase UUID selections normalize and deduplicate with lowercase catalogue IDs', function() {

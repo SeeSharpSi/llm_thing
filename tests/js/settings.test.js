@@ -22,6 +22,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.equal(settings.DEFAULT_SETTINGS.PebbleMemoryToolEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.SpeakerFeedbackEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
+  assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
 });
 
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
@@ -123,6 +124,17 @@ test('PluginSourcesJson persists as phone-side JSON setting', function() {
   settings.saveSettings({ PluginSourcesJson: selected });
   assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).PluginSourcesJson, selected);
   assert.equal(settings.loadSettings().PluginSourcesJson, selected);
+});
+
+test('PluginActionsJson persists independently as phone-side JSON setting', function() {
+  var settings;
+  var selected = '[{"plugin":"00000000-0000-0000-0001-000000000007","action":"set_on"}]';
+  global.localStorage = new FakeLocalStorage();
+  settings = require(settingsPath);
+  settings.saveSettings({ PluginSourcesJson: '[{"plugin":"00000000-0000-0000-0001-000000000007","category":"switch","item":"state"}]', PluginActionsJson: selected });
+  assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).PluginActionsJson, selected);
+  assert.equal(settings.loadSettings().PluginActionsJson, selected);
+  assert.equal(JSON.parse(global.localStorage.getItem('llm_thing_settings')).PluginSourcesJson.indexOf('action'), -1);
 });
 
 test('saveSettings and loadSettings persist SpeakerFeedbackEnabled on and off', function() {

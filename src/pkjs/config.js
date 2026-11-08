@@ -390,6 +390,11 @@ module.exports = [
         "defaultValue": "[]"
       },
       {
+        "type": "plugin_actions",
+        "messageKey": "PluginActionsJson",
+        "defaultValue": "[]"
+      },
+      {
         "type": "memory_manager",
         "messageKey": "MemoriesJson",
         "defaultValue": "[]"

@@ -23,6 +23,7 @@ module.exports = {
     var item = this;
     var root = item.$element[0];
     var body = root.querySelector('[data-plugin-body]');
+    var actionsMode = root.getAttribute('data-plugin-kind') === 'actions';
     var catalogue = parseCatalogue(item.config && item.config.catalogueEncoded).map(catalogueEntry).filter(function(entry) { return !!entry; });
     var selected;
     var MAX_ENABLED = 16;
@@ -42,16 +43,25 @@ module.exports = {
     }
 
     function cleanEntry(entry) {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
-          typeof entry.plugin !== 'string' || typeof entry.category !== 'string' || typeof entry.item !== 'string') {
+      var identifier;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.plugin !== 'string') {
         return null;
       }
-      entry = { plugin: trim(entry.plugin).toLowerCase(), category: entry.category, item: entry.item };
-      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(entry.plugin) && entry.category && entry.item ? entry : null;
+      identifier = actionsMode ? entry.action : entry.item;
+      if (actionsMode ? typeof identifier !== 'string' : (typeof entry.category !== 'string' || typeof identifier !== 'string')) {
+        return null;
+      }
+      entry = actionsMode
+        ? { plugin: trim(entry.plugin).toLowerCase(), action: identifier }
+        : { plugin: trim(entry.plugin).toLowerCase(), category: entry.category, item: identifier };
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(entry.plugin) &&
+        (actionsMode ? !!identifier : !!entry.category && !!identifier) ? entry : null;
     }
 
     function keyFor(entry) {
-      return JSON.stringify([entry.plugin, entry.category, entry.item]);
+      return actionsMode
+        ? JSON.stringify([entry.plugin, entry.action])
+        : JSON.stringify([entry.plugin, entry.category, entry.item]);
     }
 
     function sameEntry(left, right) {
@@ -60,17 +70,28 @@ module.exports = {
 
     function catalogueEntry(entry) {
       var cleaned = cleanEntry(entry);
-      if (!cleaned || typeof entry.pluginName !== 'string' || !Array.isArray(entry.properties)) {
+      if (!cleaned || typeof entry.pluginName !== 'string') {
         return null;
       }
       cleaned.pluginName = entry.pluginName;
-      cleaned.properties = entry.properties.filter(function(property) { return typeof property === 'string'; });
+      if (actionsMode) {
+        if (typeof entry.description !== 'string' || !Array.isArray(entry.arguments)) { return null; }
+        cleaned.description = entry.description;
+        cleaned.arguments = entry.arguments.filter(function(argument) { return typeof argument === 'string'; });
+      } else {
+        if (!Array.isArray(entry.properties)) { return null; }
+        cleaned.properties = entry.properties.filter(function(property) { return typeof property === 'string'; });
+      }
       return cleaned;
+    }
+
+    function sourceIdentifier(entry) {
+      return actionsMode ? entry.action : entry.item;
     }
 
     function humanize(value) {
       value = String(value).replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
-      return value ? value.charAt(0).toUpperCase() + value.substring(1) : 'Source';
+      return value ? value.charAt(0).toUpperCase() + value.substring(1) : (actionsMode ? 'Action' : 'Source');
     }
 
     function createElement(tag, className, text) {
@@ -94,7 +115,7 @@ module.exports = {
       group.root.setAttribute('data-plugin-group', plugin);
       group.rows = createElement('div', 'plugin-source-rows');
       group.details = createElement('details', 'plugin-source-details');
-      group.details.appendChild(createElement('summary', '', 'Source details'));
+      group.details.appendChild(createElement('summary', '', actionsMode ? 'Action details' : 'Source details'));
       group.detailList = createElement('ul', 'plugin-source-detail-list');
       group.details.appendChild(group.detailList);
       group.root.appendChild(heading);
@@ -113,7 +134,8 @@ module.exports = {
 
     function addAvailableSource(group, source, catalogueIndex) {
       var label = createElement('label', 'plugin-source-row');
-      var title = createElement('span', 'plugin-source-title', humanize(source.item));
+      var identifier = sourceIdentifier(source);
+      var title = createElement('span', 'plugin-source-title', humanize(identifier));
       var switchWrap = createElement('span', 'plugin-source-switch');
       var checkbox = createElement('input');
       var track = createElement('span', 'plugin-source-track');
@@ -121,30 +143,35 @@ module.exports = {
 
       checkbox.type = 'checkbox';
       checkbox.setAttribute('data-plugin-index', String(catalogueIndex));
-      checkbox.setAttribute('aria-label', source.pluginName + ': ' + humanize(source.item));
+      checkbox.setAttribute('aria-label', source.pluginName + ': ' + humanize(identifier));
       checkbox.checked = selected.some(function(choice) { return sameEntry(choice, source); });
       switchWrap.appendChild(checkbox);
       switchWrap.appendChild(track);
       label.appendChild(title);
       label.appendChild(switchWrap);
       group.rows.appendChild(label);
-      addDetail(group, source.category + ' / ' + source.item + ': ' + (source.properties.length ? source.properties.join(', ') : 'No properties listed'), key);
+      if (actionsMode) {
+        addDetail(group, 'Action ID: ' + source.action + '. ' + source.description + ' Arguments: ' + (source.arguments.length ? source.arguments.join(', ') : 'none'), key);
+      } else {
+        addDetail(group, source.category + ' / ' + source.item + ': ' + (source.properties.length ? source.properties.join(', ') : 'No properties listed'), key);
+      }
     }
 
     function addUnavailableSource(group, choice) {
       var row = createElement('div', 'plugin-source-unavailable');
-      var label = createElement('span', 'plugin-source-title', humanize(choice.item));
+      var identifier = sourceIdentifier(choice);
+      var label = createElement('span', 'plugin-source-title', humanize(identifier));
       var remove = createElement('button', 'plugin-source-remove', 'Remove');
       var key = keyFor(choice);
 
       row.setAttribute('data-unavailable-key', key);
       remove.type = 'button';
       remove.setAttribute('data-plugin-remove', key);
-      remove.setAttribute('aria-label', 'Remove unavailable source ' + choice.category + ' / ' + choice.item);
+      remove.setAttribute('aria-label', 'Remove unavailable ' + (actionsMode ? 'action ' + choice.action : 'source ' + choice.category + ' / ' + choice.item));
       row.appendChild(label);
       row.appendChild(remove);
       group.rows.appendChild(row);
-      addDetail(group, choice.category + ' / ' + choice.item + ' (unavailable)', key);
+      addDetail(group, actionsMode ? 'Action ID: ' + choice.action + ' (unavailable)' : choice.category + ' / ' + choice.item + ' (unavailable)', key);
     }
 
     function setExpanded(expanded) {
@@ -165,14 +192,14 @@ module.exports = {
       var status = root.querySelector('[data-plugin-status]');
       var parts = [selected.length + ' of ' + MAX_ENABLED + ' selected.'];
       var catalogueStatus = item.config && item.config.catalogueStatus;
-      var normalStatus = 'Pebble plugin sources available';
+      var normalStatus = actionsMode ? 'Pebble plugin actions available' : 'Pebble plugin sources available';
       if (catalogueStatus === normalStatus) {
         catalogueStatus = '';
       } else if (catalogueStatus && catalogueStatus.indexOf(normalStatus) === 0) {
         catalogueStatus = catalogueStatus.substring(normalStatus.length).replace(/^[\s.;:,\-]+/, '');
       }
       if (catalogueStatus) { parts.push(catalogueStatus); }
-      if (!catalogue.length && !catalogueStatus) { parts.push('Plugin source catalogue unavailable on this phone.'); }
+      if (!catalogue.length && !catalogueStatus) { parts.push(actionsMode ? 'Plugin action catalogue unavailable on this phone.' : 'Plugin source catalogue unavailable on this phone.'); }
       if (message) { parts.push(message); }
       status.textContent = parts.join(' ');
     }
@@ -298,10 +325,12 @@ module.exports = {
       if (event.target.checked && selectedIndex < 0) {
         if (selected.length >= MAX_ENABLED) {
           event.target.checked = false;
-          updateStatus('Maximum of 16 enabled plugin sources reached.');
+          updateStatus('Maximum of 16 enabled plugin ' + (actionsMode ? 'actions' : 'sources') + ' reached.');
           return;
         }
-        selected.push({ plugin: source.plugin, category: source.category, item: source.item });
+        selected.push(actionsMode
+          ? { plugin: source.plugin, action: source.action }
+          : { plugin: source.plugin, category: source.category, item: source.item });
       } else if (!event.target.checked && selectedIndex >= 0) {
         selected.splice(selectedIndex, 1);
       }
