@@ -173,9 +173,10 @@ retain saved selections.
 Actions execute serially. By default, an enabled action executes automatically,
 preserving existing behavior. Turn on its **Ask first** switch to require watch
 approval before each native call. The switch appears only for enabled actions.
-The watch displays plugin, action, and arguments. Press SELECT to confirm, BACK
-to deny, and UP or DOWN to scroll. Approval requests expire after 60 seconds;
-denial, cancellation, timeout, or transport failure means the action is not run.
+The watch displays plugin, action, and arguments as key: value lines. Press
+SELECT to confirm, BACK to deny, and UP or DOWN to scroll when details
+overflow. Approval requests expire after 60 seconds; denial, cancellation,
+timeout, or transport failure means the action is not run.
 Denied actions cannot be requested again during the same model request.
 
 The watch approval inbox is limited to 1,024 bytes. The full approval detail is

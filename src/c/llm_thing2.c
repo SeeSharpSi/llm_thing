@@ -87,6 +87,15 @@
 #define PAST_CHATS_STATUS_SIZE 96
 #define APPROVAL_DETAIL_BUFFER_SIZE (LLM_APPROVAL_DETAIL_MAX_BYTES + 1)
 #define APPROVAL_DETAIL_MEASURE_HEIGHT 16000
+#define APPROVAL_DETAIL_NARROW_WIDTH 180
+#define APPROVAL_HEADER_HEIGHT 30
+#define APPROVAL_HEADER_COMPACT_HEIGHT 24
+#define APPROVAL_FOOTER_MIN_HEIGHT 18
+#define APPROVAL_FOOTER_FONT_KEY FONT_KEY_GOTHIC_14_BOLD
+#define APPROVAL_FOOTER_SINGLE_TEXT "SELECT: Confirm   BACK: Deny"
+#define APPROVAL_FOOTER_MULTI_TEXT "SELECT: Confirm\nBACK: Deny"
+#define APPROVAL_SCROLL_STEP 30
+#define APPROVAL_SCROLL_MIN_HEIGHT 20
 #define APPROVAL_SEND_RETRY_MS 100
 #define APPROVAL_SEND_MAX_ATTEMPTS 3
 
@@ -549,6 +558,32 @@ static void prv_buzz_response_done(void) {
     }
     case 2:
       vibes_short_pulse();
+      return;
+    case 3:
+      vibes_double_pulse();
+      return;
+    default:
+      return;
+  }
+}
+
+static void prv_buzz_input_needed(void) {
+  static const uint32_t light_segments[] = { 60, 80, 60 };
+  static const uint32_t medium_segments[] = { 100, 100, 100 };
+  VibePattern pattern;
+
+  switch (s_buzz_strength) {
+    case 0:
+      return;
+    case 1:
+      pattern.durations = light_segments;
+      pattern.num_segments = 3;
+      vibes_enqueue_custom_pattern(pattern);
+      return;
+    case 2:
+      pattern.durations = medium_segments;
+      pattern.num_segments = 3;
+      vibes_enqueue_custom_pattern(pattern);
       return;
     case 3:
       vibes_double_pulse();
@@ -2556,22 +2591,42 @@ static void prv_approval_back_click(ClickRecognizerRef recognizer, void *context
   prv_approval_choose(false);
 }
 
-static void prv_approval_scroll_up(ClickRecognizerRef recognizer, void *context) {
+static void prv_approval_scroll_by(int32_t delta, bool animated) {
   GPoint offset;
+  GSize content_size;
+  GRect frame;
+  int32_t min_offset;
+  int32_t target;
+
+  if (!s_approval_scroll_layer) return;
+
+  offset = scroll_layer_get_content_offset(s_approval_scroll_layer);
+  content_size = scroll_layer_get_content_size(s_approval_scroll_layer);
+  frame = layer_get_frame(scroll_layer_get_layer(s_approval_scroll_layer));
+  if (content_size.h <= frame.size.h) return;
+  min_offset = frame.size.h - content_size.h;
+  if (min_offset > 0) min_offset = 0;
+
+  target = offset.y + delta;
+  if (target > 0) {
+    target = 0;
+  } else if (target < min_offset) {
+    target = min_offset;
+  }
+
+  scroll_layer_set_content_offset(s_approval_scroll_layer, GPoint(0, (int16_t)target), animated);
+}
+
+static void prv_approval_scroll_up(ClickRecognizerRef recognizer, void *context) {
   (void)recognizer;
   (void)context;
-  if (!s_approval_scroll_layer) return;
-  offset = scroll_layer_get_content_offset(s_approval_scroll_layer);
-  scroll_layer_set_content_offset(s_approval_scroll_layer, GPoint(0, offset.y + 30), true);
+  prv_approval_scroll_by(APPROVAL_SCROLL_STEP, true);
 }
 
 static void prv_approval_scroll_down(ClickRecognizerRef recognizer, void *context) {
-  GPoint offset;
   (void)recognizer;
   (void)context;
-  if (!s_approval_scroll_layer) return;
-  offset = scroll_layer_get_content_offset(s_approval_scroll_layer);
-  scroll_layer_set_content_offset(s_approval_scroll_layer, GPoint(0, offset.y - 30), true);
+  prv_approval_scroll_by(-APPROVAL_SCROLL_STEP, true);
 }
 
 static void prv_approval_click_config(void *context) {
@@ -2584,31 +2639,60 @@ static void prv_approval_click_config(void *context) {
   window_single_click_subscribe(BUTTON_ID_BACK, prv_approval_back_click);
 }
 
+static const char *prv_approval_footer_text(int16_t width) {
+  GFont font = fonts_get_system_font(APPROVAL_FOOTER_FONT_KEY);
+
+  if (prv_measure_text_width(APPROVAL_FOOTER_SINGLE_TEXT, font) <= width) {
+    return APPROVAL_FOOTER_SINGLE_TEXT;
+  }
+  return APPROVAL_FOOTER_MULTI_TEXT;
+}
+
+static int16_t prv_approval_footer_height(const char *text, int16_t width) {
+  GSize size = graphics_text_layout_get_content_size(text,
+      fonts_get_system_font(APPROVAL_FOOTER_FONT_KEY),
+      GRect(0, 0, width, TEXT_MEASURE_HEIGHT),
+      GTextOverflowModeWordWrap, GTextAlignmentCenter);
+
+  return size.h > APPROVAL_FOOTER_MIN_HEIGHT ? size.h : APPROVAL_FOOTER_MIN_HEIGHT;
+}
+
+static GFont prv_approval_detail_font(int16_t width) {
+  return fonts_get_system_font(width < APPROVAL_DETAIL_NARROW_WIDTH ?
+      FONT_KEY_GOTHIC_14 : FONT_KEY_GOTHIC_18);
+}
+
 static void prv_approval_window_load(Window *window) {
   Layer *root = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(root);
   int16_t margin = HOME_CARD_MARGIN;
   int16_t vertical_inset = 0;
-  int16_t header_height = 30;
-  int16_t footer_height = 30;
+  int16_t content_width;
+  int16_t header_height = APPROVAL_HEADER_HEIGHT;
+  int16_t footer_height;
+  const char *footer_text;
   GRect scroll_frame;
   GSize detail_size;
+  bool detail_overflows;
 
 #if defined(PBL_ROUND)
   margin = 14;
   vertical_inset = 16;
 #endif
   if (bounds.size.w < margin * 2 + 20) margin = 2;
-  if (bounds.size.h < header_height + footer_height + 20 + vertical_inset * 2) {
-    header_height = 24;
-    footer_height = 24;
-    if (bounds.size.h < header_height + footer_height + 20 + vertical_inset * 2) {
+  content_width = bounds.size.w - margin * 2;
+  footer_text = prv_approval_footer_text(content_width);
+  footer_height = prv_approval_footer_height(footer_text, content_width);
+  if (bounds.size.h < header_height + footer_height + APPROVAL_SCROLL_MIN_HEIGHT +
+      vertical_inset * 2) {
+    header_height = APPROVAL_HEADER_COMPACT_HEIGHT;
+    if (bounds.size.h < header_height + footer_height + APPROVAL_SCROLL_MIN_HEIGHT +
+        vertical_inset * 2) {
       vertical_inset = 0;
     }
   }
   s_approval_header_layer = text_layer_create(GRect(margin, vertical_inset,
-      bounds.size.w - margin * 2,
-      header_height));
+      content_width, header_height));
   if (!s_approval_header_layer) return;
   text_layer_set_background_color(s_approval_header_layer, GColorClear);
   text_layer_set_text_color(s_approval_header_layer, s_text_color);
@@ -2617,39 +2701,40 @@ static void prv_approval_window_load(Window *window) {
   text_layer_set_text(s_approval_header_layer, "Confirm action");
   layer_add_child(root, text_layer_get_layer(s_approval_header_layer));
 
-  scroll_frame = GRect(margin, vertical_inset + header_height, bounds.size.w - margin * 2,
+  scroll_frame = GRect(margin, vertical_inset + header_height, content_width,
       bounds.size.h - vertical_inset * 2 - header_height - footer_height);
   s_approval_scroll_layer = scroll_layer_create(scroll_frame);
   if (!s_approval_scroll_layer) return;
-  scroll_layer_set_shadow_hidden(s_approval_scroll_layer, true);
   s_approval_detail_layer = text_layer_create(GRect(0, 0, scroll_frame.size.w,
       APPROVAL_DETAIL_MEASURE_HEIGHT));
   if (!s_approval_detail_layer) return;
   text_layer_set_background_color(s_approval_detail_layer, GColorClear);
   text_layer_set_text_color(s_approval_detail_layer, s_text_color);
-  text_layer_set_font(s_approval_detail_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_approval_detail_layer, prv_approval_detail_font(bounds.size.w));
   text_layer_set_overflow_mode(s_approval_detail_layer, GTextOverflowModeWordWrap);
   text_layer_set_text_alignment(s_approval_detail_layer, GTextAlignmentLeft);
   text_layer_set_text(s_approval_detail_layer, s_approval_detail);
   detail_size = text_layer_get_content_size(s_approval_detail_layer);
   if (detail_size.h <= 0 || detail_size.h >= APPROVAL_DETAIL_MEASURE_HEIGHT) return;
-  if (detail_size.h < scroll_frame.size.h) detail_size.h = scroll_frame.size.h;
+  detail_overflows = detail_size.h > scroll_frame.size.h;
+  if (!detail_overflows) detail_size.h = scroll_frame.size.h;
   layer_set_frame(text_layer_get_layer(s_approval_detail_layer),
       GRect(0, 0, scroll_frame.size.w, detail_size.h));
   scroll_layer_add_child(s_approval_scroll_layer, text_layer_get_layer(s_approval_detail_layer));
   scroll_layer_set_content_size(s_approval_scroll_layer,
       GSize(scroll_frame.size.w, detail_size.h));
+  scroll_layer_set_shadow_hidden(s_approval_scroll_layer, !detail_overflows);
   layer_add_child(root, scroll_layer_get_layer(s_approval_scroll_layer));
 
   s_approval_footer_layer = text_layer_create(GRect(margin,
       bounds.size.h - vertical_inset - footer_height,
-      bounds.size.w - margin * 2, footer_height));
+      content_width, footer_height));
   if (!s_approval_footer_layer) return;
   text_layer_set_background_color(s_approval_footer_layer, GColorClear);
   text_layer_set_text_color(s_approval_footer_layer, s_text_color);
-  text_layer_set_font(s_approval_footer_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
+  text_layer_set_font(s_approval_footer_layer, fonts_get_system_font(APPROVAL_FOOTER_FONT_KEY));
   text_layer_set_text_alignment(s_approval_footer_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_approval_footer_layer, "SELECT: Confirm\nBACK: Deny");
+  text_layer_set_text(s_approval_footer_layer, footer_text);
   layer_add_child(root, text_layer_get_layer(s_approval_footer_layer));
   window_set_click_config_provider(window, prv_approval_click_config);
 }
@@ -2893,6 +2978,7 @@ static bool prv_show_approval(uint32_t request_id, uint32_t approval_id,
     prv_approval_choose(false);
     return false;
   }
+  prv_buzz_input_needed();
   return true;
 }
 

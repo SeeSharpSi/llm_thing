@@ -491,12 +491,42 @@ function nextActionApprovalId() {
   return result;
 }
 
-function escapeApprovalJson(value) {
-  return value.replace(/[\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g, function(character) {
-    var hex = character.charCodeAt(0).toString(16);
+function escapeApprovalText(value) {
+  return String(value).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g, function(character) {
+    var hex;
+    if (character === '\n') { return '\\n'; }
+    if (character === '\r') { return '\\r'; }
+    if (character === '\t') { return '\\t'; }
+    hex = character.charCodeAt(0).toString(16);
     while (hex.length < 4) { hex = '0' + hex; }
     return '\\u' + hex;
   });
+}
+
+function approvalArgumentText(value) {
+  var encoded;
+  if (typeof value === 'string') { return escapeApprovalText(value); }
+  if (value === null) { return 'null'; }
+  if (typeof value === 'number' || typeof value === 'boolean') { return String(value); }
+  encoded = JSON.stringify(value);
+  return typeof encoded === 'string' ? escapeApprovalText(encoded) : escapeApprovalText(String(value));
+}
+
+function formatApprovalArguments(args) {
+  var keys;
+  var lines = [];
+  var i;
+  var encoded;
+  if (!args || typeof args !== 'object' || Object.prototype.toString.call(args) === '[object Array]') {
+    encoded = JSON.stringify(args);
+    return 'Arguments:\n' + (typeof encoded === 'string' ? escapeApprovalText(encoded) : '(none)');
+  }
+  keys = Object.keys(args);
+  if (!keys.length) { return 'Arguments:\n(none)'; }
+  for (i = 0; i < keys.length; i += 1) {
+    lines.push(escapeApprovalText(keys[i]) + ': ' + approvalArgumentText(args[keys[i]]));
+  }
+  return 'Arguments:\n' + lines.join('\n');
 }
 
 function dropQueuedApprovalRequest(pending) {
@@ -571,10 +601,10 @@ function requestActionApproval(spec, requestId, callback) {
         !spec.plugin || !spec.pluginName || !spec.action) { throw new Error('invalid approval identity'); }
     argsJson = JSON.stringify(spec.args);
     if (typeof argsJson !== 'string') { throw new Error('arguments are not JSON'); }
-    detail = 'Plugin: ' + escapeApprovalJson(JSON.stringify(spec.pluginName)) +
-      '\nAction: ' + escapeApprovalJson(JSON.stringify(spec.action)) +
-      '\nArguments: ' + escapeApprovalJson(argsJson) +
-      '\nPlugin UUID: ' + escapeApprovalJson(JSON.stringify(spec.plugin));
+    detail = 'Plugin: ' + escapeApprovalText(spec.pluginName) +
+      '\nAction: ' + escapeApprovalText(spec.action) +
+      '\n' + formatApprovalArguments(spec.args) +
+      '\n\nPlugin UUID: ' + escapeApprovalText(spec.plugin);
     if (detail.indexOf('\u0000') !== -1) { throw new Error('NUL in approval detail'); }
     bytes = nextUtf8Chunk(detail, 0, ACTION_APPROVAL_DETAIL_MAX_BYTES);
     if (bytes.end !== detail.length || bytes.bytes > ACTION_APPROVAL_DETAIL_MAX_BYTES) {

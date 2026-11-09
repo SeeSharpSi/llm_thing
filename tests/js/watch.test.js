@@ -38,6 +38,8 @@ test('action approval sends scoped prompt and accepts only matching numeric deci
   assert.ok(prompt.ApprovalDetail.indexOf('Action:') < prompt.ApprovalDetail.indexOf('Arguments:'));
   assert.ok(prompt.ApprovalDetail.indexOf('Arguments:') < prompt.ApprovalDetail.indexOf('Plugin UUID:'));
   assert.match(prompt.ApprovalDetail, /Plugin UUID:/);
+  assert.match(prompt.ApprovalDetail, /Plugin: Fixture\nAction: setMode\nArguments:\nmode: on\n/);
+  assert.equal(prompt.ApprovalDetail.indexOf('{"mode":"on"}'), -1, 'raw JSON arguments are not shown');
   assert.equal(watch.handleActionApprovalResponse({ ApprovalId: prompt.ApprovalId, ApprovalDecision: 1 }), false, 'missing RequestId rejected');
   assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId, ApprovalDecision: '1' }), false, 'string allow rejected');
   assert.equal(watch.handleActionApprovalResponse({ RequestId: 501, ApprovalId: prompt.ApprovalId + 1, ApprovalDecision: 1 }), false, 'mismatched ID rejected');
@@ -59,6 +61,41 @@ test('action approval sends scoped prompt and accepts only matching numeric deci
     assert.match(error, /stale; action was not run/);
     assert.equal(global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).length, count);
   });
+});
+
+test('approval detail formats arguments as safe key value lines', function() {
+  var watch = freshWatch();
+  var values = [];
+  watch.beginRequestLifecycle(511);
+  watch.requestActionApproval({
+    plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab',
+    pluginName: 'Calendar',
+    action: 'create_event',
+    args: {
+      title: 'Lunch',
+      starts_at: '2026-11-10T12:00:00Z',
+      all_day: false,
+      reminder_minutes: 15,
+      options: { calendar: 'work', notify: true },
+      tags: ['meal', 'work'],
+      note: 'line\nbreak\u202e',
+      optional: null
+    }
+  }, 511, function() {});
+  values.push(global.Pebble.messages[0].ApprovalDetail);
+  assert.match(values[0], /Arguments:\ntitle: Lunch\nstarts_at: 2026-11-10T12:00:00Z\nall_day: false\nreminder_minutes: 15\n/);
+  assert.match(values[0], /options: \{"calendar":"work","notify":true\}\n/);
+  assert.match(values[0], /tags: \["meal","work"\]\n/);
+  assert.match(values[0], /note: line\\nbreak\\u202e\n/);
+  assert.match(values[0], /optional: null\n/);
+  assert.equal(values[0].indexOf('{"title"'), -1, 'top-level arguments are not raw JSON');
+  watch.handleActionApprovalResponse({ RequestId: 511, ApprovalId: global.Pebble.messages[0].ApprovalId, ApprovalDecision: 0 });
+
+  watch.requestActionApproval({ plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', pluginName: 'Calendar', action: 'list_events', args: {} }, 511, function() {});
+  values.push(global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0].ApprovalDetail);
+  assert.match(values[1], /Arguments:\n\(none\)\n\nPlugin UUID:/);
+  watch.handleActionApprovalResponse({ RequestId: 511, ApprovalId: global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0].ApprovalId, ApprovalDecision: 0 });
+  watch.finishRequestLifecycle(511);
 });
 
 test('approval denial, timeout, send exhaustion, and lifecycle cancellation settle fail closed', function() {
@@ -108,14 +145,14 @@ test('approval denial, timeout, send exhaustion, and lifecycle cancellation sett
 test('approval detail enforces exact UTF-8 byte limit and escapes display controls without changing input', function() {
   var watch = freshWatch();
   watch.beginRequestLifecycle(503);
-  var prefix = 'Plugin: "Fixture"\nAction: "setMode"\nArguments: ';
-  var suffix = '\nPlugin UUID: "abcdefab-cdef-abcd-efab-cdefabcdefab"';
-  var valueLength = 600 - prefix.length - '{"x":""}'.length - suffix.length;
+  var prefix = 'Plugin: Fixture\nAction: setMode\nArguments:\n';
+  var suffix = '\n\nPlugin UUID: abcdefab-cdef-abcd-efab-cdefabcdefab';
+  var valueLength = 600 - prefix.length - 'x: '.length - suffix.length;
   var result;
   watch.requestActionApproval(approvalSpec({ x: new Array(valueLength + 1).join('x') }), 503, function(error, approved) { result = [error, approved]; });
   assert.equal(global.Pebble.messages[0].ApprovalDetail.length, 600, '600-byte ASCII detail accepted');
   var firstPrompt = global.Pebble.messages[0];
-  assert.match(firstPrompt.ApprovalDetail, /Arguments: \{"x":"x+/);
+  assert.match(firstPrompt.ApprovalDetail, /Arguments:\nx: x+/);
   assert.ok(firstPrompt.ApprovalDetail.indexOf('Arguments:') < firstPrompt.ApprovalDetail.indexOf('Plugin UUID:'));
   watch.handleActionApprovalResponse({ RequestId: 503, ApprovalId: firstPrompt.ApprovalId, ApprovalDecision: 0 });
   var tooLong = { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', pluginName: 'Fixture', action: 'setMode', args: { x: new Array(valueLength + 2).join('x') } };
@@ -128,15 +165,15 @@ test('approval detail enforces exact UTF-8 byte limit and escapes display contro
 
   var quotedValue = new Array(20).join('"') + new Array(181).join('\\');
   var quoteDetail = function(value) {
-    return prefix + JSON.stringify({ x: value }) + suffix;
+    return prefix + 'x: ' + value + suffix;
   };
   while (quoteDetail(quotedValue).length < 600) { quotedValue += 'x'; }
   assert.equal(quoteDetail(quotedValue).length, 600);
   watch.requestActionApproval(approvalSpec({ x: quotedValue }), 503, function(error) { result = [error, false]; });
   var quotedPrompt = global.Pebble.messages.filter(function(message) { return message.ApprovalRequest === 1; }).slice(-1)[0];
   assert.ok(quotedPrompt, '600-byte detail with quotes and backslashes accepted');
-  assert.ok(JSON.stringify(quotedPrompt).length > 1024, 'JSON envelope expansion exceeds old false limit');
-  assert.ok(quotedPrompt.ApprovalDetail.indexOf(JSON.stringify({ x: quotedValue })) !== -1, 'full quoted argument represented');
+  assert.ok(JSON.stringify(quotedPrompt).length > quotedPrompt.ApprovalDetail.length + 150, 'JSON envelope expansion is bounded separately');
+  assert.ok(quotedPrompt.ApprovalDetail.indexOf('x: ' + quotedValue) !== -1, 'full quoted argument represented');
   watch.handleActionApprovalResponse({ RequestId: 503, ApprovalId: quotedPrompt.ApprovalId, ApprovalDecision: 0 });
 
   var hostileName = 'name\u202e\u0001\ud800';

@@ -617,7 +617,8 @@ test('confirmed action waits for exact watch approval, ignores malformed decisio
   assert.ok(approval.ApprovalDetail.indexOf(uuid) !== -1, 'approval shows complete plugin UUID');
   assert.ok(approval.ApprovalDetail.indexOf('Living Lights') !== -1, 'approval shows plugin name');
   assert.ok(approval.ApprovalDetail.indexOf('set_light') !== -1, 'approval shows exact action name');
-  assert.ok(approval.ApprovalDetail.indexOf(JSON.stringify(args)) !== -1, 'approval shows complete JSON arguments');
+  assert.match(approval.ApprovalDetail, /Arguments:\nitem: light\ninstanceId: living-room\non: false\nfadeMs: 0\n/);
+  assert.equal(approval.ApprovalDetail.indexOf(JSON.stringify(args)), -1, 'approval does not show raw JSON arguments');
   assert.equal(pebble.actionInvocations.length, 0, 'confirmation blocks native invocation');
   assert.ok(timers.activeDelays().indexOf(60000) !== -1, 'approval waits with bounded 60-second timeout');
 
