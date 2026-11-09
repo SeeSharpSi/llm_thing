@@ -45,6 +45,7 @@ function clayCustomFn() {
       'GeolocationToolEnabled',
       'TimelineToolEnabled',
       'HealthToolEnabled',
+      'SleepToolEnabled',
       'PebbleMemoryToolEnabled',
       'MaxToolCalls'
     ];

@@ -20,6 +20,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.ok(!('ConfigAction' in settings.DEFAULT_SETTINGS));
   assert.equal(settings.DEFAULT_SETTINGS.PreserveChats, false);
   assert.equal(settings.DEFAULT_SETTINGS.PebbleMemoryToolEnabled, false);
+  assert.equal(settings.DEFAULT_SETTINGS.SleepToolEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.SpeakerFeedbackEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
   assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
@@ -31,6 +32,7 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
     ShowThinking: { value: '1' },
     PreserveChats: 1,
     TimelineToolEnabled: 'true',
+    SleepToolEnabled: 1,
     PebbleMemoryToolEnabled: 1,
     SpeakerFeedbackEnabled: { value: '1' },
     TouchScrollEnabled: 0,
@@ -41,6 +43,7 @@ test('extend applies defaults, unwraps Clay values, and normalizes toggles', fun
   assert.equal(result.ShowThinking, true);
   assert.equal(result.PreserveChats, true);
   assert.equal(result.TimelineToolEnabled, false);
+  assert.equal(result.SleepToolEnabled, true);
   assert.equal(result.PebbleMemoryToolEnabled, true);
   assert.equal(result.SpeakerFeedbackEnabled, true);
   assert.equal(result.TouchScrollEnabled, false);

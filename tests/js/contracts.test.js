@@ -164,6 +164,17 @@ test('Health Info setting and watch protocol are declared consistently', functio
   assert.equal(keys.indexOf('HealthIncludeHeartRate'), -1);
 });
 
+test('Sleep Tool setting is declared as a default-off built-in toggle', function() {
+  var sleepItem = configItems(config).filter(function(item) {
+    return item.messageKey === 'SleepToolEnabled';
+  })[0];
+
+  assert.ok(sleepItem);
+  assert.equal(sleepItem.type, 'toggle');
+  assert.equal(sleepItem.label, 'Sleep Tool');
+  assert.equal(sleepItem.defaultValue, false);
+});
+
 test('Pebble Memory is disabled by default and follows plugin sources and actions', function() {
   var configured = configItems(config);
   var toggle = configured.filter(function(item) {
@@ -229,8 +240,10 @@ test('Plugin Actions is independent and default-off with phone-only persistence'
   assert.ok(packageJson.pebble.messageKeys.indexOf('PluginActionsJson') !== -1);
 });
 
-test('plugin approval protocol keys append without adding approval settings', function() {
+test('plugin approval protocol keys stay ordered without adding approval settings', function() {
   var keys = packageJson.pebble.messageKeys;
+  var pluginActionsIndex = keys.indexOf('PluginActionsJson');
+  var approvalStart = keys.indexOf('ApprovalRequest');
   var approvalKeys = [
     'PluginActionsJson',
     'ApprovalRequest',
@@ -241,7 +254,9 @@ test('plugin approval protocol keys append without adding approval settings', fu
     'ApprovalCancel'
   ];
 
-  assert.deepEqual(keys.slice(-approvalKeys.length), approvalKeys);
+  assert.ok(pluginActionsIndex !== -1);
+  assert.ok(approvalStart > pluginActionsIndex);
+  assert.deepEqual(keys.slice(approvalStart, approvalStart + approvalKeys.length - 1), approvalKeys.slice(1));
   assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
   assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
   approvalKeys.slice(1).forEach(function(key) {

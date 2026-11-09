@@ -221,6 +221,13 @@ module.exports = [
       },
       {
         "type": "toggle",
+        "messageKey": "SleepToolEnabled",
+        "label": "Sleep Tool",
+        "description": "Allow the model to wait a requested number of milliseconds, up to 60 seconds per call, before continuing.",
+        "defaultValue": false
+      },
+      {
+        "type": "toggle",
         "messageKey": "PebbleMemoryToolEnabled",
         "label": "Pebble Memory",
         "description": "Allow the model to save, search, and delete short intentional notes stored on this phone.",

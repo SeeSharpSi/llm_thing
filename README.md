@@ -97,6 +97,8 @@ shape:
   remains controlled separately.
 - Web Fetch exposes phone-side `web_fetch` for bounded HTTP(S) page reading.
   It returns normalized Markdown by character offset and limit.
+- Sleep exposes phone-side `sleep` for bounded waits of up to 60 seconds per
+  call, useful when a task needs time to finish before the next tool call.
 
 Requests are single-shot; streaming is not used. Model network errors,
 timeouts, HTTP 408, HTTP 429, and HTTP 5xx responses are retried once as
@@ -135,16 +137,16 @@ limits are explicitly shortened with `titleTruncated` or `timeTruncated`.
 
 Enabled phone tools execute automatically without confirmation prompts, except
 plugin actions configured to ask first.
-Geolocation, Timeline, Health, and each MCP server remain disabled until enabled
-in settings. Plugin sources and actions are independently opt-in. Sources are
-selected by plugin UUID, category, and item. Actions are selected by plugin UUID
-and action name. Use each MCP server's allowed-tool list and per-request call
-limit to constrain automatic execution.
+Web Fetch, Geolocation, Timeline, Health, Sleep, Pebble Memory, and each MCP
+server remain disabled until enabled in settings. Plugin sources and actions
+are independently opt-in. Sources are selected by plugin UUID, category, and
+item. Actions are selected by plugin UUID and action name. Use each MCP server's
+allowed-tool list and per-request call limit to constrain automatic execution.
 
 Within one model tool batch, independent built-in `web_fetch` reads run with a
 maximum concurrency of two. Results retain model call order. Every other tool,
-including MCP, memory, geolocation, Timeline, Health, and plugin sources, stays
-serial; each serial call forms a barrier before later reads start.
+including MCP, memory, sleep, geolocation, Timeline, Health, and plugin sources,
+stays serial; each serial call forms a barrier before later reads start.
 
 ### Pebble plugins
 

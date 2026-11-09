@@ -608,6 +608,88 @@ test('web_fetch rejects malformed and private URLs before creating a request', f
   assert.match(results[1].error, /valid HTTP\(S\)/);
 });
 
+test('SleepToolEnabled discovers a bounded sleep tool that waits for requested milliseconds', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var definitions;
+  var toolMap;
+  var results;
+
+  try {
+    harness.tools.discoverPhoneTools({ McpServersJson: '[]', SleepToolEnabled: true }, 130, function(error, found, map) {
+      assert.ifError(error);
+      definitions = found;
+      toolMap = map;
+    });
+
+    assert.equal(definitions.length, 1);
+    assert.equal(definitions[0].name, 'sleep');
+    assert.deepEqual(definitions[0].parameters.required, ['milliseconds']);
+    assert.equal(definitions[0].parameters.properties.milliseconds.maximum, 60000);
+
+    harness.tools.runToolCalls(130, [{ id: 'sleep', name: 'sleep', arguments: { milliseconds: 2500 } }], toolMap, function(value) { results = value; });
+    assert.equal(timers.timers.length, 1);
+    assert.equal(timers.timers[0].delay, 2500);
+    assert.equal(results, undefined);
+
+    timers.runAll();
+    assert.equal(results[0].error, undefined);
+    assert.deepEqual(JSON.parse(results[0].result), { status: 'slept', milliseconds: 2500 });
+    assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'done' && event[1] === 'Sleep'; }));
+  } finally {
+    timers.restore();
+  }
+});
+
+test('sleep rejects missing, fractional, and out-of-range durations without waiting', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var toolMap;
+  var results;
+
+  try {
+    harness.tools.discoverPhoneTools({ McpServersJson: '[]', SleepToolEnabled: true }, 131, function(error, definitions, map) {
+      assert.ifError(error);
+      toolMap = map;
+    });
+    harness.tools.runToolCalls(131, [
+      { id: 'missing', name: 'sleep', arguments: {} },
+      { id: 'fractional', name: 'sleep', arguments: { milliseconds: 1.5 } },
+      { id: 'negative', name: 'sleep', arguments: { milliseconds: -1 } },
+      { id: 'too-long', name: 'sleep', arguments: { milliseconds: 60001 } }
+    ], toolMap, function(value) { results = value; });
+
+    assert.equal(timers.timers.length, 0);
+    assert.match(results[0].error, /milliseconds/);
+    assert.match(results[1].error, /milliseconds must be an integer/);
+    assert.match(results[2].error, /0 or greater/);
+    assert.match(results[3].error, /60000 or less/);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('sleep suppresses its result after the request is superseded', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var toolMap;
+  var results;
+
+  try {
+    harness.tools.discoverPhoneTools({ McpServersJson: '[]', SleepToolEnabled: true }, 132, function(error, definitions, map) {
+      assert.ifError(error);
+      toolMap = map;
+    });
+    harness.tools.runToolCalls(132, [{ id: 'sleep', name: 'sleep', arguments: { milliseconds: 1000 } }], toolMap, function(value) { results = value; });
+    harness.watch.isCurrentRequest = function() { return false; };
+    timers.runAll();
+
+    assert.equal(results, undefined);
+  } finally {
+    timers.restore();
+  }
+});
+
 test('plugin source builtin integrates schema, progress, execution, and request cancellation', function() {
   var harness = createHarness();
   var sourceRequest;

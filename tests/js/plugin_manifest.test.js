@@ -8,8 +8,8 @@ test('plugin consumer declares required permissions and persisted message key', 
   var messageKeys = packageJson.pebble.messageKeys;
   var pluginSourcesIndex = messageKeys.indexOf('PluginSourcesJson');
   var pluginActionsIndex = messageKeys.indexOf('PluginActionsJson');
+  var approvalStart = messageKeys.indexOf('ApprovalRequest');
   var approvalKeys = [
-    'PluginActionsJson',
     'ApprovalRequest',
     'ApprovalId',
     'ApprovalTitle',
@@ -28,5 +28,6 @@ test('plugin consumer declares required permissions and persisted message key', 
   ]);
   assert.notEqual(pluginSourcesIndex, -1, 'PluginSourcesJson must remain declared');
   assert.ok(pluginSourcesIndex < pluginActionsIndex, 'PluginActionsJson must follow PluginSourcesJson');
-  assert.deepEqual(messageKeys.slice(-approvalKeys.length), approvalKeys);
+  assert.ok(approvalStart > pluginActionsIndex, 'approval keys must follow PluginActionsJson');
+  assert.deepEqual(messageKeys.slice(approvalStart, approvalStart + approvalKeys.length), approvalKeys);
 });

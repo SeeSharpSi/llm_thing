@@ -337,7 +337,7 @@ test('Reset Watch Display restores Response Sound default to disabled', function
   assert.equal(values.SpeakerFeedbackEnabled, false);
 });
 
-test('after build appends the six built-in tool roots into the expander', function() {
+test('after build appends the seven built-in tool roots into the expander', function() {
   var harness = createHarness();
   var afterBuild;
   var appended = [];
@@ -347,6 +347,7 @@ test('after build appends the six built-in tool roots into the expander', functi
     'GeolocationToolEnabled',
     'TimelineToolEnabled',
     'HealthToolEnabled',
+    'SleepToolEnabled',
     'PebbleMemoryToolEnabled',
     'MaxToolCalls'
   ];

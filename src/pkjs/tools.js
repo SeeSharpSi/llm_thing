@@ -3464,6 +3464,15 @@ function callMemoryDeleteBuiltin(args, requestId, callback) {
   callback(null, JSON.stringify({ status: 'deleted', id: id }));
 }
 
+function callSleepBuiltin(args, requestId, callback) {
+  var milliseconds = args && typeof args.milliseconds === 'number' ? args.milliseconds : 0;
+
+  setTimeout(function() {
+    if (!watch.isCurrentRequest(requestId)) { return; }
+    callback(null, JSON.stringify({ status: 'slept', milliseconds: milliseconds }));
+  }, milliseconds);
+}
+
 function addBuiltinTool(tools, toolMap, definition) {
   var baseName = definition.name;
   var exposedName = baseName;
@@ -3554,6 +3563,22 @@ function addBuiltinTools(settings, tools, toolMap) {
         }
       },
       call: function(args, requestId, callback) { webFetch.fetch(args, requestId, watch, callback); }
+    });
+  }
+  if (settings.SleepToolEnabled) {
+    addBuiltinTool(tools, toolMap, {
+      name: 'sleep',
+      label: 'Sleep',
+      description: 'Wait for the requested number of milliseconds before continuing. Use when a task needs time to finish or the user asks to wait. Maximum 60000 milliseconds per call.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['milliseconds'],
+        properties: {
+          milliseconds: { type: 'integer', minimum: 0, maximum: 60000, description: 'Wait duration in milliseconds, from 0 to 60000.' }
+        }
+      },
+      call: callSleepBuiltin
     });
   }
   if (settings.GeolocationToolEnabled) {
