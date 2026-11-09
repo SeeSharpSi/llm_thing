@@ -436,7 +436,7 @@ function getTools(settings) {
           (requiresConfirmation ? 'Requires watch approval before execution. ' : '') + selected.modelDescription;
         tools.push({
           name: definitionName(selected, used),
-          label: 'Plugin action: ' + selected.pluginName + ' / ' + selected.action,
+          label: selected.pluginName + ' / ' + selected.action,
           description: boundedText(description, MAX_MODEL_DESCRIPTION),
           parameters: selected.parameters,
           validate: validate,

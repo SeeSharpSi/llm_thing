@@ -636,6 +636,7 @@ test('plugin source builtin integrates schema, progress, execution, and request 
   assert.match(sourceTool.description, /properties filter/);
   harness.tools.runToolCalls(99, [{ id: 'source-call', name: sourceTool.name, arguments: {} }], toolMap, function(results) { result = results; });
   assert.equal(harness.watch.progress[0][0], 'start');
+  assert.equal(harness.watch.progress[0][1], 'Fixture / current');
   sourceRequest.onData({ pluginUuid: '00000000-0000-0000-0001-000000000007', instances: [{ instanceId: 'phone', properties: { value: { shortText: { text: 'ready' } } } }] });
   assert.equal(JSON.parse(result[0].result).instances[0].properties.value.shortText.text, 'ready');
   assert.equal(result[0]._structuredResult, true);
@@ -688,7 +689,7 @@ test('plugin action builtin uses plugin schema validator, serial progress, and s
   harness.tools.runToolCalls(120, [{ id: 'valid', name: actionDefinition.name, arguments: { mode: 'scheduled', count: 0, target: 'private-target' } }], toolMap, function(value) { results = value; });
   assert.equal(invocations.length, 1);
   assert.deepEqual(invocations[0], { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', args: { mode: 'scheduled', count: 0, target: 'private-target' } });
-  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'start' && event[1] === 'Plugin action: Action only / configure' && event[2] === 'checking action request'; }));
+  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'start' && event[1] === 'Action only / configure' && event[2] === 'checking action request'; }));
   resolveAction({ ok: true, text: 'done' });
   assert.deepEqual(JSON.parse(results[0].result), { ok: true, pluginUuid: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', text: 'done' });
   assert.equal(results[0]._structuredResult, true);

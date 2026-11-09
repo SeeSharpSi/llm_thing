@@ -221,7 +221,7 @@ function getTools(settings) {
     if (!match) { continue; }
     (function(selected) {
       tools.push({
-        name: definitionName(selected, used), label: 'Plugin: ' + selected.pluginName,
+        name: definitionName(selected, used), label: selected.pluginName + ' / ' + selected.item,
         description: 'Read current data from installed Pebble plugin ' + selected.pluginName + ' (' + selected.category + '/' + selected.item + '). Read-only. Properties: ' + selected.properties.join(', ') + '. Results page instances (default 16); use nextOffset while hasMore is true. Use properties filter to recover from truncation.',
         parameters: sourceSchema(selected),
         call: function(args, requestId, callback) { callSource(selected, args, requestId, callback); }
