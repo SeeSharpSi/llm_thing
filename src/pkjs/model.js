@@ -2521,7 +2521,7 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
     conversation[0].content = buildSystemPrompt(settings,
         buildToolInstructions(toolDefinitions, settings.MaxToolCalls, true));
   }
-  watch.progressSet(requestId, 'thinking', 'tool call limit reached');
+  watch.progressSet(requestId, 'Writing reply', 'tool call limit reached');
   setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
   requestModel(settings, conversation, requestId, {}, function(error, json) {
     var batch;
@@ -2554,7 +2554,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
   remainingToolResultChars = typeof remainingToolResultChars === 'number' ? remainingToolResultChars : MAX_TOOL_RESULTS_TOTAL_CHARS;
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
-  watch.progressSet(requestId, 'thinking', round === 0 ? completionContext.mcpUnavailableDetail || '' : 'with tool results');
+  watch.progressSet(requestId, 'Writing reply', round === 0 ? completionContext.mcpUnavailableDetail || '' : 'with tool results');
   setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
@@ -2677,7 +2677,7 @@ function startCompletion(context, settings) {
   var toolInstructions;
 
   common.logDebug('request start id=' + requestId + ' textChars=' + String(userText || '').length + ' endpoint=' + settings.Endpoint + ' model=' + settings.Model + ' maxToolCalls=' + settings.MaxToolCalls + ' preserveChats=' + (settings.PreserveChats ? '1' : '0') + ' geoTool=' + settings.GeolocationToolEnabled + ' timelineTool=' + settings.TimelineToolEnabled + ' healthTool=' + settings.HealthToolEnabled + ' history=' + context.historyAtStart.length);
-  watch.progressStart(requestId, 'thinking', '');
+  watch.progressStart(requestId, 'Working', '');
 
   if (!settings.Endpoint) {
     context.retryKind = 'setup';
@@ -2702,7 +2702,7 @@ function startCompletion(context, settings) {
     return;
   }
 
-  watch.progressSet(requestId, 'Loading tools', 'discovering phone tools');
+  watch.progressSet(requestId, 'Finding tools', '');
   context.discoveryPending = true;
   tools.discoverPhoneTools(settings, requestId, function(error, discoveredTools, toolMap, unavailableServers) {
     var mode;
@@ -2902,7 +2902,7 @@ function retryCompletion(requestId, failedRequestId) {
     appendRecoveryInstruction(conversation, settings);
     setModelRetryState(context, settings, conversation, capsule.mode, capsule.thinkingTrace,
         capsule.conversation);
-    watch.progressStart(requestId, 'thinking', 'summarizing recorded tool results');
+    watch.progressStart(requestId, 'Writing reply', 'summarizing recorded tool results');
     requestModel(settings, conversation, requestId, {}, function(error, json) {
       var batch;
       var answer;

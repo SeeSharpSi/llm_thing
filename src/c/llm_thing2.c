@@ -64,15 +64,14 @@
 #define PROGRESS_CONTEXT_HEIGHT 18
 #define PROGRESS_CONTEXT_SIDE_PADDING 2
 #define REQUEST_ELAPSED_BUFFER_SIZE 32
-#define PROGRESS_DISPLAY_BUFFER_SIZE (PROGRESS_DETAIL_BUFFER_SIZE + REQUEST_ELAPSED_BUFFER_SIZE + 16)
 #define PROGRESS_TEXT_SIDE_PADDING 6
 #define PROGRESS_TEXT_GAP 4
 #define PROGRESS_TITLE_MIN_HEIGHT 32
 #define PROGRESS_TITLE_MAX_HEIGHT 60
 #define PROGRESS_DETAIL_MIN_HEIGHT 22
 #define PROGRESS_DETAIL_MAX_HEIGHT 72
-// Elapsed line plus up to two wrapped tool-detail lines: min(MAX, 3 * MIN).
-#define PROGRESS_DETAIL_RESERVED_HEIGHT 66
+// Up to two wrapped detail lines; timer height is reserved separately.
+#define PROGRESS_DETAIL_RESERVED_HEIGHT (PROGRESS_DETAIL_MIN_HEIGHT * 2)
 #define PROGRESS_DETAIL_FONT_KEY FONT_KEY_GOTHIC_18_BOLD
 #define PROGRESS_HISTORY_MAX_HEIGHT 240
 #define HOME_CARD_MARGIN 8
@@ -163,6 +162,9 @@ static Layer *s_progress_layer;
 static TextLayer *s_progress_history_layer;
 static TextLayer *s_progress_title_layer;
 static TextLayer *s_progress_detail_layer;
+#if defined(PBL_MICROPHONE)
+static TextLayer *s_progress_timer_layer;
+#endif
 static TextLayer *s_progress_input_context_layer;
 static TextLayer *s_progress_output_context_layer;
 static Layer *s_progress_loading_layer;
@@ -213,7 +215,6 @@ static int32_t s_latest_prompt_y;
 #if defined(PBL_MICROPHONE)
 static uint16_t s_past_chat_count;
 static char s_request_elapsed[REQUEST_ELAPSED_BUFFER_SIZE];
-static char s_progress_display[PROGRESS_DISPLAY_BUFFER_SIZE];
 static int16_t s_progress_detail_first_line_height;
 static int16_t s_progress_detail_line_pitch;
 static uint32_t s_request_started_at;
@@ -621,6 +622,11 @@ static void prv_apply_settings_visuals(const WatchSettingsDirty *dirty) {
     if (s_progress_detail_layer) {
       text_layer_set_text_color(s_progress_detail_layer, s_text_color);
     }
+#if defined(PBL_MICROPHONE)
+    if (s_progress_timer_layer) {
+      text_layer_set_text_color(s_progress_timer_layer, s_text_color);
+    }
+#endif
     if (s_progress_history_layer) {
       text_layer_set_text_color(s_progress_history_layer, s_text_color);
     }
@@ -1296,12 +1302,12 @@ static void prv_update_progress_text(void) {
   int16_t history_height = 0;
   int16_t title_height;
   int16_t detail_height = 0;
+  int16_t timer_height = 0;
   int16_t title_y;
   int16_t detail_available;
   int16_t max_y;
-  const char *detail_text = s_progress_detail;
 #if defined(PBL_MICROPHONE)
-  bool detail_whole_lines = false;
+  bool timer_visible = false;
 #endif
 
   if (s_progress_history_layer) {
@@ -1323,8 +1329,25 @@ static void prv_update_progress_text(void) {
     history_height = prv_clamp_int16(text_layer_get_content_size(s_progress_history_layer).h, PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_HISTORY_MAX_HEIGHT);
   }
 
+#if defined(PBL_MICROPHONE)
+  timer_visible = s_request_active && s_request_elapsed[0] != '\0';
+  if (s_progress_timer_layer) {
+    text_layer_set_size(s_progress_timer_layer, GSize(s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
+    text_layer_set_text(s_progress_timer_layer, s_request_elapsed);
+    if (timer_visible) {
+      timer_height = prv_clamp_int16(text_layer_get_content_size(s_progress_timer_layer).h,
+          PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
+    }
+  }
+#endif
+
   title_y = (s_progress_height - title_height) / 2;
   max_y = s_progress_height - PROGRESS_LOADING_HEIGHT - title_height;
+#if defined(PBL_MICROPHONE)
+  if (timer_height > 0) {
+    max_y -= PROGRESS_TEXT_GAP + timer_height;
+  }
+#endif
   if (max_y < 0) {
     max_y = 0;
   }
@@ -1337,9 +1360,12 @@ static void prv_update_progress_text(void) {
 
 #if defined(PBL_MICROPHONE)
   if (s_request_active && s_progress_detail[0] != '\0') {
-    // Keep elapsed visible and reserve up to two wrapped detail lines for tool output.
+    // Keep up to two wrapped detail lines and the timer above the loading bar.
     int16_t reserved_title_y = s_progress_height - PROGRESS_LOADING_HEIGHT -
         PROGRESS_TEXT_GAP - title_height - PROGRESS_DETAIL_RESERVED_HEIGHT;
+    if (timer_height > 0) {
+      reserved_title_y -= PROGRESS_TEXT_GAP + timer_height;
+    }
     if (reserved_title_y < 0) {
       reserved_title_y = 0;
     }
@@ -1350,36 +1376,25 @@ static void prv_update_progress_text(void) {
 #endif
 
   detail_available = s_progress_height - PROGRESS_LOADING_HEIGHT - (title_y + title_height + PROGRESS_TEXT_GAP);
-
 #if defined(PBL_MICROPHONE)
-  if (s_request_active && s_request_elapsed[0] != '\0') {
-    if (s_progress_detail[0] == '\0') {
-      snprintf(s_progress_display, sizeof(s_progress_display), "%s", s_request_elapsed);
-    } else if (detail_available >= (PROGRESS_DETAIL_MIN_HEIGHT * 2)) {
-      // Reserve the elapsed/cancel line above wrapped tool detail.
-      snprintf(s_progress_display, sizeof(s_progress_display), "%s\n%s",
-          s_request_elapsed, s_progress_detail);
-    } else {
-      // One line only: keep elapsed/cancel visible and ellipsize tool detail.
-      snprintf(s_progress_display, sizeof(s_progress_display), "%s | %s",
-          s_request_elapsed, s_progress_detail);
-      text_layer_set_overflow_mode(s_progress_detail_layer, GTextOverflowModeTrailingEllipsis);
-    }
-    detail_text = s_progress_display;
-    detail_whole_lines = true;
+  if (timer_height > 0) {
+    detail_available -= PROGRESS_TEXT_GAP + timer_height;
   }
 #endif
+  if (detail_available < 0) {
+    detail_available = 0;
+  }
 
   text_layer_set_size(s_progress_detail_layer, GSize(s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
-  text_layer_set_text(s_progress_detail_layer, detail_text);
-  if (detail_text[0] != '\0' && detail_available >= PROGRESS_DETAIL_MIN_HEIGHT) {
+  text_layer_set_text(s_progress_detail_layer, s_progress_detail);
+  if (s_progress_detail[0] != '\0' && detail_available >= PROGRESS_DETAIL_MIN_HEIGHT) {
     detail_height = prv_clamp_int16(text_layer_get_content_size(s_progress_detail_layer).h,
         PROGRESS_DETAIL_MIN_HEIGHT, PROGRESS_DETAIL_MAX_HEIGHT);
     if (detail_height > detail_available) {
       detail_height = detail_available;
     }
 #if defined(PBL_MICROPHONE)
-    if (detail_whole_lines) {
+    if (s_request_active) {
       int16_t line_limit = detail_available < PROGRESS_DETAIL_MAX_HEIGHT ?
           detail_available : PROGRESS_DETAIL_MAX_HEIGHT;
       int16_t line_cap = prv_progress_detail_line_cap(line_limit);
@@ -1401,6 +1416,20 @@ static void prv_update_progress_text(void) {
   if (detail_height) {
     layer_set_frame(text_layer_get_layer(s_progress_detail_layer), GRect(PROGRESS_TEXT_SIDE_PADDING, title_y + title_height + PROGRESS_TEXT_GAP, s_progress_width, detail_height));
   }
+#if defined(PBL_MICROPHONE)
+  if (s_progress_timer_layer) {
+    int16_t timer_y = title_y + title_height + PROGRESS_TEXT_GAP;
+
+    layer_set_hidden(text_layer_get_layer(s_progress_timer_layer), !timer_visible);
+    if (timer_visible) {
+      if (detail_height) {
+        timer_y += detail_height + PROGRESS_TEXT_GAP;
+      }
+      layer_set_frame(text_layer_get_layer(s_progress_timer_layer),
+          GRect(PROGRESS_TEXT_SIDE_PADDING, timer_y, s_progress_width, timer_height));
+    }
+  }
+#endif
 }
 
 #if defined(PBL_MICROPHONE)
@@ -1411,7 +1440,7 @@ static void prv_update_request_elapsed(void) {
     return;
   }
   s_request_elapsed_seconds = elapsed;
-  snprintf(s_request_elapsed, sizeof(s_request_elapsed), "%lus | BACK cancel",
+  snprintf(s_request_elapsed, sizeof(s_request_elapsed), "%lus",
       (unsigned long)elapsed);
   prv_update_progress_text();
 }
@@ -2120,8 +2149,7 @@ static void prv_send_request(const char *text) {
   prv_set_status("Waiting for phone");
   prv_start_request_clock();
   prv_progress_reset();
-  prv_set_progress("thinking");
-  prv_set_progress_detail("waiting for phone");
+  prv_set_progress("Waiting for phone");
 }
 
 static void prv_dictation_callback(DictationSession *session, DictationSessionStatus status,
@@ -3552,6 +3580,17 @@ static void prv_window_load(Window *window) {
   text_layer_set_text_alignment(s_progress_detail_layer, GTextAlignmentCenter);
   layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_detail_layer));
 
+#if defined(PBL_MICROPHONE)
+  s_progress_timer_layer = text_layer_create(GRect(PROGRESS_TEXT_SIDE_PADDING, 0, s_progress_width, PROGRESS_DETAIL_MAX_HEIGHT));
+  text_layer_set_background_color(s_progress_timer_layer, GColorClear);
+  text_layer_set_text_color(s_progress_timer_layer, s_text_color);
+  text_layer_set_font(s_progress_timer_layer, fonts_get_system_font(PROGRESS_DETAIL_FONT_KEY));
+  text_layer_set_overflow_mode(s_progress_timer_layer, GTextOverflowModeTrailingEllipsis);
+  text_layer_set_text_alignment(s_progress_timer_layer, GTextAlignmentCenter);
+  layer_set_hidden(text_layer_get_layer(s_progress_timer_layer), true);
+  layer_add_child(s_progress_layer, text_layer_get_layer(s_progress_timer_layer));
+#endif
+
   s_progress_loading_layer = layer_create(GRect(0, bounds.size.h - PROGRESS_LOADING_HEIGHT, bounds.size.w, PROGRESS_LOADING_HEIGHT));
   layer_set_update_proc(s_progress_loading_layer, prv_progress_loading_update_proc);
   layer_add_child(s_progress_layer, s_progress_loading_layer);
@@ -3615,6 +3654,10 @@ static void prv_window_unload(Window *window) {
   s_progress_input_context_layer = NULL;
   layer_destroy(s_progress_loading_layer);
   s_progress_loading_layer = NULL;
+#if defined(PBL_MICROPHONE)
+  text_layer_destroy(s_progress_timer_layer);
+  s_progress_timer_layer = NULL;
+#endif
   text_layer_destroy(s_progress_detail_layer);
   s_progress_detail_layer = NULL;
   text_layer_destroy(s_progress_title_layer);

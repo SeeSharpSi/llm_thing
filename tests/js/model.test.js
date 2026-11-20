@@ -47,6 +47,7 @@ function createHarness(overrides) {
     responses: [],
     preparedResponses: [],
     progress: [],
+    progressStarts: [],
     syncSettings: [],
     canceledRequestIds: [],
     finishedRequestIds: [],
@@ -76,7 +77,7 @@ function createHarness(overrides) {
       if (index !== -1) { requests.splice(index, 1); }
     },
     syncWatchSettings: function(value) { watch.syncSettings.push(value); },
-    progressStart: function() {},
+    progressStart: function(id, title, detail) { watch.progressStarts.push([title, detail]); },
     progressSet: function(id, title, detail) { watch.progress.push([title, detail]); },
     progressDone: function() {},
     progressToolStart: function() {},
@@ -268,6 +269,8 @@ test('Responses request uses input shape, timeout, auth, and parsed output', fun
   var harness = createHarness();
 
   harness.model.requestCompletion(1, 'Hello');
+  assert.deepEqual(harness.watch.progressStarts, [['Working', '']], 'initial progress uses neutral label');
+  assert.deepEqual(harness.watch.progress, [['Writing reply', '']], 'model request phase is labeled as reply writing');
   var request = FakeXMLHttpRequest.last();
   var body = JSON.parse(request.body);
 
@@ -473,6 +476,9 @@ test('native tool result is sent into follow-up Responses request', function() {
   });
 
   assert.equal(FakeXMLHttpRequest.instances.length, 2);
+  assert.ok(harness.watch.progress.some(function(entry) {
+    return entry[0] === 'Writing reply' && entry[1] === 'with tool results';
+  }), 'follow-up model request reports reply writing with tool results');
   var followUp = JSON.parse(FakeXMLHttpRequest.instances[1].body);
   assert.equal(followUp.input[followUp.input.length - 1].type, 'function_call_output');
   assert.equal(followUp.input[followUp.input.length - 1].output, '{"result":"tool result"}');
@@ -535,6 +541,9 @@ test('exhausted tool budget finalizes without tool definitions across native API
         }), 'reasoning signature preserved in provider replay');
       }
       assert.equal(finalBody.tools, undefined, modeCase.name + ' final-only request omits definitions');
+      assert.ok(harness.watch.progress.some(function(entry) {
+        return entry[0] === 'Writing reply' && entry[1] === 'tool call limit reached';
+      }), modeCase.name + ' final cap request reports reply writing and cap detail');
       if (modeCase.name === 'responses') {
         assert.match(finalBody.input[finalBody.input.length - 1].content[0].text, /FINAL ANSWER ONLY/);
         FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'Final from results' });
@@ -629,20 +638,23 @@ test('MCP discovery unavailable labels appear in first model progress only when 
 
     harness.model.requestCompletion(requestId, 'Hi');
     assert.ok(harness.watch.progress.some(function(entry) {
-      return entry[0] === 'thinking' && entry[1] === expected;
+      return entry[0] === 'Finding tools' && entry[1] === '';
+    }), 'discovery uses dedicated phase without redundant detail');
+    assert.ok(harness.watch.progress.some(function(entry) {
+      return entry[0] === 'Writing reply' && entry[1] === expected;
     }), 'model progress detail is formatted as expected');
     assert.ok(harness.watch.progress.some(function(entry) {
-      return entry[0] === 'thinking' && entry[1].length <= 60;
+      return entry[0] === 'Writing reply' && entry[1].length <= 60;
     }), 'detail fits compact watch progress budget');
     if (retryNative) {
       FakeXMLHttpRequest.last().respond(400, 'native tools unsupported');
       assert.ok(harness.watch.progress.some(function(entry) {
-        return entry[0] === 'thinking' && entry[1] === expected;
+        return entry[0] === 'Writing reply' && entry[1] === expected;
       }), 'unavailable detail survives native compatibility fallback');
     }
     FakeXMLHttpRequest.last().respond(200, { output_text: 'Done' });
     assert.ok(harness.watch.progress.some(function(entry) {
-      return entry[0] === 'thinking' && entry[1] === 'with tool results';
+      return entry[0] === 'Writing reply' && entry[1] === 'with tool results';
     }) === false, 'discovery detail is not reused in later rounds');
   }
 
@@ -2649,6 +2661,9 @@ test('post-mutation model failure retries final-answer-only across provider shap
         item.name + ': bounded tool results allow safe final-only retry');
 
     assert.equal(harness.model.retryCompletion(691 + i * 10, 690 + i * 10), true);
+    assert.ok(harness.watch.progressStarts.some(function(entry) {
+      return entry[0] === 'Writing reply' && entry[1] === 'summarizing recorded tool results';
+    }), item.name + ': final-only recovery uses reply-writing phase');
     recovery1 = FakeXMLHttpRequest.last();
     body = JSON.parse(recovery1.body);
     assert.equal(body.tools, undefined, item.name + ': first manual recovery cannot execute tools');

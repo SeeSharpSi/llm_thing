@@ -276,9 +276,11 @@ reminder mode to add one again.
 
 ## Request Controls And Recovery
 
-While a request runs, the watch shows its current stage or tool, compact tool
-history, and elapsed seconds. Press **BACK** to cancel. **SELECT** is ignored
-while work is active; after an eligible error, the watch shows `SELECT retry`.
+While a request runs, the watch shows `Finding tools`, `Running <tool>`, or
+`Writing reply`, along with compact tool history. Visible tool arguments appear
+as `key: value` lines above the elapsed timer. Press **BACK** to cancel.
+**SELECT** is ignored while work is active, except at an approval prompt. After
+an eligible error, the watch shows `SELECT retry`.
 Errors appear under a labeled **Error** heading. Cancellation stops remaining
 work but cannot undo a side effect already completed by a phone-side tool.
 

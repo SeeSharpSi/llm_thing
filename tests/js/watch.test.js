@@ -747,14 +747,15 @@ test('progress messages track tools, history, and context for current request', 
 
   watch.beginRequestLifecycle(5);
   watch.progressStart(5, 'thinking', 'start');
-  watch.progressToolStart(5, 'MCP Search', 'query');
+  watch.progressToolStart(5, 'Running Search: Lookup', 'query', null, 'MCP Search');
   watch.progressDone(5);
-  watch.progressToolStart(5, 'MCP Search', 'second query');
+  watch.progressToolStart(5, 'Running Search: Lookup', 'second query', null, 'MCP Search');
   watch.progressDone(5);
   watch.progressSetContextSizes(5, '100', '20');
   watch.progressSet(4, 'stale', 'ignored');
 
   assert.equal(global.Pebble.messages[0].ProgressReset, 1);
+  assert.equal(global.Pebble.messages[global.Pebble.messages.length - 1].ProgressText, 'Running Search: Lookup');
   assert.equal(global.Pebble.messages[global.Pebble.messages.length - 1].ProgressHistory, 'MCP Search 2x');
   assert.equal(global.Pebble.messages[global.Pebble.messages.length - 1].ProgressInputContextSize, '100');
   assert.equal(global.Pebble.messages.some(function(message) { return message.ProgressText === 'stale'; }), false);
@@ -766,13 +767,13 @@ test('identified overlapping tool progress counts each completion and retains ac
 
   watch.beginRequestLifecycle(50);
   watch.progressStart(50, 'thinking', 'start');
-  watch.progressToolStart(50, 'Web Fetch', 'web_fetch: { url: first }', 'fetch-call-1');
-  watch.progressToolStart(50, 'Web Fetch', 'web_fetch: { url: second }', 'fetch-call-2');
+  watch.progressToolStart(50, 'Running Web Fetch', 'url: first', 'fetch-call-1', 'Web Fetch');
+  watch.progressToolStart(50, 'Running Web Fetch', 'url: second', 'fetch-call-2', 'Web Fetch');
 
   watch.progressDone(50, 'Web Fetch', '12 chars', 'fetch-call-2');
   latest = global.Pebble.messages[global.Pebble.messages.length - 1];
   assert.equal(latest.ProgressHistory, 'Web Fetch');
-  assert.equal(latest.ProgressText, 'Web Fetch');
+  assert.equal(latest.ProgressText, 'Running Web Fetch');
   assert.match(latest.ProgressDetail, /first/);
   assert.doesNotMatch(latest.ProgressDetail, /12 chars/);
 
@@ -782,8 +783,43 @@ test('identified overlapping tool progress counts each completion and retains ac
 
   latest = global.Pebble.messages[global.Pebble.messages.length - 1];
   assert.equal(latest.ProgressHistory, 'Web Fetch 2x');
-  assert.equal(latest.ProgressText, 'Web Fetch');
+  assert.equal(latest.ProgressText, 'Running Web Fetch');
   assert.match(latest.ProgressDetail, /first/);
+});
+
+test('progress keeps active title and history label separate and sanitizes control characters', function() {
+  var watch = freshWatch();
+  var latest;
+
+  watch.beginRequestLifecycle(60);
+  watch.progressStart(60, 'thinking', 'start');
+  watch.progressToolStart(60, 'Running Bad\nTool', 'key: value', 'call-1', 'Hist\rLabel');
+  latest = global.Pebble.messages[global.Pebble.messages.length - 1];
+  assert.equal(latest.ProgressText, 'Running Bad Tool');
+  assert.equal(latest.ProgressDetail, 'key: value');
+
+  watch.progressDone(60, 'Running Bad Tool', '4 chars', 'call-1');
+  latest = global.Pebble.messages[global.Pebble.messages.length - 1];
+  assert.equal(latest.ProgressHistory, 'Hist Label');
+});
+
+test('progress history labels stay independent when switching identified and legacy tool runs', function() {
+  var watch = freshWatch();
+  var latest;
+
+  watch.beginRequestLifecycle(61);
+  watch.progressStart(61, 'thinking', 'start');
+  watch.progressToolStart(61, 'Running Legacy', 'first', null, 'Legacy One');
+  watch.progressDone(61);
+  watch.progressToolStart(61, 'Running Identified', 'second', 'call-1', 'Identified One');
+  watch.progressDone(61, 'Running Identified', 'ok', 'call-1');
+  watch.progressToolStart(61, 'Running Legacy Again', 'third', null, 'Legacy Two');
+  watch.progressDone(61);
+  watch.progressSetContextSizes(61, '1', '2');
+
+  latest = global.Pebble.messages[global.Pebble.messages.length - 1];
+  assert.equal(latest.ProgressText, 'Running Legacy Again');
+  assert.equal(latest.ProgressHistory, 'Legacy One\nIdentified One\nLegacy Two');
 });
 
 test('Health Info request handles response and timeout', function() {

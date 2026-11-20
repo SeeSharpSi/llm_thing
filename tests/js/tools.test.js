@@ -843,7 +843,7 @@ test('plugin source builtin integrates schema, progress, execution, and request 
   assert.match(sourceTool.description, /properties filter/);
   harness.tools.runToolCalls(99, [{ id: 'source-call', name: sourceTool.name, arguments: {} }], toolMap, function(results) { result = results; });
   assert.equal(harness.watch.progress[0][0], 'start');
-  assert.equal(harness.watch.progress[0][1], 'Fixture / current');
+  assert.equal(harness.watch.progress[0][1], 'Running Fixture / current');
   sourceRequest.onData({ pluginUuid: '00000000-0000-0000-0001-000000000007', instances: [{ instanceId: 'phone', properties: { value: { shortText: { text: 'ready' } } } }] });
   assert.equal(JSON.parse(result[0].result).instances[0].properties.value.shortText.text, 'ready');
   assert.equal(result[0]._structuredResult, true);
@@ -896,7 +896,9 @@ test('plugin action builtin uses plugin schema validator, serial progress, and s
   harness.tools.runToolCalls(120, [{ id: 'valid', name: actionDefinition.name, arguments: { mode: 'scheduled', count: 0, target: 'private-target' } }], toolMap, function(value) { results = value; });
   assert.equal(invocations.length, 1);
   assert.deepEqual(invocations[0], { plugin: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', args: { mode: 'scheduled', count: 0, target: 'private-target' } });
-  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'start' && event[1] === 'Action only / configure' && event[2] === 'checking action request'; }));
+  assert.ok(harness.watch.progress.some(function(event) { return event[0] === 'start' && event[1] === 'Running Action only / configure' && event[2] === 'checking action request'; }));
+  assert.equal(harness.watch.progress.some(function(event) { return String(event[2] || '').indexOf('private-target') !== -1; }), false,
+    'plugin action progress never exposes private arguments');
   resolveAction({ ok: true, text: 'done' });
   assert.deepEqual(JSON.parse(results[0].result), { ok: true, pluginUuid: 'abcdefab-cdef-abcd-efab-cdefabcdefab', action: 'configure', text: 'done' });
   assert.equal(results[0]._structuredResult, true);
@@ -1167,11 +1169,71 @@ test('mixed unknown, invalid, and successful calls report exact progress once in
   assert.equal(results[2].result, 'hello');
   assert.deepEqual(harness.watch.progress, [
     ['done', 'missing', 'unknown tool'],
-    ['start', 'Echo', 'invalid arguments'],
+    ['start', 'Running Echo', 'invalid arguments'],
     ['done', 'Echo', 'error: Missing required tool argument: text'],
-    ['start', 'Echo', 'echo: { text:hello }'],
+    ['start', 'Running Echo', 'text: hello'],
     ['done', 'Echo', '5 chars']
   ]);
+});
+
+test('tool progress detail uses newline key-value rows and escapes control characters', function() {
+  var harness = createHarness();
+  var toolMap = {
+    echo: {
+      kind: 'builtin',
+      name: 'echo',
+      builtinName: 'echo',
+      label: 'Echo',
+      executionClass: 'serial',
+      parameters: { type: 'object' },
+      validate: function() { return ''; },
+      call: function(args, requestId, callback) { callback(null, 'ok'); }
+    }
+  };
+
+  harness.tools.runToolCalls(609, [
+    { id: 'empty', name: 'echo', arguments: {} },
+    { id: 'rows', name: 'echo', arguments: { text: 'line1\nline2', 'bad\nkey': 'value\rrow' } }
+  ], toolMap, function() {});
+
+  assert.deepEqual(harness.watch.progress, [
+    ['start', 'Running Echo', ''],
+    ['done', 'Echo', '2 chars'],
+    ['start', 'Running Echo', 'text: line1 line2\nbad\\nkey: value row'],
+    ['done', 'Echo', '2 chars']
+  ]);
+});
+
+test('tool progress detail truncation never leaves a lone high surrogate', function() {
+  var harness = createHarness();
+  var toolMap = {
+    echo: {
+      kind: 'builtin',
+      name: 'echo',
+      builtinName: 'echo',
+      label: 'Echo',
+      executionClass: 'serial',
+      parameters: { type: 'object' },
+      validate: function() { return ''; },
+      call: function(args, requestId, callback) { callback(null, 'ok'); }
+    }
+  };
+  var perValue = new Array(77).join('a') + '\ud83d\ude00' + 'tail';
+  var outerA = new Array(81).join('a');
+  var outerB = new Array(69).join('a') + '\ud83d\ude00' + 'tail';
+  var starts;
+
+  harness.tools.runToolCalls(610, [
+    { id: 'value', name: 'echo', arguments: { text: perValue } },
+    { id: 'outer', name: 'echo', arguments: { ab: outerA, c: outerB } }
+  ], toolMap, function() {});
+
+  starts = harness.watch.progress.filter(function(event) { return event[0] === 'start'; });
+  assert.equal(starts.length, 2);
+  assert.equal(/[\uD800-\uDBFF]/.test(starts[0][2]), false, 'per-value truncation drops an unpaired high surrogate');
+  assert.equal(/[\uD800-\uDBFF]/.test(starts[1][2]), false, 'whole-detail truncation drops an unpaired high surrogate');
+  assert.ok(starts[0][2].length <= 160);
+  assert.ok(starts[1][2].length <= 160);
 });
 
 test('stale read callbacks cannot start queued reads or mutations', function() {
@@ -1770,6 +1832,13 @@ test('MCP nested strict objects reject extras while open objects remain open', f
     'unconstrained MCP dictionaries and open top-level fields pass through');
   FakeXMLHttpRequest.last().respond(200, { result: { content: [{ type: 'text', text: 'ok' }] } });
   assert.equal(validResults[0].result, 'ok');
+
+  var starts = harness.watch.progress.filter(function(event) { return event[0] === 'start'; });
+  var mcpStart = starts[starts.length - 1];
+  assert.equal(mcpStart[1], 'Running Nested: Lookup', 'MCP heading names the called tool, not only the server');
+  assert.match(mcpStart[2], /^profile: /);
+  assert.match(mcpStart[2], /\nmetadata: /);
+  assert.equal(mcpStart[2].indexOf('lookup'), -1, 'detail does not repeat the tool name');
 });
 
 test('MCP arrays honor declared maxItems within shared validation work budget', function() {

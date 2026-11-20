@@ -158,30 +158,73 @@ function formatDisplayToolName(toolName, toolInfo) {
   return name || 'unknown';
 }
 
-function formatToolCallDetail(toolName, args, toolInfo) {
-  var parts = [];
+function escapeToolDetailText(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, '?');
+}
+
+function stripLoneHighSurrogates(text) {
+  var result = '';
+  var code;
+  var next;
+  var i;
+
+  for (i = 0; i < text.length; i += 1) {
+    code = text.charCodeAt(i);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      next = text.charCodeAt(i + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        result += text.charAt(i) + text.charAt(i + 1);
+        i += 1;
+      }
+      continue;
+    }
+    result += text.charAt(i);
+  }
+  return result;
+}
+
+function formatToolDetailValue(value, maxLength) {
+  return stripLoneHighSurrogates(formatToolParamValue(value, maxLength));
+}
+
+function formatToolCallDetail(args) {
+  var lines = [];
   var key;
   var text;
-  var displayToolName = formatDisplayToolName(toolName, toolInfo);
 
   args = args || {};
-  if (typeof args !== 'object') {
-    return common.truncate(displayToolName + ': { value:' + formatToolParamValue(args, 100) + ' }', 160);
+  if (typeof args !== 'object' || Object.prototype.toString.call(args) === '[object Array]') {
+    return stripLoneHighSurrogates(common.truncate('value: ' + escapeToolDetailText(formatToolDetailValue(args, 100)), 160));
   }
 
   for (key in args) {
     if (hasOwn(args, key) && args[key] !== undefined) {
-      parts.push(key + ':' + formatToolParamValue(args[key], 80));
+      lines.push(escapeToolDetailText(key) + ': ' + escapeToolDetailText(formatToolDetailValue(args[key], 80)));
     }
   }
 
-  text = displayToolName + ': { ';
-  if (parts.length) {
-    text += parts.join(', ') + ' ';
-  }
-  text += '}';
+  text = lines.join('\n');
+  return text ? stripLoneHighSurrogates(common.truncate(text, 160)) : '';
+}
 
-  return common.truncate(text, 160);
+function formatToolActiveTitle(toolName, toolInfo) {
+  var name = String(toolName || '');
+  var label;
+
+  if (toolInfo && toolInfo.kind === 'mcp') {
+    label = common.trim(toolInfo.server.displayLabel) || formatToolWords(toolInfo.server.label || 'MCP');
+    label += ': ' + (formatToolWords(formatDisplayToolName(toolInfo.toolName || name, toolInfo)) || 'Tool');
+  } else if (toolInfo) {
+    label = formatToolLabel(toolInfo);
+  } else {
+    label = formatToolWords(name) || 'Unknown Tool';
+  }
+
+  return 'Running ' + label;
 }
 
 function formatToolWords(value) {
@@ -4528,7 +4571,13 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
     if (!watch.isCurrentRequest(requestId)) {
       return;
     }
-    watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), job.toolInfo.logArguments === false ? 'checking action request' : formatToolCallDetail(job.name, job.args, job.toolInfo), job.progressId);
+    watch.progressToolStart(
+      requestId,
+      formatToolActiveTitle(job.name, job.toolInfo),
+      job.toolInfo.logArguments === false ? 'checking action request' : formatToolCallDetail(job.args),
+      job.progressId,
+      formatToolLabel(job.toolInfo)
+    );
     try {
       if (job.toolInfo.kind === 'builtin') {
         callBuiltinTool(job.toolInfo, job.args, requestId, finishToolCall);
@@ -4542,7 +4591,7 @@ function runToolCalls(requestId, toolCalls, toolMap, callback) {
 
   function reportImmediateError(job) {
     if (job.toolInfo && watch.isCurrentRequest(requestId)) {
-      watch.progressToolStart(requestId, formatToolLabel(job.toolInfo), 'invalid arguments', job.progressId);
+      watch.progressToolStart(requestId, formatToolActiveTitle(job.name, job.toolInfo), 'invalid arguments', job.progressId, formatToolLabel(job.toolInfo));
     }
     settleJob(job, job.error);
   }

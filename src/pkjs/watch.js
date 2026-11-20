@@ -37,6 +37,7 @@ var s_progress = {
   detail: '',
   toolHistory: [],
   currentTool: '',
+  currentToolHistoryLabel: '',
   currentToolRemembered: false,
   toolExecutions: Object.create(null),
   activeToolExecutionIds: [],
@@ -1189,6 +1190,12 @@ function sendPastChatTranscript(chat, settings, onDone) {
   });
 }
 
+function sanitizeProgressLine(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g, '');
+}
+
 function formatProgressHistory(items) {
   var groups = [];
   var text = '';
@@ -1200,7 +1207,7 @@ function formatProgressHistory(items) {
   var line;
 
   for (i = 0; i < items.length; i += 1) {
-    label = String(items[i] || '');
+    label = sanitizeProgressLine(items[i]);
     if (!label) {
       continue;
     }
@@ -1229,7 +1236,7 @@ function formatProgressHistory(items) {
 function sendProgressState(requestId, current, detail, reset, onDone) {
   var dict = {
     RequestId: requestId,
-    ProgressText: common.truncate(current || 'thinking', 80),
+    ProgressText: common.truncate(sanitizeProgressLine(current) || 'thinking', 80),
     ProgressDetail: common.truncate(detail || '', 160),
     ProgressHistory: formatProgressHistory(s_progress.toolHistory),
     ProgressInputContextSize: common.truncate(s_progress.inputContextSize || '', 24),
@@ -1250,10 +1257,11 @@ function progressStart(requestId, current, detail) {
 
   s_progress.requestId = requestId;
   s_progress.active = true;
-  s_progress.current = current || 'thinking';
+  s_progress.current = sanitizeProgressLine(current) || 'thinking';
   s_progress.detail = detail || '';
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
+  s_progress.currentToolHistoryLabel = '';
   s_progress.currentToolRemembered = false;
   s_progress.toolExecutions = Object.create(null);
   s_progress.activeToolExecutionIds = [];
@@ -1287,16 +1295,21 @@ function removeActiveToolExecution(executionId) {
   }
 }
 
-function progressToolStart(requestId, current, detail, toolExecutionId) {
+function progressToolStart(requestId, current, detail, toolExecutionId, historyLabel) {
   var executionKey;
   var entry;
+  var title;
+  var history;
 
   if (!isCurrentRequest(requestId)) {
     return;
   }
 
+  title = sanitizeProgressLine(current) || 'thinking';
+  history = sanitizeProgressLine(historyLabel) || title;
+
   if (!s_progress.active || s_progress.requestId !== requestId) {
-    progressStart(requestId, current, detail);
+    progressStart(requestId, title, detail);
   }
 
   if (toolExecutionId !== undefined && toolExecutionId !== null && String(toolExecutionId)) {
@@ -1305,22 +1318,25 @@ function progressToolStart(requestId, current, detail, toolExecutionId) {
     if (entry && entry.completed) {
       return;
     }
-    s_progress.currentTool = current || 'thinking';
+    s_progress.currentTool = title;
+    s_progress.currentToolHistoryLabel = '';
     if (!entry) {
-      entry = { label: s_progress.currentTool, detail: detail || '', completed: false };
+      entry = { label: title, historyLabel: history, detail: detail || '', completed: false };
       s_progress.toolExecutions[executionKey] = entry;
       s_progress.activeToolExecutionIds.push(executionKey);
     } else {
-      entry.label = s_progress.currentTool;
+      entry.label = title;
+      entry.historyLabel = history;
       entry.detail = detail || '';
     }
     s_progress.currentToolExecutionId = executionKey;
   } else {
-    s_progress.currentTool = current || 'thinking';
+    s_progress.currentTool = title;
+    s_progress.currentToolHistoryLabel = history;
     s_progress.currentToolExecutionId = '';
     s_progress.currentToolRemembered = false;
   }
-  progressSet(requestId, current, detail);
+  progressSet(requestId, title, detail);
 }
 
 function progressSet(requestId, current, detail) {
@@ -1328,7 +1344,7 @@ function progressSet(requestId, current, detail) {
     return;
   }
 
-  current = current || 'thinking';
+  current = sanitizeProgressLine(current) || 'thinking';
   detail = detail || '';
 
   if (!s_progress.active || s_progress.requestId !== requestId) {
@@ -1383,7 +1399,7 @@ function progressDone(requestId, current, detail, toolExecutionId) {
       return;
     }
     entry.completed = true;
-    s_progress.toolHistory.push(entry.label);
+    s_progress.toolHistory.push(entry.historyLabel || entry.label);
     removeActiveToolExecution(executionKey);
 
     if (s_progress.currentToolExecutionId === executionKey) {
@@ -1391,10 +1407,12 @@ function progressDone(requestId, current, detail, toolExecutionId) {
       if (active) {
         s_progress.currentToolExecutionId = active.id;
         s_progress.currentTool = active.entry.label;
+        s_progress.currentToolHistoryLabel = active.entry.historyLabel || active.entry.label;
         s_progress.current = active.entry.label;
         s_progress.detail = active.entry.detail;
       } else {
         s_progress.currentToolExecutionId = executionKey;
+        s_progress.currentToolHistoryLabel = '';
       }
     }
     sendProgressState(requestId, s_progress.current, s_progress.detail, false);
@@ -1405,7 +1423,7 @@ function progressDone(requestId, current, detail, toolExecutionId) {
   if (s_progress.currentToolExecutionId && s_progress.toolExecutions[s_progress.currentToolExecutionId]) {
     return;
   }
-  toolName = s_progress.currentTool;
+  toolName = s_progress.currentToolHistoryLabel || s_progress.currentTool;
   if (toolName && !s_progress.currentToolRemembered) {
     s_progress.toolHistory.push(toolName);
     s_progress.currentToolRemembered = true;
@@ -1422,6 +1440,7 @@ function progressStop(requestId) {
   s_progress.detail = '';
   s_progress.toolHistory = [];
   s_progress.currentTool = '';
+  s_progress.currentToolHistoryLabel = '';
   s_progress.currentToolRemembered = false;
   s_progress.toolExecutions = Object.create(null);
   s_progress.activeToolExecutionIds = [];
