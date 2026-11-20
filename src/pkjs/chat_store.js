@@ -2,7 +2,7 @@ var common = require('./settings');
 
 var STORE_KEY = 'llm_thing_saved_chats_v1';
 var MAX_SAVED_CHATS = 20;
-var MAX_SAVED_CHAT_MESSAGE_CHARS = 1200;
+var MAX_SAVED_CHAT_STORAGE_BYTES = 256 * 1024;
 var MAX_CHAT_TITLE_CHARS = 48;
 
 function nowMs() {
@@ -32,7 +32,7 @@ function copyMessages(messages) {
     }
     result.push({
       role: role,
-      content: common.truncate(String(message.content || ''), MAX_SAVED_CHAT_MESSAGE_CHARS)
+      content: common.truncate(String(message.content || ''), common.MAX_CHAT_HISTORY_MESSAGE_CHARS)
     });
   }
 
@@ -112,6 +112,35 @@ function sortNewestFirst(chats) {
   });
 }
 
+function utf8ByteLength(value) {
+  var bytes = 0;
+  var i;
+  var code;
+
+  for (i = 0; i < value.length; i += 1) {
+    code = value.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length && value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4;
+      i += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+
+  return bytes;
+}
+
+function serializeStore(store) {
+  return JSON.stringify({
+    version: 1,
+    chats: store.chats
+  });
+}
+
 function loadStore() {
   var parsed;
   var raw;
@@ -145,17 +174,22 @@ function loadStore() {
 }
 
 function saveStore(store) {
+  var serialized;
+
   sortNewestFirst(store.chats);
   while (store.chats.length > MAX_SAVED_CHATS) {
     store.chats.pop();
   }
 
+  serialized = serializeStore(store);
+  while (store.chats.length && utf8ByteLength(serialized) > MAX_SAVED_CHAT_STORAGE_BYTES) {
+    store.chats.pop();
+    serialized = serializeStore(store);
+  }
+
   while (store.chats.length >= 0) {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify({
-        version: 1,
-        chats: store.chats
-      }));
+      localStorage.setItem(STORE_KEY, serialized);
       return true;
     } catch (e) {
       if (!store.chats.length) {
@@ -163,6 +197,7 @@ function saveStore(store) {
         return false;
       }
       store.chats.pop();
+      serialized = serializeStore(store);
     }
   }
 
@@ -283,6 +318,7 @@ function deleteAllChats() {
 
 module.exports = {
   MAX_SAVED_CHATS: MAX_SAVED_CHATS,
+  MAX_SAVED_CHAT_STORAGE_BYTES: MAX_SAVED_CHAT_STORAGE_BYTES,
   listChats: listChats,
   getChat: getChat,
   saveChatHistory: saveChatHistory,

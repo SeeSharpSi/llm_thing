@@ -13,6 +13,7 @@ var modelPath = path.resolve(__dirname, '../../src/pkjs/model');
 var toolsPath = path.resolve(__dirname, '../../src/pkjs/tools');
 var originalSetTimeout = global.setTimeout;
 var originalClearTimeout = global.clearTimeout;
+var TEST_TOOL_CAP_NOTICE = 'Tool call budget exhausted. FINAL ANSWER ONLY. Use output.';
 
 function createHarness(overrides) {
   overrides = overrides || {};
@@ -480,6 +481,196 @@ test('native tool result is sent into follow-up Responses request', function() {
   assert.deepEqual(harness.watch.responses, ['Final']);
 });
 
+test('exhausted tool budget finalizes without tool definitions across native API modes', function() {
+  var modes = [
+    { name: 'responses', settings: { MaxToolCalls: 1 }, call: { output: [
+      { type: 'function_call', call_id: 'call-1', name: 'lookup', arguments: '{}' }
+    ] } },
+    { name: 'chat', settings: {
+      ApiMode: 'chat-completions', Endpoint: 'https://api.example.test/v1/chat/completions', MaxToolCalls: 1
+    }, call: { choices: [{ message: { tool_calls: [
+      { id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{}' } }
+    ] } }] } },
+    { name: 'messages', settings: {
+      ApiMode: 'messages', Endpoint: 'https://api.example.test/v1/messages', MaxToolCalls: 1
+    }, call: { content: [
+      { type: 'thinking', thinking: 'reason', signature: 'signed-reasoning' },
+      { type: 'tool_use', id: 'call-1', name: 'lookup', input: {} }
+    ] } }
+  ];
+  var i;
+
+  for (i = 0; i < modes.length; i += 1) {
+    (function(modeCase) {
+      var tools = {
+        discoverPhoneTools: function(settings, id, callback) {
+          callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
+            lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+          });
+        },
+        runToolCalls: function(id, calls, map, callback) {
+          callback([{ id: calls[0].id, call_id: calls[0].call_id, name: 'lookup', result: 'gathered result' }]);
+        },
+        formatToolCallLabel: function() { return 'Lookup'; }
+      };
+      var harness = createHarness({ settings: modeCase.settings, tools: tools });
+      var initialBody;
+      var finalBody;
+
+      harness.model.requestCompletion(101 + i, 'Use lookup');
+      FakeXMLHttpRequest.instances[0].respond(200, modeCase.call);
+      initialBody = JSON.parse(FakeXMLHttpRequest.instances[0].body);
+      finalBody = JSON.parse(FakeXMLHttpRequest.instances[1].body);
+      if (modeCase.name === 'responses') {
+        assert.ok(initialBody.tools, 'initial request offers tools');
+        assert.ok(finalBody.input.some(function(item) { return item.type === 'function_call_output'; }), 'native tool result replayed');
+      } else if (modeCase.name === 'chat') {
+        assert.ok(initialBody.tools, 'initial request offers tools');
+        assert.ok(finalBody.messages.some(function(item) { return item.role === 'tool'; }), 'native tool result replayed');
+      } else {
+        assert.ok(initialBody.tools, 'initial request offers tools');
+        assert.ok(finalBody.messages[2].content.some(function(item) { return item.type === 'tool_result'; }), 'native tool result replayed');
+        assert.ok(finalBody.messages[1].content.some(function(item) {
+          return item.type === 'thinking' && item.signature === 'signed-reasoning';
+        }), 'reasoning signature preserved in provider replay');
+      }
+      assert.equal(finalBody.tools, undefined, modeCase.name + ' final-only request omits definitions');
+      if (modeCase.name === 'responses') {
+        assert.match(finalBody.input[finalBody.input.length - 1].content[0].text, /FINAL ANSWER ONLY/);
+        FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'Final from results' });
+      } else if (modeCase.name === 'chat') {
+        assert.match(finalBody.messages[finalBody.messages.length - 1].content, /FINAL ANSWER ONLY/);
+        FakeXMLHttpRequest.instances[1].respond(200, { choices: [{ message: { content: 'Final from results' } }] });
+      } else {
+        assert.match(finalBody.messages[finalBody.messages.length - 1].content.slice(-1)[0].text, /FINAL ANSWER ONLY/);
+        assert.ok(finalBody.messages[1].content.some(function(item) {
+          return item.type === 'thinking' && item.signature === 'signed-reasoning';
+        }), 'final-only request still replays signed reasoning');
+        FakeXMLHttpRequest.instances[1].respond(200, { content: [{ type: 'text', text: 'Final from results' }] });
+      }
+      assert.deepEqual(harness.watch.responses, ['Final from results']);
+    }(modes[i]));
+  }
+});
+
+test('text fallback finalization overrides tool JSON instructions and treats JSON answer as text', function() {
+  var tools = {
+    discoverPhoneTools: function(settings, id, callback) {
+      callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
+        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      });
+    },
+    runToolCalls: function(id, calls, map, callback) {
+      callback([{ id: calls[0].id, call_id: calls[0].call_id, name: 'lookup', result: 'gathered result' }]);
+    },
+    formatToolCallLabel: function() { return 'Lookup'; }
+  };
+  var harness = createHarness({ settings: {
+    ApiMode: 'chat-completions', Endpoint: 'https://api.example.test/v1/chat/completions', MaxToolCalls: 1
+  }, tools: tools });
+  var finalBody;
+  var answer = '{"tool_calls":[{"name":"lookup","arguments":{}}]}';
+
+  harness.model.requestCompletion(104, 'Use lookup');
+  FakeXMLHttpRequest.instances[0].respond(400, 'native tools unsupported');
+  FakeXMLHttpRequest.instances[1].respond(200, {
+    output_text: '{"tool_calls":[{"id":"call-1","name":"lookup","arguments":{}}]}'
+  });
+  assert.equal(FakeXMLHttpRequest.instances.length, 3, 'one tool batch runs, then final-only request starts');
+  finalBody = JSON.parse(FakeXMLHttpRequest.instances[2].body);
+  assert.equal(finalBody.tools, undefined);
+  assert.ok(JSON.parse(FakeXMLHttpRequest.instances[1].body).messages[0].content.indexOf('only JSON') !== -1,
+    'initial text fallback request has tool JSON instructions');
+  assert.equal(finalBody.messages[0].content.indexOf('only JSON'), -1,
+    'final-only system prompt removes tool JSON instructions');
+  assert.match(finalBody.messages[finalBody.messages.length - 1].content, /FINAL ANSWER ONLY\. Use output\./);
+  FakeXMLHttpRequest.instances[2].respond(200, { choices: [{ message: { content: answer } }] });
+  assert.deepEqual(harness.watch.responses, [answer], 'tool_calls-shaped final JSON is not treated as another tool request');
+  assert.equal(FakeXMLHttpRequest.instances.length, 3, 'finalization never runs another tool');
+});
+
+test('unexpected native tool call during finalization is rejected without execution', function() {
+  var runCount = 0;
+  var tools = {
+    discoverPhoneTools: function(settings, id, callback) {
+      callback(null, [{ name: 'lookup', description: 'Lookup', parameters: { type: 'object', properties: {} } }], {
+        lookup: { kind: 'builtin', parameters: { type: 'object', properties: {} } }
+      });
+    },
+    runToolCalls: function(id, calls, map, callback) {
+      runCount += calls.length;
+      callback([{ id: calls[0].id, call_id: calls[0].call_id, name: 'lookup', result: 'gathered result' }]);
+    },
+    formatToolCallLabel: function() { return 'Lookup'; }
+  };
+  var harness = createHarness({ settings: { MaxToolCalls: 1 }, tools: tools });
+
+  harness.model.requestCompletion(105, 'Use lookup');
+  FakeXMLHttpRequest.instances[0].respond(200, {
+    output: [{ type: 'function_call', call_id: 'first', name: 'lookup', arguments: '{}' }]
+  });
+  FakeXMLHttpRequest.instances[1].respond(200, {
+    output: [{ type: 'function_call', call_id: 'unexpected', name: 'lookup', arguments: '{}' }]
+  });
+
+  assert.equal(runCount, 1, 'final-only native call does not execute');
+  assert.equal(FakeXMLHttpRequest.instances.length, 2, 'no tool replay request is sent');
+  assert.match(harness.watch.responses[0], /out of tool calls/);
+});
+
+test('MCP discovery unavailable labels appear in first model progress only when present', function() {
+  function run(labels, expected, requestId, retryNative) {
+    var tools = {
+      discoverPhoneTools: function(settings, id, callback) { callback(null, [], {}, labels); },
+      runToolCalls: function(id, calls, map, callback) { callback([]); },
+      formatToolCallLabel: function() { return 'Tool'; }
+    };
+    var harness = createHarness({ settings: { MaxToolCalls: 1 }, tools: tools });
+
+    harness.model.requestCompletion(requestId, 'Hi');
+    assert.ok(harness.watch.progress.some(function(entry) {
+      return entry[0] === 'thinking' && entry[1] === expected;
+    }), 'model progress detail is formatted as expected');
+    assert.ok(harness.watch.progress.some(function(entry) {
+      return entry[0] === 'thinking' && entry[1].length <= 60;
+    }), 'detail fits compact watch progress budget');
+    if (retryNative) {
+      FakeXMLHttpRequest.last().respond(400, 'native tools unsupported');
+      assert.ok(harness.watch.progress.some(function(entry) {
+        return entry[0] === 'thinking' && entry[1] === expected;
+      }), 'unavailable detail survives native compatibility fallback');
+    }
+    FakeXMLHttpRequest.last().respond(200, { output_text: 'Done' });
+    assert.ok(harness.watch.progress.some(function(entry) {
+      return entry[0] === 'thinking' && entry[1] === 'with tool results';
+    }) === false, 'discovery detail is not reused in later rounds');
+  }
+
+  run(['Slow', 'Bad\nServer'], 'MCP unavailable: Slow, Bad Server', 106, true);
+  run([], '', 107);
+  run([new Array(101).join('L')], 'MCP unavailable: ' + new Array(43).join('L') + '…', 110);
+});
+
+test('superseding request cancels only pending discovery foreground wait', function() {
+  var discoveryCallbacks = [];
+  var canceled = [];
+  var tools = {
+    discoverPhoneTools: function(settings, id, callback) { discoveryCallbacks.push(callback); },
+    cancelMcpRequest: function(id) { canceled.push(id); },
+    runToolCalls: function(id, calls, map, callback) { callback([]); },
+    formatToolCallLabel: function() { return 'Tool'; }
+  };
+  var harness = createHarness({ settings: { MaxToolCalls: 1 }, tools: tools });
+
+  harness.model.requestCompletion(108, 'First');
+  harness.model.requestCompletion(109, 'Second');
+
+  assert.deepEqual(canceled, [108]);
+  discoveryCallbacks[0](null, [], {}, ['Slow']);
+  discoveryCallbacks[1](null, [], {}, []);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'stale discovery callback does not start a model request');
+});
+
 test('structured null tool result remains visible through model budget handling', function() {
   var tools = {
     discoverPhoneTools: function(settings, id, callback) {
@@ -632,7 +823,7 @@ test('tool results are capped by per-result and total context budgets', function
   assert.match(JSON.parse(outputs[2].output).result, /\[truncated\]$/);
   var emittedChars = JSON.parse(outputs[0].output).result.length +
     JSON.parse(outputs[1].output).result.length + JSON.parse(outputs[2].output).result.length +
-    'Tool call budget exhausted. Answer using gathered results.'.length;
+    TEST_TOOL_CAP_NOTICE.length;
   assert.equal(emittedChars, 12000);
   FakeXMLHttpRequest.instances[1].respond(200, { output_text: 'Final' });
   assert.deepEqual(harness.watch.responses, ['Final']);
@@ -783,7 +974,7 @@ test('large structured tool results stay parseable and obey budgets across provi
       outputs.forEach(function(output) {
         payloadChars += output.error ? output.error.length : JSON.stringify(output.result).length;
       });
-      payloadChars += 'Tool call budget exhausted. Answer using gathered results.'.length;
+      payloadChars += TEST_TOOL_CAP_NOTICE.length;
        assert.ok(payloadChars <= 12000, provider + ' error/omission payloads count against total budget');
        assert.equal(JSON.parse(JSON.stringify(outputs[0])).result.structuredContent.data.length, 5589, provider + ' output remains serializable');
     }(providers[i]));
@@ -872,7 +1063,7 @@ test('tool-result reserve preserves complete errors at exact aggregate boundary 
     JSON.parse(outputs[1].output).result.length +
     JSON.parse(outputs[2].output).error.length +
     JSON.parse(outputs[3].output).error.length +
-    'Tool call budget exhausted. Answer using gathered results.'.length;
+    TEST_TOOL_CAP_NOTICE.length;
   assert.equal(outputChars, 12000);
   FakeXMLHttpRequest.instances[2].respond(200, { output_text: 'Done' });
   assert.deepEqual(harness.watch.responses, ['Done']);
@@ -921,9 +1112,9 @@ test('many tool errors and skipped-call errors share bounded aggregate budget', 
     }
     totalErrorChars += error.length;
   });
-  totalErrorChars += 'Tool call budget exhausted. Answer using gathered results.'.length;
+  totalErrorChars += TEST_TOOL_CAP_NOTICE.length;
   assert.ok(totalErrorChars <= 12000);
-  assert.notEqual(JSON.stringify(body.input).indexOf('Tool call budget exhausted. Answer using gathered results.'), -1,
+  assert.notEqual(JSON.stringify(body.input).indexOf(TEST_TOOL_CAP_NOTICE), -1,
     'cap notice stays fixed-size and does not include growing skipped-call counts');
 });
 
@@ -1652,6 +1843,7 @@ test('Messages tool call budget cap adds per-call error results plus cap notice 
   assert.equal(JSON.parse(resultBlocks[2].content).result, undefined);
   assert.equal(resultBlocks[3].type, 'text');
   assert.match(resultBlocks[3].text, /Tool call budget exhausted/);
+  assert.match(resultBlocks[3].text, /FINAL ANSWER ONLY/);
 
   FakeXMLHttpRequest.instances[1].respond(200, {
     content: [{ type: 'text', text: 'Final capped answer' }]

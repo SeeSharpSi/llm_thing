@@ -125,6 +125,10 @@ character total. Tool output is also capped per result and across each request.
 Structured tool results remain valid JSON when capped; plain-text results may be
 truncated with a marker.
 
+New saved chats preserve the same 3,000-character-per-message content as live
+history. Up to 20 whole chats fit within a 256 KiB serialized UTF-8 storage
+budget. Content truncated in earlier saves cannot be recovered.
+
 Memory search and the Timeline pin list return `{items, hasMore, nextCursor}`
 pages. Memory search defaults to four items, and Timeline listing defaults to
 five; callers may request larger bounded pages. Pass `nextCursor` unchanged on
@@ -212,9 +216,12 @@ minutes, with bounded cache and pending-discovery sizes. Cache identity includes
 server URL, credentials, custom headers, label, allowed tools, and call limit;
 changing those settings starts a fresh discovery. The app warms enabled MCP
 servers after startup and settings saves, and overlapping warmup and foreground
-discovery share pending work. A failed server does not discard successful
-results from other servers. Remote servers require HTTPS; HTTP is accepted only
-for localhost development.
+discovery share pending work. Foreground discovery waits up to three seconds;
+then built-in tools and available servers proceed, while watch progress identifies
+unavailable server labels. Warmup may finish for later requests. A successful
+server with no tools is not a failure, and a failed server does not discard
+successful results from other servers. Remote servers require HTTPS; HTTP is
+accepted only for localhost development.
 
 MCP text blocks are joined with blank lines. Text-only results stay plain text;
 structured-only results stay JSON. Mixed results use a bounded JSON envelope
@@ -276,9 +283,11 @@ Retry reuses the failed prompt and existing conversation history. Setup errors
 can be retried after correcting phone settings. If a model request fails before
 any tool runs, retry starts the model request again. If a failure happens after
 tool execution begins, retry sends recorded bounded tool results to the model
-for a final answer only; it does not execute tools again. A failed watch
-delivery retries the already prepared response without another model or tool
-request. Retry capsules are capped at 64 KiB, 4,096 nodes, and 32 levels; retry
+for a final answer only; it does not execute tools again or expose further tools.
+When the tool-call cap is reached, the final model request can use recorded
+results but receives no further tools. A failed watch delivery retries the
+already prepared response without another model or tool request. Retry capsules
+are capped at 64 KiB, 4,096 nodes, and 32 levels; retry
 is disabled when complete recovery data cannot fit. Canceled requests and stale
 retry actions are rejected.
 

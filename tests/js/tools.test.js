@@ -128,6 +128,116 @@ test('discoverPhoneTools returns enabled built-ins in stable name order', functi
   assert.equal(result.map.pebble_get_location.kind, 'builtin');
 });
 
+test('foreground discovery returns completed tools and unavailable labels at shared deadline', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var result;
+  var callbackCount = 0;
+  try {
+    harness.tools.discoverPhoneTools(mcpSettings([
+      { enabled: true, label: 'Ready', url: 'https://ready.example.test' },
+      { enabled: true, label: 'Slow', url: 'https://slow.example.test' }
+    ]), 801, function(error, definitions, map, unavailable) {
+      callbackCount += 1;
+      result = { error: error, definitions: definitions, map: map, unavailable: unavailable };
+    });
+    assert.equal(timers.timers.filter(function(timer) { return timer.delay === 3000; }).length, 1);
+    FakeXMLHttpRequest.instances[0].respond(200, { result: { protocolVersion: '2025-06-18' } });
+    FakeXMLHttpRequest.instances[1].respond(200, { result: { protocolVersion: '2025-06-18' } });
+    FakeXMLHttpRequest.instances[2].respond(202, '');
+    FakeXMLHttpRequest.instances[3].respond(202, '');
+    FakeXMLHttpRequest.instances[4].respond(200, { result: { tools: [{ name: 'ready_tool' }] } });
+    assert.equal(result, undefined);
+    timers.run(timers.timers.filter(function(timer) { return timer.delay === 3000; })[0].id);
+    assert.equal(result.error, null);
+    assert.deepEqual(result.unavailable, ['Slow']);
+    assert.ok(result.definitions.some(function(definition) { return definition.name === 'Ready__ready_tool'; }));
+    assert.equal(FakeXMLHttpRequest.instances[5].aborted, true);
+    FakeXMLHttpRequest.instances[5].respond(200, { result: { tools: [{ name: 'late_tool' }] } });
+    assert.equal(callbackCount, 1);
+    assert.equal(result.definitions.some(function(definition) { return definition.name === 'Slow__late_tool'; }), false);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('empty foreground discovery skips shared deadline timer', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  try {
+    harness.tools.discoverPhoneTools({ McpServersJson: '[]' }, 806, function(error) {
+      assert.ifError(error);
+    });
+    assert.equal(timers.timers.filter(function(timer) { return timer.delay === 3000; }).length, 0);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('foreground discovery reports early failures without exposing error bodies', function() {
+  var harness = createHarness();
+  var result;
+  harness.tools.discoverPhoneTools(mcpSettings([
+    { enabled: true, label: 'Private Server', url: 'https://private.example.test', authorization: 'secret' }
+  ]), 802, function(error, definitions, map, unavailable) {
+    result = { error: error, unavailable: unavailable };
+  });
+  FakeXMLHttpRequest.instances[0].respond(401, 'secret response body');
+  assert.equal(result.error, null);
+  assert.deepEqual(result.unavailable, ['Private Server']);
+  assert.equal(JSON.stringify(result).indexOf('secret'), -1);
+});
+
+test('foreground deadline detaches from shared warmup and warmup caches late result', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var warmResult;
+  var foregroundResult;
+  var settings = mcpSettings([{ enabled: true, label: 'Warm Server', url: 'https://warm.example.test' }]);
+  try {
+    harness.tools.warmMcpTools(settings, function(error, summary) { warmResult = { error: error, summary: summary }; });
+    harness.tools.discoverPhoneTools(settings, 803, function(error, definitions, map, unavailable) {
+      foregroundResult = { error: error, unavailable: unavailable };
+    });
+    assert.equal(FakeXMLHttpRequest.instances.length, 1);
+    var foregroundTimer = timers.timers.filter(function(timer) { return timer.delay === 3000; })[0];
+    timers.run(foregroundTimer.id);
+    assert.deepEqual(foregroundResult.unavailable, ['Warm Server']);
+    assert.equal(FakeXMLHttpRequest.instances[0].aborted, false);
+    FakeXMLHttpRequest.instances[0].respond(200, { result: { protocolVersion: '2025-06-18' } });
+    FakeXMLHttpRequest.instances[1].respond(202, '');
+    FakeXMLHttpRequest.instances[2].respond(200, { result: { tools: [{ name: 'warm_tool' }] } });
+    assert.equal(warmResult.error, null);
+    assert.equal(warmResult.summary.tools.length, 1);
+    harness.tools.discoverPhoneTools(settings, 804, function(error, definitions) {
+      assert.equal(error, null);
+      assert.ok(definitions.some(function(definition) { return definition.name === 'Warm_Server__warm_tool'; }));
+    });
+    assert.equal(FakeXMLHttpRequest.instances.length, 3);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('canceling foreground discovery clears deadline and detaches callback', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  var calls = 0;
+  try {
+    harness.tools.discoverPhoneTools(mcpSettings([
+      { enabled: true, label: 'Cancel Me', url: 'https://cancel.example.test' }
+    ]), 805, function() { calls += 1; });
+    var deadline = timers.timers.filter(function(timer) { return timer.delay === 3000; })[0];
+    harness.tools.cancelMcpRequest(805);
+    assert.equal(deadline.cleared, true);
+    assert.equal(FakeXMLHttpRequest.instances[0].aborted, true);
+    timers.run(deadline.id);
+    assert.equal(calls, 0);
+  } finally {
+    timers.restore();
+  }
+});
+
 test('memory built-ins expose bounded schemas and execute locally', function() {
   var harness = createHarness();
   var result;
@@ -628,8 +738,8 @@ test('SleepToolEnabled discovers a bounded sleep tool that waits for requested m
     assert.equal(definitions[0].parameters.properties.milliseconds.maximum, 60000);
 
     harness.tools.runToolCalls(130, [{ id: 'sleep', name: 'sleep', arguments: { milliseconds: 2500 } }], toolMap, function(value) { results = value; });
-    assert.equal(timers.timers.length, 1);
-    assert.equal(timers.timers[0].delay, 2500);
+    assert.equal(timers.timers.filter(function(timer) { return !timer.cleared; }).length, 1);
+    assert.equal(timers.timers.filter(function(timer) { return !timer.cleared; })[0].delay, 2500);
     assert.equal(results, undefined);
 
     timers.runAll();
@@ -659,7 +769,7 @@ test('sleep rejects missing, fractional, and out-of-range durations without wait
       { id: 'too-long', name: 'sleep', arguments: { milliseconds: 60001 } }
     ], toolMap, function(value) { results = value; });
 
-    assert.equal(timers.timers.length, 0);
+    assert.equal(timers.timers.filter(function(timer) { return !timer.cleared; }).length, 0);
     assert.match(results[0].error, /milliseconds/);
     assert.match(results[1].error, /milliseconds must be an integer/);
     assert.match(results[2].error, /0 or greater/);

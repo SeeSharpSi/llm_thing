@@ -29,7 +29,7 @@ var TOOL_RESULT_TRUNCATION_SUFFIX = '... [truncated]';
 var TOOL_RESULT_ERROR_RESERVE_CHARS = 96;
 var TOOL_RESULT_ERROR_OMISSION = 'Tool result omitted: budget exhausted';
 var TOOL_ERROR_OMISSION = 'Tool error omitted: exceeds reserved allowance';
-var TOOL_CAP_NOTICE = 'Tool call budget exhausted. Answer using gathered results.';
+var TOOL_CAP_NOTICE = 'Tool call budget exhausted. FINAL ANSWER ONLY. Use output.';
 var DEFAULT_MESSAGES_MAX_TOKENS = 4096;
 var ANTHROPIC_API_VERSION = '2023-06-01';
 var NATIVE_UNSUPPORTED_TTL_MS = 5 * 60 * 1000;
@@ -854,6 +854,7 @@ function invalidateConversationGeneration() {
   s_active_completion = null;
   if (context) {
     clearCompletionTimers(context);
+    cancelPendingDiscovery(context);
     watch.cancelRequestLifecycle(context.requestId);
   }
 }
@@ -2509,18 +2510,20 @@ function isNativeToolRequestError(error) {
   return /^HTTP (400|404|422)/.test(String(error || ''));
 }
 
-function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
+function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, mode,
                                   thinkingTrace, callback) {
-  var requestOptions = mode === 'native' ? { nativeTools: true, toolDefinitions: toolDefinitions } : {};
   var completionContext = s_active_completion && s_active_completion.requestId === requestId ? s_active_completion : null;
 
   if (!isCurrentCompletion(completionContext)) {
     return;
   }
+  if (mode === 'text' && conversation.length && conversation[0].role === 'system') {
+    conversation[0].content = buildSystemPrompt(settings,
+        buildToolInstructions(toolDefinitions, settings.MaxToolCalls, true));
+  }
   watch.progressSet(requestId, 'thinking', 'tool call limit reached');
   setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
-  requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
-    var assistantText;
+  requestModel(settings, conversation, requestId, {}, function(error, json) {
     var batch;
     if (!isCurrentCompletion(completionContext)) {
       return;
@@ -2530,9 +2533,8 @@ function requestFinalAfterToolCap(requestId, settings, conversation, toolDefinit
       return;
     }
     updateProgressContextSizes(requestId, settings, json);
-    assistantText = extractResponseText(json);
-    batch = extractToolCallBatch(json, mode, toolMap);
-    if (batch.calls.length) {
+    batch = extractNativeToolCalls(json);
+    if (batch.length) {
       callback(null, 'I am out of tool calls, and the model requested another tool instead of producing a final answer. I can only answer from information already gathered.');
       return;
     }
@@ -2552,7 +2554,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
   remainingToolResultChars = typeof remainingToolResultChars === 'number' ? remainingToolResultChars : MAX_TOOL_RESULTS_TOTAL_CHARS;
 
   common.logDebug('tool loop mode=' + mode + ' round=' + round + ' availableTools=' + Object.keys(toolMap).length + ' usedToolCalls=' + usedToolCalls + ' maxToolCalls=' + settings.MaxToolCalls);
-  watch.progressSet(requestId, 'thinking', round === 0 ? '' : 'with tool results');
+  watch.progressSet(requestId, 'thinking', round === 0 ? completionContext.mcpUnavailableDetail || '' : 'with tool results');
   setModelRetryState(completionContext, settings, conversation, mode, thinkingTrace);
   requestModel(settings, conversation, requestId, requestOptions, function(error, json) {
     var assistantText;
@@ -2603,8 +2605,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
         includeCapNotice: true
       });
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, skippedResults, true, originalToolCalls.length);
-      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
-          thinkingTrace, callback);
+      requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, mode, thinkingTrace, callback);
       return;
     }
     budgetPlan = planToolCallsByBudget(originalToolCalls, toolMap, remainingToolCalls, mcpToolCallCounts);
@@ -2633,8 +2634,7 @@ function completeWithTools(requestId, settings, conversation, toolDefinitions, t
       common.logDebug('tool loop results=' + results.length + ' skipped=' + skippedCount);
       appendToolResults(conversation, settings, json, assistantText, batch.source, originalToolCalls, results, noMoreTools, skippedCount);
       if (noMoreTools) {
-        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, toolMap, mode,
-            thinkingTrace, callback);
+        requestFinalAfterToolCap(requestId, settings, conversation, toolDefinitions, mode, thinkingTrace, callback);
         return;
       }
       completeWithTools(requestId, settings, conversation, toolDefinitions, toolMap, mode, round + 1, usedToolCalls + results.length, mcpToolCallCounts, thinkingTrace, remainingToolResultChars, callback);
@@ -2703,9 +2703,12 @@ function startCompletion(context, settings) {
   }
 
   watch.progressSet(requestId, 'Loading tools', 'discovering phone tools');
-  tools.discoverPhoneTools(settings, requestId, function(error, discoveredTools, toolMap) {
+  context.discoveryPending = true;
+  tools.discoverPhoneTools(settings, requestId, function(error, discoveredTools, toolMap, unavailableServers) {
     var mode;
+    var unavailableDetail;
 
+    context.discoveryPending = false;
     if (!isCurrentCompletion(context)) {
       return;
     }
@@ -2717,6 +2720,10 @@ function startCompletion(context, settings) {
 
     toolInstructions = buildToolInstructions(discoveredTools, settings.MaxToolCalls,
         !isNativeToolsUnsupported(settings));
+    unavailableDetail = formatMcpUnavailableDetail(unavailableServers);
+    if (unavailableDetail) {
+      context.mcpUnavailableDetail = unavailableDetail;
+    }
     conversation = buildConversation(settings, userText, toolInstructions,
         context.historyAtStart);
     common.logDebug('tools discover done tools=' + discoveredTools.length + ' nativeUnsupported=' + (isNativeToolsUnsupported(settings) ? '1' : '0'));
@@ -2748,6 +2755,7 @@ function activateCompletion(context) {
 
   clearCompletionTimers(previousContext);
   watch.beginRequestLifecycle(context.requestId);
+  cancelPendingDiscovery(previousContext);
   s_active_completion = context;
 }
 
@@ -2765,6 +2773,38 @@ function appendRecoveryInstruction(conversation, settings) {
     return;
   }
   conversation.push({ role: 'user', content: instruction });
+}
+
+function formatMcpUnavailableDetail(labels) {
+  var prefix = 'MCP unavailable: ';
+  var parts = [];
+  var text;
+  var i;
+
+  if (!labels || !labels.length) {
+    return '';
+  }
+  for (i = 0; i < labels.length; i += 1) {
+    text = String(labels[i] || '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    if (text) {
+      parts.push(text);
+    }
+  }
+  if (!parts.length) {
+    return '';
+  }
+  text = prefix + parts.join(', ');
+  if (text.length > 60) {
+    text = text.substring(0, 59).replace(/[,\s]+$/, '') + '…';
+  }
+  return text;
+}
+
+function cancelPendingDiscovery(context) {
+  if (context && context.discoveryPending && tools.cancelMcpRequest) {
+    context.discoveryPending = false;
+    tools.cancelMcpRequest(context.requestId);
+  }
 }
 
 function sendRetryUnavailable(requestId, message, failedRequestId) {

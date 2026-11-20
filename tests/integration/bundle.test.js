@@ -261,6 +261,63 @@ test('built PebbleKit bundle loads and registers runtime handlers', function() {
   assert.ok(settingsIoMarker < firstScriptEnd, 'settings backup component source escaped its script');
 });
 
+test('foreground model discovery falls back while a warmed MCP server is still initializing', function() {
+  var endpoint = 'https://offline.invalid/v1/responses';
+  var timers = createManualTimers();
+  var harness = createBundleHarness({
+    llm_thing_settings: JSON.stringify({
+      Endpoint: endpoint,
+      ApiKey: 'offline-key',
+      Model: 'offline-model',
+      MaxToolCalls: 2,
+      SleepToolEnabled: true,
+      McpServersJson: JSON.stringify([{ enabled: true, label: 'Slow', url: 'https://slow.invalid/mcp' }])
+    })
+  }, true, { timers: timers });
+  var pebble = harness.pebble;
+  var initializeRequest;
+  var modelRequest;
+  var body;
+  var progress;
+  var responseText;
+
+  pebble.emit('ready');
+  flushManualSends(pebble);
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'ready starts MCP warm-up');
+  initializeRequest = FakeXMLHttpRequest.last();
+  assert.equal(initializeRequest.url, 'https://slow.invalid/mcp');
+  assert.equal(JSON.parse(initializeRequest.body).method, 'initialize');
+
+  pebble.emit('appmessage', { payload: { RequestId: 151, RequestText: 'What time is it?' } });
+  assert.ok(timers.activeDelays().indexOf(3000) !== -1, 'foreground discovery has a manual 3000 ms deadline');
+  assert.equal(FakeXMLHttpRequest.instances.length, 1, 'provider waits for foreground discovery deadline');
+  assert.equal(timers.runDelay(3000), true, 'foreground discovery deadline fires');
+
+  modelRequest = FakeXMLHttpRequest.last();
+  assert.notEqual(modelRequest, initializeRequest, 'provider request starts while MCP initialize remains pending');
+  assert.equal(modelRequest.url, endpoint);
+  body = JSON.parse(modelRequest.body);
+  assert.ok(body.tools.some(function(tool) { return tool.name === 'sleep'; }), 'built-in sleep tool remains available');
+  assert.equal(body.tools.some(function(tool) { return tool.name.indexOf('slow__') === 0; }), false,
+    'unavailable MCP tools are omitted');
+
+  flushManualSends(pebble);
+  progress = pebble.messages.filter(function(message) {
+    return message.ProgressDetail && Number(message.RequestId) === 151;
+  });
+  assert.ok(progress.some(function(message) { return /MCP unavailable: Slow/.test(message.ProgressDetail); }),
+    'watch receives MCP unavailability detail during first model request');
+
+  modelRequest.respond(200, { output_text: 'It is noon.' });
+  flushManualSends(pebble);
+  responseText = pebble.messages.filter(function(message) { return message.ResponseChunk !== undefined; })
+    .map(function(message) { return message.ResponseChunk; }).join('');
+  assert.match(responseText, /It is noon/);
+  assert.ok(pebble.messages.some(function(message) {
+    return message.ResponseDone === 1 && Number(message.RequestId) === 151;
+  }), 'final answer is delivered to watch');
+});
+
 test('built bundle supplies encoded plugin catalogue to plugin sources Clay component', function() {
   var plugin = {
     uuid: '12345678-1234-4234-8234-123456789abc',

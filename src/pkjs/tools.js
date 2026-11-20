@@ -93,6 +93,7 @@ var MCP_MAX_SERVER_CACHE_CHARS = 65536;
 var MCP_MAX_SESSION_ID_CHARS = 1024;
 var MCP_MAX_SCHEMA_DEPTH = 64;
 var MCP_REQUEST_TIMEOUT_MS = 30000;
+var MCP_DISCOVERY_FOREGROUND_TIMEOUT_MS = 3000;
 var MCP_SUPPORTED_PROTOCOL_VERSIONS = { '2025-06-18': true };
 var MCP_CACHE_TTL_MS = 5 * 60 * 1000;
 var MCP_MAX_CACHE_ENTRIES = 32;
@@ -105,6 +106,7 @@ var s_mcp_pending = Object.create(null);
 var s_mcp_pending_count = 0;
 var s_mcp_warm_generation = null;
 var s_mcp_warm_generation_id = 1;
+var s_mcp_foreground_batches = [];
 var MCP_INVALID_SCHEMA = {};
 
 function hasOwn(object, key) {
@@ -517,7 +519,7 @@ function isCurrentMcpContext(context) {
   return watch.isCurrentRequest(context);
 }
 
-function makeMcpWaiter(requestContext, server, callback) {
+function makeMcpWaiter(requestContext, server, callback, foregroundBatch) {
   if (requestContext && typeof requestContext === 'object' && requestContext.warmGeneration) {
     return {
       type: 'warm',
@@ -531,6 +533,7 @@ function makeMcpWaiter(requestContext, server, callback) {
   return {
     type: 'foreground',
     requestId: requestContext,
+    foregroundBatch: foregroundBatch || null,
     server: server,
     callback: callback,
     settled: false
@@ -567,6 +570,9 @@ function pruneMcpWaiters(pending) {
   }
   pending.waiters = kept;
   for (i = 0; i < removed.length; i += 1) {
+    if (removed[i].foregroundBatch) {
+      finishForegroundBatch(removed[i].foregroundBatch, true, false);
+    }
     settleMcpWaiter(removed[i], 'MCP discovery canceled', null, false);
   }
 }
@@ -617,36 +623,70 @@ function cancelUnobservedMcpDiscoveries(preserveGeneration) {
 }
 
 function cancelMcpRequest(requestId) {
+  pluginSources.cancelRequest(requestId);
+  pluginActions.cancelRequest(requestId);
+  cancelForegroundBatchesForRequest(requestId);
+}
+
+function clearForegroundBatchTimer(batch) {
+  if (batch.timer !== null) {
+    try {
+      clearTimeout(batch.timer);
+    } catch (e) {}
+    batch.timer = null;
+  }
+}
+
+function removeForegroundBatch(batch) {
+  var index = s_mcp_foreground_batches.indexOf(batch);
+  if (index !== -1) {
+    s_mcp_foreground_batches.splice(index, 1);
+  }
+}
+
+function cancelForegroundBatchesForRequest(requestId) {
+  var batches = s_mcp_foreground_batches.slice();
+  var i;
+  for (i = 0; i < batches.length; i += 1) {
+    if (Number(batches[i].requestId) === Number(requestId)) {
+      finishForegroundBatch(batches[i], true, true);
+    }
+  }
+}
+
+function finishForegroundBatch(batch, canceled, detachWaiters) {
+  if (!batch || batch.finished || batch.canceled) {
+    return;
+  }
+  batch.canceled = canceled === true;
+  batch.finished = !batch.canceled;
+  clearForegroundBatchTimer(batch);
+  removeForegroundBatch(batch);
+  if (detachWaiters) {
+    detachForegroundBatchWaiters(batch);
+  }
+}
+
+function detachForegroundBatchWaiters(batch) {
   var keys = Object.keys(s_mcp_pending);
   var i;
   var j;
   var pending;
   var kept;
-  var removed;
-  var waiter;
-
-  pluginSources.cancelRequest(requestId);
-  pluginActions.cancelRequest(requestId);
-
   for (i = 0; i < keys.length; i += 1) {
     pending = s_mcp_pending[keys[i]];
     if (!pending || pending.done) {
       continue;
     }
     kept = [];
-    removed = [];
     for (j = 0; j < pending.waiters.length; j += 1) {
-      waiter = pending.waiters[j];
-      if (waiter.type === 'foreground' && Number(waiter.requestId) === Number(requestId)) {
-        removed.push(waiter);
+      if (pending.waiters[j].foregroundBatch !== batch) {
+        kept.push(pending.waiters[j]);
       } else {
-        kept.push(waiter);
+        pending.waiters[j].settled = true;
       }
     }
     pending.waiters = kept;
-    for (j = 0; j < removed.length; j += 1) {
-      settleMcpWaiter(removed[j], 'MCP discovery canceled', null, false);
-    }
     if (!kept.length) {
       cancelMcpServerDiscovery(pending, 'MCP discovery canceled');
     }
@@ -1595,12 +1635,12 @@ function finishMcpServerDiscovery(pending, error, tools, noTools) {
   }
 }
 
-function discoverMcpServer(server, requestContext, callback) {
+function discoverMcpServer(server, requestContext, callback, foregroundBatch) {
   var key = server._mcpCacheKey || mcpCacheKey(server);
   var storageKey = mcpCacheStorageKey(key);
   var cached = lookupMcpCache(key);
   var pending = s_mcp_pending[storageKey];
-  var waiter = makeMcpWaiter(requestContext, server, callback);
+  var waiter = makeMcpWaiter(requestContext, server, callback, foregroundBatch);
   var context;
 
   if (!isCurrentMcpWaiter(waiter)) {
@@ -1683,6 +1723,18 @@ function discoverMcpTools(settings, requestContext, callback, serverList) {
   var usedNames = Object.create(null);
   var results = [];
   var remaining = servers.length;
+  var foregroundBatch = null;
+  var isForeground = !(requestContext && typeof requestContext === 'object' && requestContext.background === true);
+
+  if (isForeground) {
+    foregroundBatch = {
+      requestId: requestContext,
+      timer: null,
+      finished: false,
+      canceled: false
+    };
+    s_mcp_foreground_batches.push(foregroundBatch);
+  }
 
   common.logDebug('mcp discover start servers=' + servers.length);
 
@@ -1749,30 +1801,52 @@ function discoverMcpTools(settings, requestContext, callback, serverList) {
     }
   }
 
-  function finalize() {
+  function finalize(expired) {
     var i;
     var entry;
+    var unavailable = [];
 
-    if (!isCurrentMcpContext(requestContext)) {
+    if (foregroundBatch && (foregroundBatch.finished || foregroundBatch.canceled)) {
       return;
     }
-    for (i = 0; i < results.length; i += 1) {
+    if (!isCurrentMcpContext(requestContext)) {
+      if (foregroundBatch) {
+        finishForegroundBatch(foregroundBatch, true, true);
+      }
+      return;
+    }
+    for (i = 0; i < servers.length; i += 1) {
       entry = results[i];
       if (entry && entry.tools) {
         addTools(entry.server, entry.tools);
+      } else if (foregroundBatch) {
+        unavailable.push(servers[i].displayLabel || servers[i].label);
       }
     }
 
-    callback(null, cloneTools(tools), cloneToolMap(toolMap));
+    if (foregroundBatch) {
+      finishForegroundBatch(foregroundBatch, false, expired === true);
+    }
+    callback(null, cloneTools(tools), cloneToolMap(toolMap), unavailable);
+  }
+
+  if (foregroundBatch && servers.length) {
+    foregroundBatch.timer = setTimeout(function() {
+      foregroundBatch.timer = null;
+      finalize(true);
+    }, MCP_DISCOVERY_FOREGROUND_TIMEOUT_MS);
   }
 
   if (!remaining) {
-    finalize();
+    finalize(false);
     return;
   }
 
   servers.forEach(function(server, index) {
     discoverMcpServer(server, requestContext, function(discoveryError, serverTools) {
+      if (foregroundBatch && (foregroundBatch.finished || foregroundBatch.canceled)) {
+        return;
+      }
       if (discoveryError) {
         results[index] = null;
       } else {
@@ -1780,9 +1854,9 @@ function discoverMcpTools(settings, requestContext, callback, serverList) {
       }
       remaining -= 1;
       if (remaining <= 0) {
-        finalize();
+        finalize(false);
       }
-    });
+    }, foregroundBatch);
   });
 }
 
@@ -3733,12 +3807,12 @@ function addBuiltinTools(settings, tools, toolMap) {
 }
 
 function discoverPhoneTools(settings, requestId, callback) {
-  discoverMcpTools(settings, requestId, function(error, tools, toolMap) {
+  discoverMcpTools(settings, requestId, function(error, tools, toolMap, unavailableServers) {
     if (!watch.isCurrentRequest(requestId)) {
       return;
     }
     if (error) {
-      callback(error);
+      callback(error, null, null, unavailableServers || []);
       return;
     }
 
@@ -3758,7 +3832,7 @@ function discoverPhoneTools(settings, requestId, callback) {
       }
       return 0;
     });
-    callback(null, tools, toolMap);
+    callback(null, tools, toolMap, unavailableServers || []);
   });
 }
 

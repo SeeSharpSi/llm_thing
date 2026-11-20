@@ -49,7 +49,7 @@ test('save, list, load, update, and delete chat history', function() {
 });
 
 test('loading normalizes corrupt records, roles, lengths, and ordering', function() {
-  var longText = new Array(1300).join('x');
+  var longText = new Array(3101).join('x');
   var initial = {
     llm_thing_saved_chats_v1: JSON.stringify({
       version: 1,
@@ -64,8 +64,50 @@ test('loading normalizes corrupt records, roles, lengths, and ordering', functio
   var listed = store.listChats();
 
   assert.deepEqual(listed.map(function(chat) { return chat.id; }), ['new', 'old']);
-  assert.equal(store.getChat('old').messages[0].content.length, 1200);
+  assert.equal(store.getChat('old').messages[0].content.length, 3000);
   assert.equal(store.getChat('invalid'), null);
+});
+
+test('saved chat messages round-trip at live history character limit', function() {
+  var store = loadStore();
+  var content = new Array(3001).join('x');
+  var saved = store.saveChatHistory(null, [{ role: 'user', content: content }]);
+
+  assert.equal(store.getChat(saved.id).messages[0].content, content);
+});
+
+test('saved archive byte cap retains newest whole chats', function() {
+  var chats = [];
+  var messages = [];
+  var i;
+  var j;
+  var store;
+
+  for (j = 0; j < 4; j += 1) {
+    messages.push({
+      role: j % 2 === 0 ? 'user' : 'assistant',
+      content: new Array(3001).join('\u4e2d')
+    });
+  }
+  for (i = 0; i < 8; i += 1) {
+    chats.push({
+      id: 'large-' + i,
+      title: 'Large chat ' + i,
+      createdAt: i + 1,
+      updatedAt: i + 1,
+      messages: messages
+    });
+  }
+
+  store = loadStore({ llm_thing_saved_chats_v1: JSON.stringify({ version: 1, chats: chats }) });
+  store.saveChatHistory('large-7', messages);
+
+  assert.deepEqual(store.listChats().map(function(chat) { return chat.id; }), [
+    'large-7', 'large-6', 'large-5', 'large-4', 'large-3', 'large-2', 'large-1'
+  ]);
+  assert.equal(store.getChat('large-6').messages.length, 4);
+  assert.equal(store.getChat('large-4').messages[0].content.length, 3000);
+  assert.ok(Buffer.byteLength(global.localStorage.getItem('llm_thing_saved_chats_v1'), 'utf8') <= store.MAX_SAVED_CHAT_STORAGE_BYTES);
 });
 
 test('store caps chat count and evicts oldest chats on quota failure', function() {
