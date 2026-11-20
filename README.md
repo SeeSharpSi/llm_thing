@@ -216,8 +216,11 @@ minutes, with bounded cache and pending-discovery sizes. Cache identity includes
 server URL, credentials, custom headers, label, allowed tools, and call limit;
 changing those settings starts a fresh discovery. The app warms enabled MCP
 servers after startup and settings saves, and overlapping warmup and foreground
-discovery share pending work. Foreground discovery waits up to three seconds;
-then built-in tools and available servers proceed, while watch progress identifies
+discovery share pending work. Phone settings below MCP servers include a global
+**MCP Discovery Timeout (ms)**, defaulting to 3000 and bounded from 1000 to
+30000. This timeout is shared across discovery for each foreground request; it
+does not change background warmup or tool-execution deadlines. When it expires,
+built-in tools and available servers proceed, while watch progress identifies
 unavailable server labels. Warmup may finish for later requests. A successful
 server with no tools is not a failure, and a failed server does not discard
 successful results from other servers. Remote servers require HTTPS; HTTP is

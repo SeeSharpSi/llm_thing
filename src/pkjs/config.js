@@ -392,6 +392,19 @@ module.exports = [
         "defaultValue": "[]"
       },
       {
+        "type": "input",
+        "messageKey": "McpDiscoveryTimeoutMs",
+        "label": "MCP Discovery Timeout (ms)",
+        "description": "Chat starts with tools discovered within this foreground wait. Does not change MCP warmup or MCP tool-call timeouts.",
+        "defaultValue": 3000,
+        "attributes": {
+          "type": "number",
+          "min": 1000,
+          "max": 30000,
+          "step": 1
+        }
+      },
+      {
         "type": "plugin_sources",
         "messageKey": "PluginSourcesJson",
         "defaultValue": "[]"

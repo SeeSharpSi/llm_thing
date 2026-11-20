@@ -24,6 +24,7 @@ test('DEFAULT_SETTINGS owns no transient configuration action fields', function(
   assert.equal(settings.DEFAULT_SETTINGS.SpeakerFeedbackEnabled, false);
   assert.equal(settings.DEFAULT_SETTINGS.PluginSourcesJson, '[]');
   assert.equal(settings.DEFAULT_SETTINGS.PluginActionsJson, '[]');
+  assert.equal(settings.DEFAULT_SETTINGS.McpDiscoveryTimeoutMs, 3000);
 });
 
 test('extend applies defaults, unwraps Clay values, and normalizes toggles', function() {
@@ -85,6 +86,10 @@ test('extend clamps numeric settings and enforces font choices', function() {
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { MaxToolCalls: 99 }).MaxToolCalls, 16);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { RequestTimeoutMs: 50 }).RequestTimeoutMs, 1000);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { RequestTimeoutMs: 'bad' }).RequestTimeoutMs, 60000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: '7250' }).McpDiscoveryTimeoutMs, 7250);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: 0 }).McpDiscoveryTimeoutMs, 1000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: 50000 }).McpDiscoveryTimeoutMs, 30000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: 'bad' }).McpDiscoveryTimeoutMs, 3000);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { FontSize: 19 }).FontSize, 18);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { FontSize: 28 }).FontSize, 28);
   assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { BuzzStrength: 9 }).BuzzStrength, 3);

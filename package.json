@@ -1,7 +1,7 @@
 {
   "name": "llm_thing",
   "author": "SilasT",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "keywords": [
     "pebble-app"
   ],
@@ -126,7 +126,8 @@
       "ApprovalDetail",
       "ApprovalDecision",
       "ApprovalCancel",
-      "SleepToolEnabled"
+      "SleepToolEnabled",
+      "McpDiscoveryTimeoutMs"
     ],
     "resources": {
       "media": [

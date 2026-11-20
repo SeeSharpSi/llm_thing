@@ -93,7 +93,6 @@ var MCP_MAX_SERVER_CACHE_CHARS = 65536;
 var MCP_MAX_SESSION_ID_CHARS = 1024;
 var MCP_MAX_SCHEMA_DEPTH = 64;
 var MCP_REQUEST_TIMEOUT_MS = 30000;
-var MCP_DISCOVERY_FOREGROUND_TIMEOUT_MS = 3000;
 var MCP_SUPPORTED_PROTOCOL_VERSIONS = { '2025-06-18': true };
 var MCP_CACHE_TTL_MS = 5 * 60 * 1000;
 var MCP_MAX_CACHE_ENTRIES = 32;
@@ -1834,7 +1833,7 @@ function discoverMcpTools(settings, requestContext, callback, serverList) {
     foregroundBatch.timer = setTimeout(function() {
       foregroundBatch.timer = null;
       finalize(true);
-    }, MCP_DISCOVERY_FOREGROUND_TIMEOUT_MS);
+    }, common.normalizeMcpDiscoveryTimeoutMs(settings && settings.McpDiscoveryTimeoutMs));
   }
 
   if (!remaining) {

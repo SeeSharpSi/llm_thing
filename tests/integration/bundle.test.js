@@ -271,6 +271,7 @@ test('foreground model discovery falls back while a warmed MCP server is still i
       Model: 'offline-model',
       MaxToolCalls: 2,
       SleepToolEnabled: true,
+      McpDiscoveryTimeoutMs: 7500,
       McpServersJson: JSON.stringify([{ enabled: true, label: 'Slow', url: 'https://slow.invalid/mcp' }])
     })
   }, true, { timers: timers });
@@ -289,9 +290,10 @@ test('foreground model discovery falls back while a warmed MCP server is still i
   assert.equal(JSON.parse(initializeRequest.body).method, 'initialize');
 
   pebble.emit('appmessage', { payload: { RequestId: 151, RequestText: 'What time is it?' } });
-  assert.ok(timers.activeDelays().indexOf(3000) !== -1, 'foreground discovery has a manual 3000 ms deadline');
+  assert.deepEqual(timers.activeDelays(), [30000, 7500], 'background warm-up timeout and saved foreground deadline are active');
+  assert.equal(timers.activeDelays().indexOf(3000), -1, 'default foreground discovery timeout is not active');
   assert.equal(FakeXMLHttpRequest.instances.length, 1, 'provider waits for foreground discovery deadline');
-  assert.equal(timers.runDelay(3000), true, 'foreground discovery deadline fires');
+  assert.equal(timers.runDelay(7500), true, 'saved foreground discovery deadline fires');
 
   modelRequest = FakeXMLHttpRequest.last();
   assert.notEqual(modelRequest, initializeRequest, 'provider request starts while MCP initialize remains pending');

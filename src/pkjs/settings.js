@@ -1,6 +1,7 @@
 var SETTINGS_KEY = 'llm_thing_settings';
 var DEFAULT_MAX_TOOL_CALLS = 4;
 var DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+var DEFAULT_MCP_DISCOVERY_TIMEOUT_MS = 3000;
 var MAX_CHAT_HISTORY_MESSAGES = 16;
 var MAX_CHAT_HISTORY_MESSAGE_CHARS = 3000;
 var MAX_CHAT_HISTORY_TOTAL_CHARS = 12000;
@@ -14,6 +15,7 @@ var DEFAULT_SETTINGS = {
   ApiKey: '',
   Model: 'gpt-4.1-mini',
   RequestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+  McpDiscoveryTimeoutMs: DEFAULT_MCP_DISCOVERY_TIMEOUT_MS,
   SystemPrompt: 'The current date-time is $DATETIME. You are a helpful assistant. Keep answers concise for a watch screen. Format your responses in markdown, but only use bold text and lists.',
   ShowThinking: false,
   ShowInputContextSize: false,
@@ -80,6 +82,10 @@ function minNumber(value, min, fallback) {
   return number;
 }
 
+function normalizeMcpDiscoveryTimeoutMs(value) {
+  return clampNumber(value, 1000, 30000, DEFAULT_MCP_DISCOVERY_TIMEOUT_MS);
+}
+
 function extend(base, extra) {
   var result = {};
   var key;
@@ -125,6 +131,7 @@ function extend(base, extra) {
     : '';
   result.MaxToolCalls = clampNumber(result.MaxToolCalls, 0, 16, DEFAULT_MAX_TOOL_CALLS);
   result.RequestTimeoutMs = minNumber(result.RequestTimeoutMs, 1000, DEFAULT_REQUEST_TIMEOUT_MS);
+  result.McpDiscoveryTimeoutMs = normalizeMcpDiscoveryTimeoutMs(result.McpDiscoveryTimeoutMs);
   result.FontSize = clampNumber(result.FontSize, 14, 28, 18);
   if (result.FontSize !== 14 && result.FontSize !== 18 && result.FontSize !== 24 && result.FontSize !== 28) {
     result.FontSize = 18;
@@ -228,6 +235,7 @@ module.exports = {
   DEFAULT_SETTINGS: DEFAULT_SETTINGS,
   DEFAULT_MAX_TOOL_CALLS: DEFAULT_MAX_TOOL_CALLS,
   DEFAULT_REQUEST_TIMEOUT_MS: DEFAULT_REQUEST_TIMEOUT_MS,
+  DEFAULT_MCP_DISCOVERY_TIMEOUT_MS: DEFAULT_MCP_DISCOVERY_TIMEOUT_MS,
   MAX_CHAT_HISTORY_MESSAGES: MAX_CHAT_HISTORY_MESSAGES,
   MAX_CHAT_HISTORY_MESSAGE_CHARS: MAX_CHAT_HISTORY_MESSAGE_CHARS,
   MAX_CHAT_HISTORY_TOTAL_CHARS: MAX_CHAT_HISTORY_TOTAL_CHARS,
@@ -238,6 +246,7 @@ module.exports = {
   logDebug: logDebug,
   clampNumber: clampNumber,
   minNumber: minNumber,
+  normalizeMcpDiscoveryTimeoutMs: normalizeMcpDiscoveryTimeoutMs,
   extend: extend,
   loadSettings: loadSettings,
   saveSettings: saveSettings,

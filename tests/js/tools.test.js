@@ -174,6 +174,21 @@ test('empty foreground discovery skips shared deadline timer', function() {
   }
 });
 
+test('foreground discovery uses normalized configured deadline for partial settings', function() {
+  var timers = installFakeTimers();
+  var harness = createHarness();
+  try {
+    harness.tools.discoverPhoneTools({
+      McpServersJson: JSON.stringify([{ enabled: true, label: 'Configured', url: 'https://configured.example.test' }]),
+      McpDiscoveryTimeoutMs: '7250'
+    }, 807, function() {});
+    assert.equal(timers.timers.filter(function(timer) { return timer.delay === 7250; }).length, 1);
+    assert.equal(timers.timers.filter(function(timer) { return timer.delay === 3000; }).length, 0);
+  } finally {
+    timers.restore();
+  }
+});
+
 test('foreground discovery reports early failures without exposing error bodies', function() {
   var harness = createHarness();
   var result;

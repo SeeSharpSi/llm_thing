@@ -72,6 +72,22 @@ test('configuration defaults normalize to runtime defaults', function() {
   assert.deepEqual(apiModeItem.options.map(function(option) { return option.value; }), Object.keys(settings.API_MODES));
 });
 
+test('MCP discovery timeout UI matches phone-side default and bounds', function() {
+  var item = configItems(config).filter(function(configItem) {
+    return configItem.messageKey === 'McpDiscoveryTimeoutMs';
+  })[0];
+
+  assert.ok(item);
+  assert.equal(item.label, 'MCP Discovery Timeout (ms)');
+  assert.equal(item.defaultValue, 3000);
+  assert.equal(item.attributes.type, 'number');
+  assert.equal(item.attributes.min, 1000);
+  assert.equal(item.attributes.max, 30000);
+  assert.equal(settings.DEFAULT_SETTINGS.McpDiscoveryTimeoutMs, 3000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: 999 }).McpDiscoveryTimeoutMs, 1000);
+  assert.equal(settings.extend(settings.DEFAULT_SETTINGS, { McpDiscoveryTimeoutMs: 30001 }).McpDiscoveryTimeoutMs, 30000);
+});
+
 test('model configuration uses the dynamic selector', function() {
   var modelItem = configItems(config).filter(function(item) {
     return item.messageKey === 'Model';
@@ -124,6 +140,7 @@ test('watch settings sync excludes phone-only settings and secrets', function() 
   assert.equal(global.Pebble.messages[0].SpeakerFeedbackEnabled, 0);
   assert.equal(global.Pebble.messages[0].ApiKey, undefined);
   assert.equal(global.Pebble.messages[0].McpServersJson, undefined);
+  assert.equal(global.Pebble.messages[0].McpDiscoveryTimeoutMs, undefined);
   assert.equal(global.Pebble.messages[0].PluginSourcesJson, undefined);
   assert.equal(global.Pebble.messages[0].PluginActionsJson, undefined);
   assert.equal(global.Pebble.messages[0].DeleteAllPastChats, undefined);
@@ -187,13 +204,15 @@ test('Pebble Memory is disabled by default and follows plugin sources and action
   assert.equal(finalSection.type, 'section');
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
+    'McpDiscoveryTimeoutMs',
     'PluginSourcesJson',
     'PluginActionsJson',
     'MemoriesJson'
   ]);
-  assert.equal(finalSection.items[1].type, 'plugin_sources');
-  assert.equal(finalSection.items[2].type, 'plugin_actions');
-  assert.equal(finalSection.items[3].type, 'memory_manager');
+  assert.equal(finalSection.items[1].type, 'input');
+  assert.equal(finalSection.items[2].type, 'plugin_sources');
+  assert.equal(finalSection.items[3].type, 'plugin_actions');
+  assert.equal(finalSection.items[4].type, 'memory_manager');
   assert.equal(config[config.length - 1].type, 'submit');
 });
 
@@ -216,6 +235,7 @@ test('settings backup section sits before the final MCP and memory section witho
   assert.equal(backupSection.items[0].messageKey, undefined);
   assert.deepEqual(finalSection.items.map(function(item) { return item.messageKey; }), [
     'McpServersJson',
+    'McpDiscoveryTimeoutMs',
     'PluginSourcesJson',
     'PluginActionsJson',
     'MemoriesJson'
